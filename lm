@@ -1,0 +1,19 @@
+#!/bin/bash
+# local-memory CLI shortcut
+# Usage:
+#   lm search "keywords"     — search memory
+#   lm ingest                — ingest all sources
+#   lm ingest --source cc    — ingest Claude Code only
+#   lm stats                 — show stats
+#   lm reset --yes           — reset index
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Load .env if present (CLI also loads it, this is for standalone use)
+if [ -f "$SCRIPT_DIR/.env" ]; then
+  set -a
+  source "$SCRIPT_DIR/.env"
+  set +a
+fi
+
+cd "$SCRIPT_DIR" && bun run src/cli.ts "$@"
