@@ -1,0 +1,49 @@
+[
+  {
+    "name": "telegram_bridge",
+    "query": "telegram bridge",
+    "profile": "debug",
+    "limit": 5,
+    "expectAny": ["telegram-cli-bridge", "telegram-ai-bridge", "Telegram bridge"],
+    "expectScopePrefixes": ["cc", "asset"],
+    "notes": "Bridge maintenance and migration history should be easy to recall."
+  },
+  {
+    "name": "openclaw_memory",
+    "query": "OpenClaw 记忆系统",
+    "profile": "writing",
+    "limit": 6,
+    "expectAny": ["OpenClaw", "记忆系统", "memory-lancedb-pro", "LanceDB"],
+    "expectScopePrefixes": ["cc", "memory", "asset"],
+    "notes": "Core memory architecture discussion should be recoverable."
+  },
+  {
+    "name": "writing_style",
+    "query": "写作风格 口语化 不端着 可自嘲",
+    "profile": "writing",
+    "limit": 5,
+    "expectAll": ["口语化", "不端着"],
+    "expectAny": ["可自嘲", "写作风格"],
+    "expectScopePrefixes": ["cc", "asset"],
+    "notes": "User writing-style preferences should rank high."
+  },
+  {
+    "name": "visual_style",
+    "query": "审美偏好 手绘涂鸦 高对比撞色",
+    "profile": "default",
+    "limit": 5,
+    "expectAll": ["手绘涂鸦", "高对比撞色"],
+    "expectAny": ["审美偏好"],
+    "expectScopePrefixes": ["cc", "asset"],
+    "notes": "Visual preference memories should stay stable."
+  },
+  {
+    "name": "aws_bot_config",
+    "query": "AWS bot 配置 gpt-5.4",
+    "profile": "debug",
+    "limit": 6,
+    "expectAny": ["AWS-bot", "gpt-5.4", "thinkingDefault", "openclaw.json"],
+    "expectScopePrefixes": ["cc", "asset"],
+    "notes": "Operational config changes should be easy to recover."
+  }
+]
