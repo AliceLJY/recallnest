@@ -38,12 +38,12 @@
     "notes": "Visual preference memories should stay stable."
   },
   {
-    "name": "aws_bot_config",
-    "query": "AWS bot 配置 gpt-5.4",
+    "name": "aws_ssh_access",
+    "query": "aws ssh",
     "profile": "debug",
     "limit": 6,
-    "expectAny": ["AWS-bot", "gpt-5.4", "thinkingDefault", "openclaw.json"],
-    "expectScopePrefixes": ["cc", "asset"],
-    "notes": "Operational config changes should be easy to recover."
+    "expectAny": ["AWS bot", "aws bot", "ssh", "key2", "Discord", "容器"],
+    "expectScopePrefixes": ["cc"],
+    "notes": "Real-world AWS access queries should use the wording the operator actually types."
   }
 ]
