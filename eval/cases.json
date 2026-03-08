@@ -54,5 +54,32 @@
     "expectAny": ["AWS bot", "aws bot", "ssh", "key2", "Discord", "容器"],
     "expectScopePrefixes": ["cc"],
     "notes": "Real-world AWS access queries should use the wording the operator actually types."
+  },
+  {
+    "name": "fuzzy_bot_crash",
+    "query": "上次那个 bot 突然挂了是怎么回事来着",
+    "profile": "debug",
+    "limit": 5,
+    "expectAny": ["崩溃", "crash", "error", "报错", "排查", "修复", "docker"],
+    "expectScopePrefixes": ["cc"],
+    "notes": "Fuzzy colloquial query about bot crash should find debugging conversations."
+  },
+  {
+    "name": "fuzzy_ai_feelings",
+    "query": "之前聊过一个关于 AI 到底有没有感受的话题",
+    "profile": "writing",
+    "limit": 5,
+    "expectAny": ["意识", "consciousness", "experiencing", "感受", "自由意志", "sentience"],
+    "expectScopePrefixes": ["cc"],
+    "notes": "Vague conversational query about AI consciousness should recall philosophical discussions."
+  },
+  {
+    "name": "fuzzy_image_style",
+    "query": "那个配图风格轮换的逻辑是怎么搞的",
+    "profile": "default",
+    "limit": 5,
+    "expectAny": ["风格", "style", "轮换", "catalog", "配图"],
+    "expectScopePrefixes": ["cc"],
+    "notes": "Casual question about image style rotation should find implementation discussions."
   }
 ]
