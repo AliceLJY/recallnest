@@ -1,0 +1,50 @@
+[
+  {
+    "name": "writing_style_continuity",
+    "task": "继续写我的AI小木屋的文章",
+    "profile": "writing",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": false,
+    "expectStableAny": ["口语化", "不端着"],
+    "notes": "Fresh windows should carry over stable writing-style preferences."
+  },
+  {
+    "name": "visual_style_continuity",
+    "task": "给文章做封面和配图",
+    "profile": "default",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": false,
+    "expectStableAny": ["手绘涂鸦", "高对比撞色"],
+    "notes": "Visual direction should survive without the user restating it."
+  },
+  {
+    "name": "project_context_continuity",
+    "task": "一起继续排查 RecallNest 的连续性问题",
+    "profile": "default",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": false,
+    "expectStableAny": ["RecallNest"],
+    "forbid": ["https://", "笑不活了", "open issues"],
+    "notes": "Fresh windows should at least recover the active project context."
+  },
+  {
+    "name": "workflow_pattern_gap_check",
+    "task": "开个新窗口继续做同一个终端项目",
+    "profile": "default",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": false,
+    "expectPatternsAny": ["search_memory", "resume_context", "checkpoint"],
+    "notes": "This is a stretch case. It should start passing as more workflow patterns are promoted into durable memory."
+  },
+  {
+    "name": "recallnest_checkpoint_continuity",
+    "task": "继续 recallnest",
+    "scope": "recallnest",
+    "profile": "default",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": true,
+    "expectCheckpointAny": ["Phase 3", "resume_context", "store_memory"],
+    "forbid": ["[助手]", "手绘涂鸦", "本地没 clone", "https://", "笑不活了", "open issues"],
+    "notes": "When a project checkpoint exists, resume_context should prefer checkpoint-led continuity over noisy transcript fragments."
+  }
+]
