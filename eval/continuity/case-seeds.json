@@ -24,5 +24,35 @@
     "outcome": "The three terminals now have a working continuity trigger loop, so startup recall and handoff checkpoints happen without manual reminders.",
     "tools": ["resume_context", "checkpoint_session"],
     "tags": ["continuity", "integration", "three-terminals"]
+  },
+  {
+    "title": "RecallNest scope fallback cleanup",
+    "problem": "resume_context stayed too narrow on project scope and surfaced ongoing notes instead of stable handoff context.",
+    "context": "This showed up after checkpoint isolation, when project continuity still preferred plan-like transcript snippets over durable cases.",
+    "solutionSteps": [
+      "Reject plan-like non-durable snippets during case and pattern selection.",
+      "Prefer durable or explicitly structured task results over raw transcript notes.",
+      "Trigger fallback queries only after filtered task results are empty."
+    ],
+    "outcome": "RecallNest project continuity now surfaces durable case memories instead of raw transcript fragments.",
+    "tools": ["resume_context", "search_memory", "eval:continuity"],
+    "tags": ["continuity", "recallnest", "source-aware"],
+    "scope": "recallnest",
+    "importance": 0.86
+  },
+  {
+    "title": "Continuity eval checkpoint isolation",
+    "problem": "continuity eval results drifted because they were reading whichever live latest checkpoint happened to exist locally.",
+    "context": "The noisy checkpoint input made eval regressions look worse than the actual continuity composer behavior.",
+    "solutionSteps": [
+      "Allow continuity eval cases to define their own checkpoint fixtures.",
+      "Build an in-memory checkpoint store from the fixture set instead of reading live session-checkpoints.",
+      "Re-run continuity eval and confirm checkpoint summaries come from the case fixture."
+    ],
+    "outcome": "continuity eval became deterministic and no longer depends on live latest checkpoint state.",
+    "tools": ["eval:continuity", "resume_context", "checkpoint_session"],
+    "tags": ["continuity", "eval", "checkpoint"],
+    "scope": "recallnest",
+    "importance": 0.85
   }
 ]

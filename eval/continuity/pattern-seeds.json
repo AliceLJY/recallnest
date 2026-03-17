@@ -37,5 +37,31 @@
     "tools": ["store_workflow_pattern", "/v1/pattern"],
     "tags": ["continuity", "promotion"],
     "importance": 0.88
+  },
+  {
+    "title": "Recall before repo exploration",
+    "trigger": "When a fresh window continues an existing project and startup context still looks sparse",
+    "steps": [
+      "Call resume_context before reading local files or docs.",
+      "If stable context is still thin, run search_memory with the project name and task nouns.",
+      "Only after recall is established, inspect the repo and continue implementation."
+    ],
+    "outcome": "Fresh windows recover both stable background and task-specific memory before local exploration drifts.",
+    "tools": ["resume_context", "search_memory"],
+    "tags": ["continuity", "startup", "retrieval"],
+    "importance": 0.91
+  },
+  {
+    "title": "Scoped project continuity recall",
+    "trigger": "When continuing a named project that already has a shared scope or project key",
+    "steps": [
+      "Call resume_context with the project scope when it is known.",
+      "Prefer scoped durable entities, patterns, and cases before falling back to global memory.",
+      "Use search_memory only after scoped continuity results are reviewed."
+    ],
+    "outcome": "Project-specific context appears before unrelated global memories in fresh windows.",
+    "tools": ["resume_context", "latest_checkpoint", "search_memory"],
+    "tags": ["continuity", "scope", "project"],
+    "importance": 0.89
   }
 ]
