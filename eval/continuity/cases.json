@@ -98,5 +98,71 @@
     "expectCheckpointAny": ["doctor", "smoke:claude-continuity", "continuity eval case"],
     "forbid": ["[助手]", "手绘涂鸦", "https://", "笑不活了", "open issues"],
     "notes": "Project-scoped checkpoints should compose cleanly when the scope uses the explicit `project:` key."
+  },
+  {
+    "name": "project_task_pivot_recall",
+    "task": "回到 RecallNest 项目，处理主动 recall regression",
+    "sessionId": "eval-task-pivot-recall",
+    "profile": "default",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": true,
+    "checkpoint": {
+      "sessionId": "eval-task-pivot-recall",
+      "scope": "project:recallnest",
+      "task": "RecallNest task-pivot recall regression",
+      "summary": "RecallNest 已补上 HTTP auto-recall，下一步把 task-pivot 的主动 recall 变成 smoke 和 eval 的稳定回归信号。",
+      "decisions": ["任务切换时也要先回忆，不能只在 continue 场景触发"],
+      "nextActions": ["补 task-pivot continuity eval case", "补 Claude Code smoke task-pivot case"],
+      "entities": ["RecallNest", "auto-recall", "search_memory", "smoke:claude-continuity"],
+      "updatedAt": "2026-03-17T14:40:00.000Z"
+    },
+    "expectStableAny": ["RecallNest", "auto-recall"],
+    "expectPatternsAny": ["search_memory"],
+    "expectCheckpointAny": ["smoke", "eval"],
+    "forbid": ["[助手]", "https://", "笑不活了", "open issues"],
+    "notes": "A named project task pivot should still surface continuity context and search_memory guidance even without an explicit continue prompt."
+  },
+  {
+    "name": "associative_recall_vague_query",
+    "task": "之前弄过那个什么 Nest 的记忆系统",
+    "profile": "default",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": false,
+    "expectStableAny": ["RecallNest", "checkpoint", "memory"],
+    "forbid": ["https://", "笑不活了"],
+    "notes": "Vague associative query should still retrieve relevant memories through fuzzy matching, not require exact keywords."
+  },
+  {
+    "name": "cross_language_recall",
+    "task": "continue my AI writing project",
+    "profile": "default",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": false,
+    "scope": "project:recallnest",
+    "expectStableAny": ["AI", "写作", "公众号"],
+    "forbid": ["https://"],
+    "notes": "English prompt should still retrieve Chinese-language durable memories when the scope is known."
+  },
+  {
+    "name": "scope_isolation_check",
+    "task": "继续我的项目",
+    "scope": "project:recallnest",
+    "profile": "default",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": false,
+    "expectStableAny": ["RecallNest"],
+    "forbid": ["content-alchemy", "content-publisher", "digital-clone"],
+    "notes": "When querying with project:recallnest scope, should NOT leak memories from other projects like content-alchemy or digital-clone."
+  },
+  {
+    "name": "legacy_null_scope_isolation",
+    "task": "之前我记得有个关于",
+    "profile": "default",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": false,
+    "scope": "project:recallnest",
+    "expectStableAny": ["RecallNest"],
+    "forbid": ["null:", "global:", "undefined"],
+    "notes": "Legacy memories without proper scope should not leak into scoped queries. The scope policy should filter them out."
   }
 ]
