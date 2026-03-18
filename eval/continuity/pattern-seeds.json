@@ -8,6 +8,7 @@
       "Continue from the recovered state instead of restating the whole project."
     ],
     "outcome": "A fresh window starts with the right project background and fewer manual reminders.",
+    "scope": "recallnest",
     "tools": ["resume_context", "latest_checkpoint"],
     "tags": ["continuity", "handoff"],
     "importance": 0.92
@@ -21,6 +22,7 @@
       "Only then close the window or switch terminals."
     ],
     "outcome": "The next window can recover active work state without depending on raw transcript recall.",
+    "scope": "recallnest",
     "tools": ["checkpoint_session"],
     "tags": ["continuity", "checkpoint"],
     "importance": 0.9
@@ -34,6 +36,7 @@
       "Prefer the stored durable pattern over temporary fallback rules in future windows."
     ],
     "outcome": "Continuity logic gradually moves from built-in fallback to reusable durable patterns.",
+    "scope": "recallnest",
     "tools": ["store_workflow_pattern", "/v1/pattern"],
     "tags": ["continuity", "promotion"],
     "importance": 0.88
@@ -47,6 +50,7 @@
       "Only after recall is established, inspect the repo and continue implementation."
     ],
     "outcome": "Fresh windows recover both stable background and task-specific memory before local exploration drifts.",
+    "scope": "recallnest",
     "tools": ["resume_context", "search_memory"],
     "tags": ["continuity", "startup", "retrieval"],
     "importance": 0.91
@@ -60,6 +64,7 @@
       "Use search_memory only after scoped continuity results are reviewed."
     ],
     "outcome": "Project-specific context appears before unrelated global memories in fresh windows.",
+    "scope": "recallnest",
     "tools": ["resume_context", "latest_checkpoint", "search_memory"],
     "tags": ["continuity", "scope", "project"],
     "importance": 0.89

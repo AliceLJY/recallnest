@@ -9,6 +9,7 @@
       "Use a lightweight task focus fallback only when no checkpoint-backed context is available."
     ],
     "outcome": "Fresh RecallNest windows now recover checkpoint-led or task-led context instead of noisy transcript snippets.",
+    "scope": "recallnest",
     "tools": ["resume_context", "checkpoint_session"],
     "tags": ["continuity", "recallnest", "startup-context"]
   },
@@ -22,6 +23,7 @@
       "Validate the behavior in a fresh terminal window and confirm checkpoint_session is called before handoff."
     ],
     "outcome": "The three terminals now have a working continuity trigger loop, so startup recall and handoff checkpoints happen without manual reminders.",
+    "scope": "recallnest",
     "tools": ["resume_context", "checkpoint_session"],
     "tags": ["continuity", "integration", "three-terminals"]
   },
