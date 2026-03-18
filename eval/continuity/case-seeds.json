@@ -56,5 +56,35 @@
     "tags": ["continuity", "eval", "checkpoint"],
     "scope": "recallnest",
     "importance": 0.85
+  },
+  {
+    "title": "RecallNest MCP transport regression",
+    "problem": "Scoped RecallNest continuity work around MCP transport could still drift unless the project-specific transport fixes were easy to recover.",
+    "context": "This came up while expanding mixed-project continuity regressions for transport-related task terms.",
+    "solutionSteps": [
+      "Store the RecallNest transport rollout as a scoped workflow pattern instead of leaving it in transient notes.",
+      "Store the transport regression cleanup as a scoped case so project-specific fixes can reappear in recentCases.",
+      "Filter scoped task results so foreign project transport rollouts do not replace RecallNest transport context."
+    ],
+    "outcome": "Scoped RecallNest transport work now recalls RecallNest-specific rollout and fix context instead of generic or foreign project results.",
+    "tools": ["resume_context", "search_memory", "eval:continuity"],
+    "tags": ["continuity", "scope", "transport", "mcp"],
+    "scope": "project:recallnest",
+    "importance": 0.87
+  },
+  {
+    "title": "Telegram bridge MCP transport regression",
+    "problem": "Bridge-specific MCP transport fixes should stay recoverable inside the bridge project without leaking into other scoped continuity requests.",
+    "context": "The bridge project uses similar transport nouns, so foreign-project filtering must still keep the bridge fixes isolated.",
+    "solutionSteps": [
+      "Store the bridge transport rollout as a bridge-scoped workflow pattern.",
+      "Store the bridge transport regression as a bridge-scoped case.",
+      "Rely on scoped task-result filtering so bridge transport fixes do not bleed into RecallNest continuity."
+    ],
+    "outcome": "Bridge transport continuity stays available inside the bridge project and stays out of unrelated project scopes.",
+    "tools": ["resume_context", "search_memory"],
+    "tags": ["continuity", "scope", "transport", "bridge"],
+    "scope": "project:telegram-bridge",
+    "importance": 0.74
   }
 ]

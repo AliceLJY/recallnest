@@ -68,5 +68,33 @@
     "tools": ["resume_context", "latest_checkpoint", "search_memory"],
     "tags": ["continuity", "scope", "project"],
     "importance": 0.89
+  },
+  {
+    "title": "RecallNest MCP transport rollout",
+    "trigger": "When RecallNest continuity work touches MCP transport wiring under project scope",
+    "steps": [
+      "Call resume_context with project:recallnest before transport changes.",
+      "Review scoped patterns and cases for prior transport fixes before editing adapters.",
+      "Keep transport rollout notes scoped to RecallNest so other projects cannot bleed into startup context."
+    ],
+    "outcome": "RecallNest transport changes recover project-specific continuity without leaking neighboring project rollout notes.",
+    "scope": "project:recallnest",
+    "tools": ["resume_context", "search_memory", "eval:continuity"],
+    "tags": ["continuity", "scope", "transport", "mcp"],
+    "importance": 0.87
+  },
+  {
+    "title": "Telegram bridge MCP transport rollout",
+    "trigger": "When Telegram bridge relay work touches MCP transport wiring under project scope",
+    "steps": [
+      "Call resume_context with project:telegram-bridge before bridge transport edits.",
+      "Review bridge-specific rollout notes before changing relay adapters.",
+      "Keep bridge transport rollout guidance isolated from other projects."
+    ],
+    "outcome": "Telegram bridge transport changes recover bridge-specific continuity without contaminating other project scopes.",
+    "scope": "project:telegram-bridge",
+    "tools": ["resume_context", "search_memory"],
+    "tags": ["continuity", "scope", "transport", "bridge"],
+    "importance": 0.74
   }
 ]
