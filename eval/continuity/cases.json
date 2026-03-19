@@ -38,6 +38,17 @@
     "notes": "Fresh windows should at least recover the active project context."
   },
   {
+    "name": "generic_named_recallnest_task_purity",
+    "task": "继续整理 RecallNest 实施清单，不要让我重复前情",
+    "profile": "default",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": false,
+    "expectStableAny": ["recallnest"],
+    "expectCasesAny": ["RecallNest scope fallback cleanup"],
+    "forbid": ["Telegram bridge", "MCP transport", "smoke:claude-continuity"],
+    "notes": "A generic named RecallNest continue prompt should keep project continuity context while suppressing same-project transport or smoke task results."
+  },
+  {
     "name": "project_scope_entity_continuity",
     "task": "继续这个项目，不要让我重复前情",
     "scope": "project:recallnest",
