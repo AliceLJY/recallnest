@@ -19,6 +19,17 @@
     "notes": "A sparse writing prompt should still recover the user's durable writing-style preferences."
   },
   {
+    "name": "writing_style_mixed_continuity",
+    "task": "接着上个窗口的写作风格",
+    "profile": "writing",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": false,
+    "expectStableAny": ["口语化", "不端着"],
+    "expectPatternsAny": ["resume_context"],
+    "forbid": ["Telegram bridge", "MCP transport"],
+    "notes": "A mixed style+continuity prompt should keep writing-style preferences and continuity guidance together."
+  },
+  {
     "name": "visual_style_continuity",
     "task": "给文章做封面和配图",
     "profile": "default",
