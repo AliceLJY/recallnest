@@ -264,5 +264,39 @@
     "expectStableAny": ["RecallNest"],
     "forbid": ["null:", "global:", "undefined", "Telegram bridge", "MCP transport", "smoke:claude-continuity"],
     "notes": "Legacy memories without proper scope should not leak into scoped queries. The scope policy should filter them out."
+  },
+  {
+    "name": "shorthand_memory_project_recall",
+    "task": "那个记忆项目，之前做到哪了",
+    "profile": "default",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": false,
+    "expectStableAny": ["RecallNest", "checkpoint", "memory"],
+    "expectPatternsAny": ["resume_context"],
+    "forbid": ["Telegram bridge", "MCP transport", "smoke:claude-continuity"],
+    "notes": "记忆项目 is a colloquial shorthand for RecallNest. Should trigger associative recall and continuity guidance."
+  },
+  {
+    "name": "shorthand_cross_terminal_memory_recall",
+    "task": "继续那个跨终端记忆",
+    "profile": "default",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": false,
+    "expectStableAny": ["RecallNest", "checkpoint", "memory"],
+    "expectPatternsAny": ["resume_context"],
+    "forbid": ["Telegram bridge", "MCP transport", "smoke:claude-continuity"],
+    "notes": "跨终端记忆 is an associative cue for RecallNest. Should route to RecallNest entity and continuity guidance."
+  },
+  {
+    "name": "english_pick_up_continuity",
+    "task": "pick up where we left off on RecallNest",
+    "profile": "default",
+    "limitPerSection": 3,
+    "includeLatestCheckpoint": false,
+    "expectStableAny": ["RecallNest"],
+    "expectPatternsAny": ["resume_context"],
+    "expectCasesAny": ["RecallNest"],
+    "forbid": ["Telegram bridge", "MCP transport", "smoke:claude-continuity"],
+    "notes": "English pick up / left off should trigger continuity guidance just like Chinese continuation verbs."
   }
 ]
