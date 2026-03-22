@@ -34,7 +34,7 @@
     "limitPerSection": 3,
     "includeLatestCheckpoint": false,
     "expectStableAny": ["RecallNest"],
-    "forbid": ["https://", "笑不活了", "open issues", "Telegram bridge", "MCP transport"],
+    "forbid": ["https://", "笑不活了", "open issues", "Telegram bridge", "MCP transport", "Three-terminal continuity trigger validation", "Scoped recall leaked conversational durable pins", "Scoped mixed-project pin collision leaked foreign project summaries", "Scoped entity recall leaked foreign project entities via shared tool nouns", "Scoped task results leaked foreign project patterns and cases", "incremental A2A details", "Borderline transcript dedup"],
     "notes": "Fresh windows should at least recover the active project context."
   },
   {
@@ -44,9 +44,9 @@
     "limitPerSection": 3,
     "includeLatestCheckpoint": false,
     "expectStableAny": ["recallnest"],
-    "expectCasesAny": ["RecallNest scope fallback cleanup"],
-    "forbid": ["Telegram bridge", "MCP transport", "smoke:claude-continuity"],
-    "notes": "A generic named RecallNest continue prompt should keep project continuity context while suppressing same-project transport or smoke task results."
+    "expectCasesAny": ["RecallNest sparse startup context cleanup"],
+    "forbid": ["Telegram bridge", "MCP transport", "smoke:claude-continuity", "doctor baseline", "seed:continuity", "workflow_observe", "workflow observation", "Three-terminal continuity trigger validation", "Scoped recall leaked conversational durable pins", "Scoped mixed-project pin collision leaked foreign project summaries", "Scoped entity recall leaked foreign project entities via shared tool nouns", "Scoped task results leaked foreign project patterns and cases", "incremental A2A details", "Borderline transcript dedup"],
+    "notes": "A generic named RecallNest continue prompt should keep project continuity context while suppressing same-project transport, smoke, doctor, or seed task results."
   },
   {
     "name": "project_scope_entity_continuity",
@@ -56,7 +56,7 @@
     "limitPerSection": 3,
     "includeLatestCheckpoint": false,
     "expectStableAny": ["RecallNest", "checkpoint_session", "resume_context"],
-    "forbid": ["https://", "笑不活了", "open issues", "Telegram bridge", "MCP transport", "smoke:claude-continuity"],
+    "forbid": ["https://", "笑不活了", "open issues", "Telegram bridge", "MCP transport", "smoke:claude-continuity", "incremental A2A details", "Borderline transcript dedup", "profile forwarding gap", "sparse writing prompts", "profile: writing"],
     "notes": "When the project scope is known, stable project entities should survive even if the task prompt is sparse."
   },
   {
@@ -87,7 +87,7 @@
       "updatedAt": "2026-03-16T03:30:00.000Z"
     },
     "expectCheckpointAny": ["Phase 3", "resume_context", "store_memory"],
-    "forbid": ["[助手]", "手绘涂鸦", "本地没 clone", "https://", "笑不活了", "open issues", "MCP transport"],
+    "forbid": ["[助手]", "手绘涂鸦", "本地没 clone", "https://", "笑不活了", "open issues", "MCP transport", "continuity eval checkpoint isolation", "Three-terminal continuity trigger validation"],
     "notes": "When a project checkpoint exists, resume_context should prefer checkpoint-led continuity over noisy transcript fragments."
   },
   {
@@ -109,7 +109,7 @@
     },
     "expectStableAny": ["RecallNest"],
     "expectCheckpointAny": ["doctor", "smoke:claude-continuity", "continuity eval case"],
-    "forbid": ["[助手]", "手绘涂鸦", "https://", "笑不活了", "open issues", "Telegram bridge", "MCP transport"],
+    "forbid": ["[助手]", "手绘涂鸦", "https://", "笑不活了", "open issues", "Telegram bridge", "MCP transport", "incremental A2A details", "Borderline transcript dedup", "profile forwarding gap", "sparse writing prompts", "profile: writing"],
     "notes": "Project-scoped checkpoints should compose cleanly when the scope uses the explicit `project:` key."
   },
   {
@@ -132,7 +132,7 @@
     "expectStableAny": ["RecallNest", "auto-recall"],
     "expectPatternsAny": ["search_memory"],
     "expectCheckpointAny": ["smoke", "eval"],
-    "forbid": ["[助手]", "https://", "笑不活了", "open issues", "MCP transport"],
+    "forbid": ["[助手]", "https://", "笑不活了", "open issues", "MCP transport", "incremental A2A details", "Borderline transcript dedup"],
     "notes": "A named project task pivot should still surface continuity context and search_memory guidance even without an explicit continue prompt."
   },
   {
@@ -240,7 +240,7 @@
     "limitPerSection": 3,
     "includeLatestCheckpoint": false,
     "expectStableAny": ["RecallNest"],
-    "forbid": ["content-alchemy", "content-publisher", "digital-clone", "Telegram bridge", "MCP transport", "smoke:claude-continuity"],
+    "forbid": ["content-alchemy", "content-publisher", "digital-clone", "Telegram bridge", "MCP transport", "smoke:claude-continuity", "profile forwarding gap", "sparse writing prompts", "profile: writing", "shared components skewed later continuity previews", "single-case replay", "per-case fresh components"],
     "notes": "When querying with project:recallnest scope, should NOT leak memories from other projects like content-alchemy or digital-clone."
   },
   {
