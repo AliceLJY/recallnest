@@ -22,9 +22,9 @@ function resolveObservationScope(
   response?: Pick<ResumeContextResponse, "resolvedScope" | "latestCheckpoint">,
 ): string | undefined {
   return request.scope
-    || (request.sessionId ? `session:${request.sessionId}` : undefined)
     || response?.resolvedScope
-    || response?.latestCheckpoint?.resolvedScope;
+    || response?.latestCheckpoint?.resolvedScope
+    || (request.sessionId ? `session:${request.sessionId}` : undefined);
 }
 
 export function buildManagedResumeObservation(

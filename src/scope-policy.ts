@@ -59,6 +59,21 @@ export interface ScopeSelection {
   inferredFrom?: string;
 }
 
+function isSessionDerivedScope(inferredFrom?: string): boolean {
+  return inferredFrom === "sessionId" || inferredFrom === "RECALLNEST_SESSION_ID";
+}
+
+/**
+ * Resume-context wrappers should treat session-derived scope as a lookup hint,
+ * not as an explicit retrieval boundary. A session can legitimately checkpoint
+ * into a shared project scope, and forcing `session:<id>` back into resume
+ * queries can hide that checkpoint or narrow subsequent recall too far.
+ */
+export function resolveResumeScope(selection: Pick<ScopeSelection, "resolvedScope" | "inferredFrom">): string | undefined {
+  if (!selection.resolvedScope) return undefined;
+  return isSessionDerivedScope(selection.inferredFrom) ? undefined : selection.resolvedScope;
+}
+
 export function resolveScopeSelection(options: ScopeSelectionOptions): ScopeSelection {
   if (options.allScopes) {
     return {

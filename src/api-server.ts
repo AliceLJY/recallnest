@@ -23,7 +23,7 @@ import { buildWorkflowEvidence, buildWorkflowObservationRecord, inspectWorkflowD
 import { WorkflowObservationStore } from "./workflow-observation-store.js";
 import { buildManagedCheckpointObservation, buildManagedResumeObservation } from "./workflow-observation-managed.js";
 import { runAutoRecall } from "./auto-recall.js";
-import { buildRetrievalContext, resolveScopeSelection } from "./scope-policy.js";
+import { buildRetrievalContext, resolveResumeScope, resolveScopeSelection } from "./scope-policy.js";
 
 const config = (loadDotEnv(), loadConfig());
 const getComponents = createComponentResolver(config);
@@ -518,12 +518,13 @@ async function handleResume(request: Request): Promise<Response> {
       operation: "api:/v1/resume",
       allowUnscoped: true,
     });
+    const resumeScope = resolveResumeScope(scopeSelection);
     const context = await composeResumeContext({
       retriever,
       checkpointStore,
     }, {
       ...body,
-      scope: scopeSelection.resolvedScope,
+      scope: resumeScope,
       profile: profile.name,
     });
     await saveManagedObservation(buildManagedResumeObservation({

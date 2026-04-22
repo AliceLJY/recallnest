@@ -1,7 +1,7 @@
 import { composeResumeContext, type ResumeContextDeps } from "./context-composer.js";
 import type { DurableMemoryCategory } from "./memory-schema.js";
 import type { RetrievalResult } from "./retriever.js";
-import { buildRetrievalContext, resolveScopeSelection } from "./scope-policy.js";
+import { buildRetrievalContext, resolveResumeScope, resolveScopeSelection } from "./scope-policy.js";
 import type { RetrievalProfileName, ResumeContextResponse } from "./session-schema.js";
 
 export interface AutoRecallRequest {
@@ -46,9 +46,7 @@ export async function runAutoRecall(
     env: request.env,
     allowUnscoped: true,
   });
-  const resumeScope = scopeSelection.inferredFrom === "sessionId"
-    ? undefined
-    : scopeSelection.resolvedScope;
+  const resumeScope = resolveResumeScope(scopeSelection);
 
   const resume = await composeResumeContext(deps, {
     task,

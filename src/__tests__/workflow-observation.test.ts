@@ -95,7 +95,10 @@ describe("workflow observation engine", () => {
 
       const dashboard = buildWorkflowHealthDashboard(
         await store.listRecent({ scope: "project:recallnest", limit: 50 }),
-        { scope: "project:recallnest" },
+        {
+          scope: "project:recallnest",
+          now: new Date("2026-03-17T12:00:00.000Z"),
+        },
       );
       expect(dashboard[0]?.workflowId).toBe("checkpoint_session");
       expect(dashboard[0]?.status).toBe("critical");
@@ -175,6 +178,27 @@ describe("workflow observation engine", () => {
     });
 
     expect(observation.scope).toBe("project:recallnest");
+  });
+
+  it("prefers response scope over session fallback for managed resume observations", () => {
+    const observation = buildManagedResumeObservation({
+      task: "Continue document-test checkpoint investigation",
+      sessionId: "codex-2026-04-22-repo-tree-archive-setup",
+    }, {
+      resolvedScope: "project:document-test",
+      stableContext: ["Checkpoint summary: Continue RecallNest checkpoint debugging."],
+      relevantPatterns: [],
+      recentCases: [],
+      latestCheckpoint: {
+        sessionId: "codex-2026-04-22-repo-tree-archive-setup",
+        resolvedScope: "project:document-test",
+        summary: "Checkpoint summary",
+        updatedAt: "2026-04-22T09:00:00.000Z",
+      },
+      responseMode: "default",
+    });
+
+    expect(observation.scope).toBe("project:document-test");
   });
 
   it("reviews and applies cue-based scope suggestions for legacy global workflow observations", () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { matchesScopeFilter, resolveScopeSelection, resolveSessionScope } from "../scope-policy.js";
+import { matchesScopeFilter, resolveResumeScope, resolveScopeSelection, resolveSessionScope } from "../scope-policy.js";
 
 describe("scope-policy", () => {
   it("prefers explicit scope over inferred values", () => {
@@ -30,6 +30,26 @@ describe("scope-policy", () => {
     expect(resolved.resolvedScope).toBe("session:session-123");
     expect(resolved.scopeFilter).toEqual(["session:session-123"]);
     expect(resolved.inferredFrom).toBe("sessionId");
+  });
+
+  it("does not reuse session-derived scope as an explicit resume boundary", () => {
+    expect(resolveResumeScope({
+      resolvedScope: "session:session-123",
+      inferredFrom: "sessionId",
+      allScopes: false,
+    })).toBeUndefined();
+
+    expect(resolveResumeScope({
+      resolvedScope: "session:session-123",
+      inferredFrom: "RECALLNEST_SESSION_ID",
+      allScopes: false,
+    })).toBeUndefined();
+
+    expect(resolveResumeScope({
+      resolvedScope: "project:recallnest",
+      inferredFrom: "scope",
+      allScopes: false,
+    })).toBe("project:recallnest");
   });
 
   it("uses environment defaults when request scope is omitted", () => {

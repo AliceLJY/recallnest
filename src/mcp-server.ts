@@ -101,7 +101,7 @@ import { buildWorkflowEvidence, buildWorkflowObservationRecord, inspectWorkflowD
 import { formatWorkflowEvidencePack, formatWorkflowHealthDashboard, formatWorkflowHealthReport, formatWorkflowObservationSaved } from "./workflow-observation-output.js";
 import { WorkflowObservationStore } from "./workflow-observation-store.js";
 import { buildManagedCheckpointObservation, buildManagedResumeObservation } from "./workflow-observation-managed.js";
-import { buildRetrievalContext, resolveScopeSelection } from "./scope-policy.js";
+import { buildRetrievalContext, resolveResumeScope, resolveScopeSelection } from "./scope-policy.js";
 import { matchesTemporalConstraint, type TemporalConstraint } from "./temporal-parser.js";
 import { setReminder, checkTriggers, fireReminder, formatReminders } from "./prospective-memory.js";
 
@@ -761,9 +761,10 @@ registerTool(
         operation: "resume_context",
         allowUnscoped: true,
       });
+      const resumeScope = resolveResumeScope(scopeSelection);
       const latest = await checkpointStore.getLatest({
         sessionId,
-        scope: scopeSelection.resolvedScope,
+        scope: resumeScope,
       });
       const summaryText = formatCheckpointSummary(latest) +
         "\n\nFor detailed recall, use search_memory with specific queries.";
@@ -771,7 +772,7 @@ registerTool(
         workflowId: "resume_context",
         outcome: "success",
         summary: `Managed resume_context returned summary-mode checkpoint${latest ? "" : " (none found)"}.`,
-        scope: scopeSelection.resolvedScope || scope || "global",
+        scope: latest?.resolvedScope || resumeScope || scope || "global",
         source: "managed:recallnest",
         signal: "managed-resume-summary",
         task,
@@ -793,12 +794,13 @@ registerTool(
       operation: "resume_context",
       allowUnscoped: true,
     });
+    const resumeScope = resolveResumeScope(scopeSelection);
     const context = await composeResumeContext({
       retriever,
       checkpointStore,
     }, {
       task,
-      scope: scopeSelection.resolvedScope,
+      scope: resumeScope,
       sessionId,
       limitPerSection,
       includeLatestCheckpoint,
