@@ -1,6 +1,13 @@
 import { describe, expect, it } from "bun:test";
 
-import { formatExplainResults, formatSearchResults } from "../memory-output.js";
+import {
+  formatBriefResults,
+  formatCollapsedResults,
+  formatExplainResults,
+  formatFullResults,
+  formatSearchResults,
+} from "../memory-output.js";
+import { estimateTokens } from "../context-collapse-renderer.js";
 import type { RetrievalResult } from "../retriever.js";
 
 function buildResult(id: string, metadata: Record<string, unknown>): RetrievalResult {
@@ -274,5 +281,136 @@ describe("memory output — session 级图片标记", () => {
     );
 
     expect(output).not.toContain("imgs :");
+  });
+});
+
+// 2026-09-11：pivot 池 1,516 条批量提炼行的转述句没逐条核对过，抽 20 条有 8 条与自存原文有实质出入。
+// 读取时把行上已有的原文 anchor 亮出来，表头说明以原文为准。
+describe("memory output — 批量提炼行附原文", () => {
+  const ANCHOR = "说很多次了，只要我说我们记忆项目，就是只这个master仓库。";
+  const ctx = { query: "记忆项目", profile: "default" as const };
+
+  function buildDistilled(id: string, extra: Record<string, unknown> = {}): RetrievalResult {
+    return buildResult(id, {
+      source: "session_distill",
+      tags: ["src:a9d91600", "date:2026-03-13", "pivot-apply", "batch:pref-r1-p3", "pinned"],
+      anchor: ANCHOR,
+      ...extra,
+    });
+  }
+
+  it("normal 档：批量行多一行 orig，带原会话日期和原文，表头说明以原文为准", () => {
+    const output = formatSearchResults([buildDistilled("abcd1234-0000-0000-0000-0000000000d1")], ctx);
+
+    expect(output).toContain(`orig : (2026-03-13 session) ${ANCHOR}`);
+    expect(output).toContain("Note    :");
+    expect(output).toContain("trust orig");
+  });
+
+  // 反向断言：当场记录的行也存 anchor，但语义不同——不该冒出 orig 行，更不该出表头说明
+  it("非批量行即使带 anchor 也不出 orig 行和表头说明", () => {
+    const output = formatSearchResults(
+      [
+        buildResult("abcd1234-0000-0000-0000-0000000000d2", {
+          source: "manual",
+          tags: ["pinned", "2026-08-01"],
+          anchor: "某句检索锚点",
+        }),
+      ],
+      ctx,
+    );
+
+    expect(output).not.toContain("orig :");
+    expect(output).not.toContain("Note    :");
+  });
+
+  it("批量行与当场记录混排时，只有批量行带 orig，且不串到下一条", () => {
+    const output = formatSearchResults(
+      [
+        buildDistilled("abcd1234-0000-0000-0000-0000000000d3"),
+        buildResult("abcd1234-0000-0000-0000-0000000000d4", { source: "manual", tags: ["pinned"], anchor: "锚点" }),
+      ],
+      ctx,
+    );
+    const lines = output.split("\n");
+    const origIdx = lines.findIndex((line) => line.startsWith("   orig : "));
+    const secondRowIdx = lines.findIndex((line) => line.startsWith("2  abcd1234"));
+
+    expect(output.match(/^ {3}orig : /gm)?.length).toBe(1);
+    expect(origIdx).toBeGreaterThan(-1);
+    expect(origIdx).toBeLessThan(secondRowIdx);
+  });
+
+  it("full 档同样附原文", () => {
+    const output = formatFullResults([buildDistilled("abcd1234-0000-0000-0000-0000000000d5")], ctx);
+
+    expect(output).toContain(`orig : (2026-03-13 session) ${ANCHOR}`);
+    expect(output).toContain("Note    :");
+  });
+
+  it("brief 档只标不附原文，保持简短", () => {
+    const output = formatBriefResults(
+      [
+        buildDistilled("abcd1234-0000-0000-0000-0000000000d6"),
+        buildResult("abcd1234-0000-0000-0000-0000000000d7", { source: "manual" }),
+      ],
+      { query: "记忆项目" },
+    );
+    const markedRows = output.split("\n").filter((line) => line.startsWith("#") && line.includes("[distilled"));
+
+    expect(markedRows.length).toBe(1);
+    expect(markedRows[0]).toContain("[distilled, 2026-03-13 session]");
+    expect(output).not.toContain(ANCHOR);
+    expect(output).toContain("detail_level=normal");
+  });
+
+  it("adaptive 档附原文，并把原文算进 token 预算", () => {
+    const single = formatCollapsedResults([buildDistilled("abcd1234-0000-0000-0000-0000000000d8")], ctx);
+    expect(single).toContain(`orig: (2026-03-13 session) ${ANCHOR}`);
+    expect(single).toContain("Note    :");
+
+    // 塞满预算：每条显示出来的批量行都必须带着原文，不能为了挤进预算把原文丢掉
+    const longText = "很长的提炼句".repeat(200);
+    const many = Array.from({ length: 200 }, (_, i) =>
+      buildDistilled(`abcd1234-0000-0000-0000-${String(i).padStart(12, "0")}`),
+    ).map((result) => ({ ...result, score: 0.5, entry: { ...result.entry, text: longText } }));
+    const output = formatCollapsedResults(many, ctx);
+    const shown = Number(/Shown\s+: (\d+) of 200/.exec(output)?.[1]);
+
+    expect(shown).toBeGreaterThan(0);
+    expect(shown).toBeLessThan(200);
+    expect(output.match(/^orig: /gm)?.length).toBe(shown);
+
+    // 真正核预算：显示出来的正文 + 原文加起来不许超 8000。只数条数挡不住「原文没算进预算」——
+    // 那种写法照样每条都带原文，只是总量悄悄超标。
+    const lines = output.split("\n");
+    let used = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (!/^\[(FULL|SNIP)\] /.test(lines[i] ?? "")) continue;
+      used += estimateTokens(lines[i + 1] ?? "");
+      const next = lines[i + 2] ?? "";
+      if (next.startsWith("orig: ")) used += estimateTokens(next);
+    }
+    expect(used).toBeLessThanOrEqual(8000);
+  });
+
+  it("批量行缺原文时照样标出来，不崩", () => {
+    const output = formatSearchResults(
+      [buildResult("abcd1234-0000-0000-0000-0000000000d9", { source: "session_distill", tags: ["pivot-apply"] })],
+      ctx,
+    );
+
+    expect(output).toContain("orig : (source text missing)");
+  });
+
+  it("原文过长时截断并留省略号", () => {
+    const output = formatSearchResults(
+      [buildDistilled("abcd1234-0000-0000-0000-0000000000da", { anchor: "原".repeat(500) })],
+      ctx,
+    );
+    const origLine = output.split("\n").find((line) => line.startsWith("   orig : ")) ?? "";
+
+    expect(origLine.endsWith("...")).toBe(true);
+    expect(origLine.length).toBeLessThan(220);
   });
 });
