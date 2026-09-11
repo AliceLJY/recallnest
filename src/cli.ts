@@ -35,8 +35,11 @@ import {
   ingestMarkdownFiles,
   ingestObsidianVault,
   ingestConnectorFile,
+  parseCCTranscript,
 } from "./ingest.js";
 import { runDoctor, formatDoctorResults } from "./doctor.js";
+import { archiveIngestedMinisFiles } from "./minis-archive.js";
+import { isProcessed } from "./tracker.js";
 import { persistCaseMemory, persistMemory, persistWorkflowPattern } from "./capture-engine.js";
 import {
   scanMemoryPromotions,
@@ -1551,6 +1554,15 @@ program
           });
           results.push(r);
           console.log(`  ✅ Minis: ${formatIngestSummary(r)}`);
+          // 入库过的挪进 data/minis-archive（Deja 从那里读，记忆库不再读它），原因见 minis-archive.ts 文件头
+          const archiveDir = resolve(metaDir(import.meta), "..", "data", "minis-archive");
+          const moved = archiveIngestedMinisFiles(minisPath, archiveDir, isProcessed, (p) => parseCCTranscript(p).length > 0);
+          if (moved.archived.length > 0 || moved.errors.length > 0) {
+            const failed = moved.errors.length > 0
+              ? `，${moved.errors.length} 个出错、原件留在原处：${moved.errors.join("；")}`
+              : "";
+            console.log(`  📦 Minis 存档: ${moved.archived.length} 个移入 data/minis-archive${failed}`);
+          }
         } else if (source === "minis") {
           console.log(`⚠️  Minis 目录不存在: ${minisPath}`);
         }

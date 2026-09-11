@@ -19,9 +19,11 @@ key 直接就是库里的 scope，回填时做字符串相等匹配。
     bun scripts/backfill-session-images.ts --dry-run
     bun scripts/backfill-session-images.ts
 
-已知不覆盖：minis 源。它的 jsonl 落在 ~/Desktop/minis-outbox/ingest，
-被 macOS TCC 挡住无法列举，也不在 ~/conversation-truth 里。影响面实测 22 条
-记忆（全库 0.026%）。
+已知不覆盖：minis 源（库里挂 minis:<sid>）。2026-09-11 起它入库后的原文存档到
+~/recallnest/data/minis-archive，经统一树出现在 ~/conversation-truth/claude/projects/minis/，
+但本脚本按 claude 端算 key 是 cc:<sid>，与库里的 minis:<sid> 对不上，回填时自然落空、不会打错标。
+新会话的图片标记在 ingest 时已经打上，不靠本脚本；缺的只有 08-20 那场 minis:4d1dc0ee 的 22 条。
+08-20 之前那批 Minis 对话挂在 cc: 下、原文在 desktop-import，照常覆盖。
 """
 import json, os, time, collections
 
