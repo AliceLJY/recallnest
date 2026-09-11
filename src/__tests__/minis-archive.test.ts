@@ -45,10 +45,11 @@ afterEach(() => {
 });
 
 describe("archiveIngestedMinisFiles", () => {
-  it("入库过的文件：存档里有逐字节一样的一份、沿用原件 mtime，原件从投递目录消失", () => {
+  it("入库过的文件：存档里有逐字节一样的一份、沿用原件 mtime 和权限，原件从投递目录消失", () => {
     const src = join(drop, "conversation-20260903-悬案局第四案.jsonl");
     const body = conversation(5);
     writeFileSync(src, body);
+    chmodSync(src, 0o600);
     const past = new Date("2026-09-03T00:45:02+08:00");
     utimesSync(src, past, past);
 
@@ -59,6 +60,7 @@ describe("archiveIngestedMinisFiles", () => {
     expect(result.errors).toEqual([]);
     expect(readFileSync(target, "utf-8")).toBe(body);
     expect(statSync(target).mtimeMs).toBe(past.getTime());
+    expect(statSync(target).mode & 0o777).toBe(0o600);
     expect(existsSync(src)).toBe(false);
   });
 
