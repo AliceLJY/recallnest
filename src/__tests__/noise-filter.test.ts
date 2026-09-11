@@ -203,3 +203,34 @@ describe("isNoise — greeting word boundary regression", () => {
     expect(isNoise("good morning everyone")).toBe(true);
   });
 });
+
+// 2026-09-11：否认句 / 问记忆的问句只对短话生效。改前改后全库对比，有 7 段规则文件的文档导入块
+// （983–1,487 字）只因含「我没找到」「我没有数据」被检索层整段丢掉。
+describe("isNoise — denial / meta-question patterns only apply to short utterances", () => {
+  const filler = "这是一段正常的笔记正文，记录了当时的判断、证据和后续动作。".repeat(8);
+
+  it("still filters a short Chinese denial", () => {
+    expect(isNoise("我没有相关记忆。")).toBe(true);
+  });
+  it("still filters a short English denial", () => {
+    expect(isNoise("I don't recall that.")).toBe(true);
+  });
+  it("still filters a short meta-question", () => {
+    expect(isNoise("你还记得吗？上次那个方案")).toBe(true);
+  });
+  it("keeps a long note that merely contains 没有记忆", () => {
+    expect(isNoise(`否决：它公开的仓库里根本没有记忆实现。${filler}`)).toBe(false);
+  });
+  it("keeps a long note that contains 我没有数据", () => {
+    expect(isNoise(`${filler}这条要她先回答一个我没有数据的问题。`)).toBe(false);
+  });
+  it("keeps a long note that quotes 我之前说过", () => {
+    expect(isNoise(`她原话：我之前说过，只要我说我们记忆项目就是指那个仓库。${filler}`)).toBe(false);
+  });
+  it("draws the line at 200 characters", () => {
+    const denial = "我没有相关记忆。";
+    const padTo = (n: number) => denial + "某".repeat(n - denial.length);
+    expect(isNoise(padTo(200))).toBe(true);
+    expect(isNoise(padTo(201))).toBe(false);
+  });
+});
