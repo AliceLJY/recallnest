@@ -115,6 +115,49 @@ function formatSessionImages(result: RetrievalResult): string | null {
   return `${parts.join(", ")} in this session · read sess=${sess}`;
 }
 
+interface DistilledSource {
+  /** 原会话日期（`date:` 标签），不是写入日——批量回填的行两者能差出半年。 */
+  date: string | null;
+  /** 写入时存在行上的原文 anchor；可能是当时助手说的，不一定是用户的话。 */
+  text: string;
+}
+
+/**
+ * 批量提炼行（pivot-apply 从历史会话回填，2026-08-04/05 共 1,516 条）：表里那句是转述，不是原话。
+ *
+ * 这批提炼句没逐条核对过——2026-09-11 抽 20 条对照各自存的原文，8 条有实质走样（丢限定词、
+ * 一次性要求记成长期规则、把当时助手的话记成用户偏好……）。原文 anchor 本来就存在行上，
+ * 读取时亮出来，比事后清洗存量便宜，也能罩住以后同一条路写进来的行。
+ *
+ * 只认 pivot-apply 标签：当场记录（manual / agent）的 anchor 语义不同，不在这里出。
+ * 不是批量行时返回 null，调用方据此什么都不输出——不给别的记忆添噪音。
+ */
+function getDistilledSource(result: RetrievalResult): DistilledSource | null {
+  const meta = parseMetadata(result.entry);
+  const tags = Array.isArray(meta.tags) ? meta.tags.map(String) : [];
+  if (!tags.includes("pivot-apply")) return null;
+  const dateTag = tags.find((tag) => tag.startsWith("date:"));
+  return {
+    date: dateTag ? dateTag.slice("date:".length) : null,
+    text: typeof meta.anchor === "string" ? meta.anchor : "",
+  };
+}
+
+const DISTILLED_ORIGIN_MAX_LEN = 160;
+
+// 措辞用英文，与 prov / imgs / fresh 行保持一致（这个输出面是英文的）。
+const DISTILLED_NOTE =
+  "rows with an orig line were batch-distilled from old sessions: the snippet is a paraphrase, " +
+  "orig is the source text (it may be the assistant's words, not the user's) — trust orig";
+
+function formatDistilledOrigin(source: DistilledSource): string {
+  const when = source.date ? `(${source.date} session) ` : "";
+  const text = source.text
+    ? cleanSnippet(source.text, DISTILLED_ORIGIN_MAX_LEN)
+    : "(source text missing)";
+  return `${when}${text}`;
+}
+
 function getProvenanceSummary(result: RetrievalResult): string {
   const provenance = extractMemoryProvenance({
     scope: result.entry.scope,
@@ -384,14 +427,25 @@ export function formatBriefResults(
 ): string {
   if (results.length === 0) return "No results found.";
   const freshnessCache = createFreshnessCache();
-  const lines = [`Query: ${context.query}`, `Hits: ${results.length}`, ""];
+  // brief 只标不附原文：它就是为省 token 选的档，原文会让它长一倍。
+  const distilled = results.map(getDistilledSource);
+  const lines = [
+    `Query: ${context.query}`,
+    `Hits: ${results.length}`,
+    ...(distilled.some(Boolean)
+      ? ["Note: [distilled] rows paraphrase old sessions — use detail_level=normal to see the source text"]
+      : []),
+    "",
+  ];
   for (let i = 0; i < results.length; i++) {
     const r = results[i];
     const excerpt = extractBriefExcerpt(r);
+    const orig = distilled[i] ?? null;
+    const distilledTag = orig ? ` [distilled${orig.date ? `, ${orig.date} session` : ""}]` : "";
     // Freshness suffix: only for memories that declared dependsOn (opt-in, cheap check).
     const fresh = evaluateEntryFreshness(r.entry.metadata, freshnessCache);
     const freshTag = fresh ? ` [fresh:${fresh}]` : "";
-    lines.push(`#${i + 1} ${r.entry.id.slice(0, 8)} ${(r.score * 100).toFixed(1)}% — ${excerpt}${freshTag}`);
+    lines.push(`#${i + 1} ${r.entry.id.slice(0, 8)} ${(r.score * 100).toFixed(1)}% — ${excerpt}${distilledTag}${freshTag}`);
   }
   return lines.join("\n");
 }
@@ -403,10 +457,12 @@ export function formatFullResults(
   if (results.length === 0) return "No results found.";
 
   const freshnessCache = createFreshnessCache();
+  const distilled = results.map(getDistilledSource);
   const lines = [
     `Query   : ${context.query}`,
     `Profile : ${context.profile}`,
     `Hits    : ${results.length}`,
+    ...(distilled.some(Boolean) ? [`Note    : ${DISTILLED_NOTE}`] : []),
     "",
     "#  ID       Score Category     Tier       Source  Date       Age   Retrieval Path       File / Snippet",
     "-- -------- ----- ------------ ---------- ------- ---------- ----- -------------------- --------------",
@@ -418,6 +474,8 @@ export function formatFullResults(
     lines.push(`   prov : ${getProvenanceSummary(results[i])}`);
     const imgs = formatSessionImages(results[i]);
     if (imgs) lines.push(`   imgs : ${imgs}`);
+    const orig = distilled[i] ?? null;
+    if (orig) lines.push(`   orig : ${formatDistilledOrigin(orig)}`);
     // Full mode: append metadata details
     const meta = parseMetadata(results[i].entry);
     const evolution = typeof meta.evolutionStatus === "string" ? meta.evolutionStatus : "-";
@@ -455,10 +513,12 @@ export function formatSearchResults(
   if (results.length === 0) return "No results found.";
 
   const freshnessCache = createFreshnessCache();
+  const distilled = results.map(getDistilledSource);
   const lines = [
     `Query   : ${context.query}`,
     `Profile : ${context.profile}`,
     `Hits    : ${results.length}`,
+    ...(distilled.some(Boolean) ? [`Note    : ${DISTILLED_NOTE}`] : []),
     "",
     "#  ID       Score Category     Tier       Source  Date       Age   Retrieval Path       File / Snippet",
     "-- -------- ----- ------------ ---------- ------- ---------- ----- -------------------- --------------",
@@ -470,6 +530,8 @@ export function formatSearchResults(
     lines.push(`   prov : ${getProvenanceSummary(results[i])}`);
     const imgs = formatSessionImages(results[i]);
     if (imgs) lines.push(`   imgs : ${imgs}`);
+    const orig = distilled[i] ?? null;
+    if (orig) lines.push(`   orig : ${formatDistilledOrigin(orig)}`);
     // Freshness: only shown for memories that declared dependsOn (opt-in, cheap check).
     const fresh = evaluateEntryFreshness(results[i].entry.metadata, freshnessCache);
     if (fresh) lines.push(`   fresh: ${fresh}`);
@@ -504,6 +566,7 @@ export function formatCollapsedResults(
   const rendered: string[] = [];
   let tokensUsed = 0;
   let shown = 0;
+  let anyOrigShown = false;
 
   // 保留传入顺序（不重排）：handler 已按 normal=score / highlight=contextual 排好。
   for (const r of results) {
@@ -511,14 +574,18 @@ export function formatCollapsedResults(
     let level = isFull ? "FULL" : "SNIP";
     // query-aware：snippet 取匹配词周围窗口、显示匹配证据（search 是"为什么命中"）。
     let text = isFull ? r.entry.text : adaptiveSnippet(context.query, r.entry.text);
-    let tokens = estimateTokens(text);
+    // 批量提炼行附原文。它同样占预算，和正文一起算，别让原文把预算悄悄撑破。
+    const orig = getDistilledSource(r);
+    const origLine = orig ? `orig: ${formatDistilledOrigin(orig)}` : "";
+    const origTokens = origLine ? estimateTokens(origLine) : 0;
+    let tokens = estimateTokens(text) + origTokens;
 
     if (tokensUsed + tokens > ADAPTIVE_TOKEN_BUDGET) {
       if (isFull) {
         // 全文超预算 → 降级为 query-aware snippet
         text = adaptiveSnippet(context.query, r.entry.text);
         level = "SNIP";
-        tokens = estimateTokens(text);
+        tokens = estimateTokens(text) + origTokens;
       }
       if (tokensUsed + tokens > ADAPTIVE_TOKEN_BUDGET) break; // snippet 仍超 → 停止，剩余计入 omitted
     }
@@ -530,6 +597,10 @@ export function formatCollapsedResults(
     const scorePct = `${(r.score * 100).toFixed(0)}%`;
     rendered.push(`[${level}] ${id}  ${scorePct}  ${getCategoryLabel(r)}  ${getSourceLabel(r)}`);
     rendered.push(text);
+    if (origLine) {
+      rendered.push(origLine);
+      anyOrigShown = true;
+    }
     rendered.push("");
   }
 
@@ -539,6 +610,7 @@ export function formatCollapsedResults(
     `Profile : ${context.profile}`,
     `Mode    : adaptive — full text for score ≥ ${ADAPTIVE_FULL_SCORE}, query-aware snippet otherwise, ${ADAPTIVE_TOKEN_BUDGET}-token budget`,
     `Shown   : ${shown} of ${results.length}${omitted > 0 ? ` (${omitted} omitted: token budget)` : ""}`,
+    ...(anyOrigShown ? [`Note    : ${DISTILLED_NOTE}`] : []),
     "",
     ...rendered,
   ];
