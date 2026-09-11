@@ -65,6 +65,11 @@ const SHORT_BOILERPLATE_PATTERNS = [
 ];
 const BOILERPLATE_MAX_LENGTH = 10;
 
+// Denial / meta-question patterns describe a whole short utterance ("我没有相关记忆" /
+// "你还记得吗"), so they only apply up to this length. Unanchored substring matching on
+// long text drops real content — see the note in isNoise().
+const UTTERANCE_MAX_LENGTH = 200;
+
 // OpenClaw v3.2+ injected metadata headers (backport from v1.0.29)
 const METADATA_HEADER_PATTERNS = [
   /^Conversation info \(untrusted metadata\)/i,
@@ -150,11 +155,19 @@ export function isNoise(text: string, options: NoiseFilterOptions = {}): boolean
     return true;
   }
 
-  if (opts.filterDenials && DENIAL_PATTERNS.some(p => p.test(trimmed))) {
+  // 否认句 / 问记忆的问句说的是「一整句短话」（助手说没有相关记忆、用户问你还记得吗）。
+  // 不锚定的子串匹配放到长文本上会误伤正文：2026-09-11 改前改后全库对比，有 7 段文档导入块
+  // （983–1,487 字，4 段 open-loops.md、3 段 feedback/reference 规则文件——其中两段讲的恰是
+  // 「"我没找到"不等于"它不存在"」）只因含「我没找到」「我没有数据」被检索层整段丢掉；一条 500 字的
+  // store_memory 因为含「没有记忆实现」被写入闸拒掉。长文本里夹着这类子串，不再算噪声。
+  // （同一作用域另有约 245 段被 bridge 提示词规则判掉，全来自 session-index 回填文件，那组规则
+  //  故意不锚定、不适用长度门槛，不在这里处理。）
+  const isShortUtterance = trimmed.length <= UTTERANCE_MAX_LENGTH;
+  if (opts.filterDenials && isShortUtterance && DENIAL_PATTERNS.some(p => p.test(trimmed))) {
     logInfo(`[INFO] noise-filter: denial pattern matched: "${redactForLog(trimmed)}..."`);
     return true;
   }
-  if (opts.filterMetaQuestions && META_QUESTION_PATTERNS.some(p => p.test(trimmed))) {
+  if (opts.filterMetaQuestions && isShortUtterance && META_QUESTION_PATTERNS.some(p => p.test(trimmed))) {
     logInfo(`[INFO] noise-filter: meta-question filtered: "${redactForLog(trimmed)}..."`);
     return true;
   }
