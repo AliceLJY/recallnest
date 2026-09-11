@@ -89,7 +89,8 @@ export function archiveIngestedMinisFiles(
       const target = pickTarget(archiveDir, name, bytes);
       if (!target.alreadyThere) {
         const partial = `${target.path}.partial`;
-        writeFileSync(partial, bytes);
+        // 沿用原件权限：Minis 写出来是 600，默认 umask 会把副本放宽成 644
+        writeFileSync(partial, bytes, { mode: before.mode & 0o777 });
         renameSync(partial, target.path);
         // 存档沿用原件 mtime，Deja 里显示的时间才是对话时间而不是搬运时间
         utimesSync(target.path, before.atime, before.mtime);
