@@ -160,11 +160,15 @@ elif [ "$STATUS_LINE" = "[[DREAM_STATUS]] skip" ]; then
     # exit 0、STATUS 照报 ok,存在性闸也发现不了(见上面 08-16 注释)。连着两周没干活 = 任务目的失效,
     # 按失败处理(TG + exit 1),不是提醒。daily 轮次的 skip 是 --auto 没有达标 scope,正常波动,不计不报。
     # 计数:skip +1、ok 归 0、blocked 不动(blocked 走下面的失败分支,自己会报)。
+    # 状态文件记「N <ISO 周标识>」(同 scripts-bin/deja-update.sh 的 bump_streak,那边按天):同一周内再 skip
+    # **不加计数**只更新周标识——同周补跑两次不是「连续两周」(Codex 第 1 轮第 9 项);跨周 skip 才 +1。
+    # 旧格式(纯数字)当 N、周标识空处理;文件坏了当 0。
     if [ -n "$SKIP_STREAK_FILE" ]; then
-        SKIP_N=$(cat "$SKIP_STREAK_FILE" 2>/dev/null || true)
+        SKIP_N=0; SKIP_WEEK=""; THIS_WEEK=$(date +%G-W%V)
+        if [ -f "$SKIP_STREAK_FILE" ]; then read -r SKIP_N SKIP_WEEK < "$SKIP_STREAK_FILE" || true; fi
         case "$SKIP_N" in ''|*[!0-9]*) SKIP_N=0 ;; esac
-        SKIP_N=$((SKIP_N + 1))
-        echo "$SKIP_N" > "$SKIP_STREAK_FILE"
+        [ "$SKIP_WEEK" = "$THIS_WEEK" ] || SKIP_N=$((SKIP_N + 1))
+        printf '%s %s\n' "$SKIP_N" "$THIS_WEEK" > "$SKIP_STREAK_FILE"
         if [ "$SKIP_N" -ge 2 ]; then
             echo "[$NOW_END] ❌ 专用轮次已连续 ${SKIP_N} 次 skip,按任务目的失效处理(TG + exit 1)"
             tg "RecallNest dream 专用轮次(scope=$DREAM_SCOPE)已连续 ${SKIP_N} 周 skip@$(hostname -s)——检查 DREAM_SCOPE 值与写计数(scope 写错会永远 skip 且 STATUS 照报 ok);日志 $LOG_SHOW"
