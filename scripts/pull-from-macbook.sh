@@ -59,6 +59,8 @@ mkdir -p "$LOG_DIR"
 ROTATING_LOG="$LOG_DIR/pull-$(date +%Y-%m-%d).log"
 EC=0
 MAPPING_TMP=""
+ROUND_FAILS=""     # 2026-09-17 报警用:本轮每条 set_failure 的正文(去掉 ❌ 前缀),一行一条,末尾进 TG
+INGEST_FAILED=0    # 2026-09-17 报警用:ingest 失败当轮就报,不去抖
 
 log() {
   local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
@@ -72,7 +74,18 @@ set_failure() {
     EC="$code"
   fi
   log "$*"
+  # 2026-09-17: 攒本轮失败,末尾报警用(去掉 ❌ 前缀;去抖键在末尾按 ` exit=` 之前的部分算 = 源 id + 失败种类)
+  local msg="$*"
+  ROUND_FAILS="${ROUND_FAILS}${msg#❌ }
+"
 }
+
+# ── 失败报警(2026-09-17 加,mini 定时任务「失败不出声」统一排查;写法同 recallnest-backup.sh)──
+# 此前全链无 TG / osascript:rsync 与探测失败经 set_failure 累进 EC、末尾 exit $EC,语义对但没人读;
+# ingest 半段的退出码此前恒 0(incremental-ingest.sh 尾句是 find),同日一并接回真实退出码。
+# 报警规则见末尾「失败报警」段。tg 发送失败经 log 记一行,不影响退出码。
+NOTIFY="$HOME/Downloads/sync-bridge/scripts-bin/cobbler-notify.sh"
+tg() { "$NOTIFY" "${1}" >/dev/null 2>&1 || log "⚠ TG 报警发送失败(cobbler-notify 退出码 $?)"; }
 
 tsv_escape() {
   local value="$1"
@@ -700,11 +713,59 @@ else
   log "⚠️ rsync 部分失败 exit=${EC}，仍触发 ingest 处理已拉到的部分"
 fi
 
-bash "$PULL_HOME/recallnest/scripts/incremental-ingest.sh"
-log "ingest 完成 exit=$?"
+# INGEST_ALERT_BY_CALLER=1:让 ingest 自己不发 TG(它只记一行日志),由本脚本汇总成一条发——同一次失败只响一次(2026-09-17 owner 定)
+INGEST_ALERT_BY_CALLER=1 bash "$PULL_HOME/recallnest/scripts/incremental-ingest.sh"
+INGEST_RC=$?
+if [ "$INGEST_RC" -ne 0 ]; then
+  # 2026-09-17: incremental-ingest.sh 同日起以真实退出码退出(此前尾句 find 永远给 0),这里第一次能看见它失败;
+  # 真正的报错在 ingest 自己的日志里,TG 正文指过去
+  set_failure "$INGEST_RC" "❌ ingest 失败 exit=${INGEST_RC}（124=超时 2h,详见 ~/recallnest/logs/ingest-$(date +%Y-%m-%d).log）"
+  INGEST_FAILED=1
+else
+  log "ingest 完成 exit=0"
+fi
 
 # 保留 14 天日志
 find "$LOG_DIR" -name "pull-*.log" -mtime +14 -delete 2>/dev/null
+
+# ── 失败报警(2026-09-17)──
+# ① 拉取半段的失败(rsync 源 / 远端探测 / 扁平化)**去抖**:同一失败键(正文里 ` exit=` 之前的部分,即
+#    「源 id + 失败种类」,如 `codex-sessions rsync 失败`)上一轮也出现过才报——单轮瞬态(09-08 15:45 那次
+#    rsync 30 传输超时,下一钟点自愈)只记日志,退出码照旧非 0;
+# ② ingest 失败当轮就报(一天最多 4 次、7 天基线 0 次,去抖只会拖到两钟点后);
+# ③ MacBook 离线在上面早退(exit 0),不进这里;离线轮也不改状态文件,不算一轮观察。
+# 状态文件 $LOG_DIR/.last-failed = 上一轮的失败键,每个走到这里的轮次都重写(全成功 → 清空)。
+# TG 正文 = 标题 + 本轮每条 ❌(上一轮也失败的标出来)+ 当天日志路径;本轮的失败在内存里攒(ROUND_FAILS),
+# 不从日志回抓,免得把同日早先那轮的 ❌ 混进来。sync-only 模式在上面早退,不走这里(那是人手动跑的)。
+LAST_FAIL_FILE="$LOG_DIR/.last-failed"
+ALERT=0; ALERT_BODY=""; ROUND_KEYS=""
+if [ -n "$ROUND_FAILS" ]; then
+  while IFS= read -r fl; do
+    [ -n "$fl" ] || continue
+    key="${fl%% exit=*}"
+    ROUND_KEYS="${ROUND_KEYS}${key}
+"
+    if [ -f "$LAST_FAIL_FILE" ] && grep -qxF -- "$key" "$LAST_FAIL_FILE"; then
+      ALERT=1
+      ALERT_BODY="${ALERT_BODY}• ${fl}(上一轮也失败)
+"
+    else
+      ALERT_BODY="${ALERT_BODY}• ${fl}
+"
+    fi
+  done <<EOF
+$ROUND_FAILS
+EOF
+fi
+[ "$INGEST_FAILED" -eq 1 ] && ALERT=1
+printf '%s' "$ROUND_KEYS" > "$LAST_FAIL_FILE"
+if [ "$ALERT" -eq 1 ]; then
+  log "⚠️ 本轮失败达到报警条件,发 TG"
+  tg "pull-from-macbook@$(hostname -s) 失败 exit=$EC
+${ALERT_BODY}日志 ~${ROTATING_LOG#"$PULL_HOME"}"
+elif [ -n "$ROUND_FAILS" ]; then
+  log "本轮有失败但未达报警条件(同一失败连续两轮才报),只记日志"
+fi
 
 log "=== pull 结束 ==="
 exit $EC

@@ -27,6 +27,22 @@ LOG_FILE="$LOG_DIR/ingest-$(date +%Y-%m-%d).log"
 # 超时时间（秒）：2 小时 = 7200 秒
 TIMEOUT=7200
 
+# ── 失败报警(2026-09-17 加,mini 定时任务「失败不出声」统一排查;写法同 recallnest-backup.sh)──
+# 此前超时 / 非零退出只 echo 进 $LOG_FILE,而脚本最后一句是 find,退出码永远是 find 的 0——launchd 与
+# pull-from-macbook.sh(另一条调用入口,每天 4 次,L703)拿到的都是 0(stderr 里 7 次 Terminated: 15 对应的
+# last exit 全是 0)。本次:超时与非零退出各发一条 TG,脚本以真实 $EXIT_CODE 退出。
+# tg 发送失败只往 $LOG_FILE 记一行——本脚本的 stdout 不是日志(launchd 的 launchagent-stdout.log 至今 0 字节)。
+# INGEST_ALERT_BY_CALLER=1(pull-from-macbook.sh 调用时传)→ 不发 TG,只记一行,由调用方汇总发;退出码语义不变。
+# launchd 直接触发的 3 次/天不带这个变量,照旧自己发。(2026-09-17 owner 定「同一次 ingest 失败只发一条」)
+NOTIFY="$HOME/Downloads/sync-bridge/scripts-bin/cobbler-notify.sh"
+LOG_SHOW="~${LOG_FILE#"$HOME"}"
+tg() {
+  if [ "${INGEST_ALERT_BY_CALLER:-}" = "1" ]; then
+    echo "报警由调用方(pull-from-macbook)发,本脚本不重复发" >> "$LOG_FILE"; return 0
+  fi
+  "$NOTIFY" "${1}" >/dev/null 2>&1 || echo "⚠ TG 报警发送失败(cobbler-notify 退出码 $?)" >> "$LOG_FILE"
+}
+
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') 增量更新开始 ===" >> "$LOG_FILE"
 
 cd "$SCRIPT_DIR" || exit 1
@@ -83,15 +99,20 @@ else
   fi
 fi
 
+# 只保留最近 7 天的日志(2026-09-17 挪到判定之前:脚本最后一句必须是 exit,不能再让 find 的 0 顶掉真实退出码)
+find "$LOG_DIR" -name "ingest-*.log" -mtime +7 -delete 2>/dev/null
+
 if [ "$EXIT_CODE" -eq 124 ]; then
   echo "⚠️  $(date '+%Y-%m-%d %H:%M:%S') 增量更新超时（${TIMEOUT}s），已自动终止" >> "$LOG_FILE"
+  tg "RecallNest ingest 超时 ${TIMEOUT}s 被终止@$(hostname -s),日志 $LOG_SHOW"
 elif [ "$EXIT_CODE" -ne 0 ]; then
-  echo "❌  $(date '+%Y-%m-%d %H:%M:%S') 增量更新异常退出（exit code: $EXIT_CODE）" >> "$LOG_FILE"
+  echo "❌  $(date '+%Y-%m-%d %H:%M:%S') 增量更新异常退出（exit code: ${EXIT_CODE}）" >> "$LOG_FILE"
+  tg "RecallNest ingest 异常退出 exit=${EXIT_CODE}@$(hostname -s),日志 $LOG_SHOW"
 else
   echo "=== $(date '+%Y-%m-%d %H:%M:%S') 增量更新完成 ===" >> "$LOG_FILE"
 fi
 
 echo "" >> "$LOG_FILE"
 
-# 只保留最近 7 天的日志
-find "$LOG_DIR" -name "ingest-*.log" -mtime +7 -delete 2>/dev/null
+# 2026-09-17: 以真实退出码退出(124 = 超时),launchd 与 pull-from-macbook.sh 才看得见失败
+exit "${EXIT_CODE:-1}"
