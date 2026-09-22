@@ -39,6 +39,47 @@
 
 export const multiVector = (): boolean => process.env.RECALLNEST_MULTI_VECTOR === "true";
 
+// --- 写入时预演触发器（T-Mem 借鉴，2026-09-22）---
+// 默认开；显式 "false" 关。侧表 memory_triggers 不存在时 TriggerStore 自建，读路径失败一律 fail-open。
+export const triggerRecall = (): boolean => process.env.RECALLNEST_TRIGGER_RECALL !== "false";
+/**
+ * trigger 命中的余弦硬闸。T-Mem 论文默认 0.85 是他们的嵌入器；本库 jina-embeddings-v5-text-small
+ * query↔query 余弦压得很紧：2026-09-22 用 12 条 canary 校准——真联想命中 0.52–0.67、无关噪声最高 0.53，
+ * 0.50 让 canary-A-mem0-borrow 从 70% 掉到 40%，0.55 与接线前逐条一致。要换嵌入器先跑 `triggers-calibrate` 重定。
+ */
+export const triggerGate = (): number => {
+  const raw = Number(process.env.RECALLNEST_TRIGGER_GATE);
+  return Number.isFinite(raw) && raw > 0 && raw < 1 ? raw : 0.55;
+};
+/**
+ * 软闸：余弦没过硬闸、但 query 与 trigger 词面重合够高时也放行（trigger 是她自己的口语问法，
+ * 她将来的问法与预演的问法常常共用同几个字：榜 / 排名 / 清一清）。09-22 校准：真命中 overlap 0.20–0.64，
+ * 无关噪声 0–0.20，但关键词短 query 会被共用词撑高——所以再加一道 query 长度门槛（见下）；取余弦 ≥0.40 且 overlap ≥0.40。
+ */
+export const triggerSoftGate = (): number => {
+  const raw = Number(process.env.RECALLNEST_TRIGGER_SOFT_GATE);
+  return Number.isFinite(raw) && raw > 0 && raw < 1 ? raw : 0.40;
+};
+export const triggerMinOverlap = (): number => {
+  const raw = Number(process.env.RECALLNEST_TRIGGER_MIN_OVERLAP);
+  return Number.isFinite(raw) && raw > 0 && raw < 1 ? raw : 0.40;
+};
+/**
+ * 软闸只对「像一句话的问法」开：query 去停用词后至少这么多 token（CJK 按字）。
+ * 09-22 实测：「OpenClaw 记忆系统」(5 token) 与「taobao 这个 mcp 是官方的吗」(7 token) 这类关键词 query，
+ * 词面重合被一个共用词（记忆系统 / mcp）撑到 0.3–0.7，把同话题的旁支宿主顶到第一、二名，
+ * 20 条回归掉了两条；联想入口本来就是给「换个情境重提旧事」的整句问法用的，关键词 query 走向量 / BM25 就够。
+ */
+export const triggerSoftMinQueryTokens = (): number => {
+  const raw = Number(process.env.RECALLNEST_TRIGGER_SOFT_MIN_QUERY_TOKENS);
+  return Number.isFinite(raw) && raw >= 1 && raw <= 64 ? Math.floor(raw) : 8;
+};
+/** 每次检索最多让多少个宿主经 trigger 进入候选池。 */
+export const triggerTopK = (): number => {
+  const raw = Number(process.env.RECALLNEST_TRIGGER_TOP_K);
+  return Number.isFinite(raw) && raw >= 1 && raw <= 50 ? Math.floor(raw) : 10;
+};
+
 export const emotionScoring = (): boolean => process.env.RECALLNEST_EMOTION_SCORING === "true";
 
 export const predictiveMemory = (): boolean => process.env.RECALLNEST_PREDICTIVE_MEMORY === "true";

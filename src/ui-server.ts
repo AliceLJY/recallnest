@@ -112,6 +112,7 @@ function getRetrievalPath(result: RetrievalResult): string {
   if (result.sources.vector) parts.push("vector");
   if (result.sources.bm25) parts.push("bm25");
   if (result.sources.reranked) parts.push("reranked");
+  if (result.sources.trigger) parts.push("trigger");
   return parts.join("+") || "direct";
 }
 

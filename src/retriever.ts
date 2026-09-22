@@ -3,7 +3,7 @@
  * Combines vector search + BM25 full-text search with RRF fusion
  */
 
-import type { MemoryStore, MemorySearchResult } from "./store.js";
+import type { MemoryStore, MemorySearchResult, MemoryEntry } from "./store.js";
 import type { Embedder } from "./embedder.js";
 import { filterNoise } from "./noise-filter.js";
 import * as envConfig from "./env-config.js";
@@ -16,6 +16,8 @@ import { type AccessTracker, computeHotnessScore, parseAccessMetadata } from "./
 import { readUtility } from "./memory-utility.js";
 import { weibullDecay, resolveTier, isDecayExempt, adjustHalfLifeForEmotion, computeArousalBoost } from "./decay-engine.js";
 import { logInfo, logWarn } from "./stderr-log.js";
+import { matchesScopeFilter } from "./scope-policy.js";
+import type { TriggerStore, TriggerHit } from "./trigger-store.js";
 import { extractBoundaryMetadata, isDurableMemoryScope, isTranscriptScope } from "./memory-boundaries.js";
 import type { TraceCollector } from "./retrieval-trace.js";
 import { extractTopicTag } from "./topic-tag.js";
@@ -200,6 +202,11 @@ export interface RetrievalResult extends MemorySearchResult {
     reranked?: { score: number };
     /** HP-narrative: true when this result was pulled as a narrative sibling */
     narrativeSibling?: boolean;
+    /**
+     * T-Mem 写入时预演触发器（2026-09-22）：经 trigger 到达或被 trigger 加强。
+     * text 只用于 explain（「为什么捞到」），不进 context 渲染——trigger 是入口不是证据。
+     */
+    trigger?: { score: number; cosine: number; text: string; admittedBy?: "hard" | "soft"; overlap?: number };
   };
 }
 
@@ -396,6 +403,21 @@ function applyAnchorBoost(results: RetrievalResult[], query: string): RetrievalR
     // Boost proportional to overlap quality, capped at ANCHOR_BOOST_MAX
     const boost = 1 + overlap * ANCHOR_BOOST_MAX;
     return { ...r, score: r.score * boost };
+  });
+}
+
+/**
+ * T-Mem triggers：hybrid 路径 rerank 之后的地板。cross-encoder 按「query 与正文像不像」打分，
+ * 而经 trigger 到达的宿主与 query 恰恰是零词面重合的——不设地板就等于把 T-Mem 自己要对抗的
+ * 相似度体制重新加回来（论文原话）。地板取 trigger 分的 0.9，只托底不抬头。
+ */
+const TRIGGER_FLOOR_FACTOR = 0.9;
+function applyTriggerFloor(results: RetrievalResult[]): RetrievalResult[] {
+  return results.map(r => {
+    const t = r.sources.trigger;
+    if (!t) return r;
+    const floor = t.score * TRIGGER_FLOOR_FACTOR;
+    return r.score >= floor ? r : { ...r, score: floor };
   });
 }
 
@@ -741,6 +763,7 @@ export class MemoryRetriever {
   private frequencyTracker?: FrequencyTracker;
   private auditLogger?: AuditLogger;
   private llmClient?: ReconstructionLLMClient;
+  private triggerStore?: TriggerStore;
   /**
    * Session-scoped suppression list (dopamine-inspired "do not disturb").
    * IDs in this set get a score penalty during retrieval but are NOT deleted.
@@ -762,6 +785,11 @@ export class MemoryRetriever {
   /** Attach a KGStore to enable graph-based retrieval (PPR). */
   setKGStore(kgStore: KGStore): void {
     this.kgStore = kgStore;
+  }
+
+  /** T-Mem triggers（2026-09-22）：挂上侧表后，检索多一条「经 trigger 到达」的入口。 */
+  setTriggerStore(triggerStore: TriggerStore): void {
+    this.triggerStore = triggerStore;
   }
 
   /** P0.2: Attach a FrequencyTracker for hit-count based boosting. */
@@ -1062,6 +1090,74 @@ export class MemoryRetriever {
       .slice(0, context.limit);
   }
 
+  /**
+   * T-Mem 写入时预演触发器召回（2026-09-22，借自腾讯 T-Mem / EMNLP 2026）。
+   *
+   * 用 query 向量搜 memory_triggers 侧表，命中的 trigger 把宿主拉进候选池：
+   * - 宿主已在候选里 → 分数取 max(原分, trigger 分)，并记 sources.trigger；
+   * - 宿主不在候选里 → 按 id 取回主表行，以 trigger 分入池（T-Mem 的「union 进候选、绕过相似度闸门」）。
+   * 之后照常走 applySharedScoring / finalizeResults——trigger 只决定「能不能到达」，不另起一套分。
+   * 硬闸 RECALLNEST_TRIGGER_GATE（余弦）防噪；侧表缺失或查询失败一律 fail-open 回原候选。
+   * category / archived / scope 三道过滤与主路径同款，trigger 不能越权。
+   */
+  private async applyTriggerRecall(
+    candidates: RetrievalResult[],
+    queryVector: number[],
+    queryText: string,
+    scopeFilter?: string[],
+    category?: string,
+    includeArchived?: boolean,
+    trace?: TraceCollector,
+  ): Promise<RetrievalResult[]> {
+    if (!this.triggerStore || !envConfig.triggerRecall()) return candidates;
+    trace?.startStage("trigger_recall", candidates.length);
+    let hits: TriggerHit[] = [];
+    try {
+      hits = await this.triggerStore.search(queryVector, envConfig.triggerTopK(), scopeFilter, {
+        minCosine: envConfig.triggerGate(),
+        softCosine: envConfig.triggerSoftGate(),
+        minOverlap: envConfig.triggerMinOverlap(),
+        minQueryTokens: envConfig.triggerSoftMinQueryTokens(),
+        queryText,
+      });
+    } catch (err) {
+      logWarn("trigger recall failed, continuing without it:", err);
+    }
+    if (hits.length === 0) {
+      trace?.endStage(candidates.length, candidates.map(r => r.score));
+      return candidates;
+    }
+    const byId = new Map(candidates.map((r, i) => [r.entry.id, i]));
+    const out = [...candidates];
+    for (const hit of hits) {
+      const triggerSource = { score: hit.score, cosine: hit.cosine, text: hit.text, admittedBy: hit.admittedBy, overlap: hit.overlap };
+      const idx = byId.get(hit.memoryId);
+      if (idx !== undefined) {
+        const existing = out[idx];
+        out[idx] = {
+          ...existing,
+          score: Math.max(existing.score, hit.score),
+          sources: { ...existing.sources, trigger: triggerSource },
+        };
+        continue;
+      }
+      let entry: MemoryEntry | null = null;
+      try {
+        entry = await this.store.getById(hit.memoryId);
+      } catch (err) {
+        logWarn(`trigger host lookup failed for ${hit.memoryId}:`, err);
+      }
+      if (!entry) continue;
+      if (!matchesScopeFilter(entry.scope, scopeFilter)) continue;
+      if (category && entry.category !== category) continue;
+      if (!includeArchived && parseMetadata(entry.metadata).archived === true) continue;
+      out.push({ entry, score: hit.score, sources: { trigger: triggerSource } });
+      byId.set(entry.id, out.length - 1);
+    }
+    trace?.endStage(out.length, out.map(r => r.score));
+    return out;
+  }
+
   private async vectorOnlyRetrieval(
     query: string,
     limit: number,
@@ -1118,7 +1214,10 @@ export class MemoryRetriever {
     // P0.1: Anchor boost for vector-only path
     const anchorBoosted = applyAnchorBoost(mapped, searchQuery);
 
-    const scored = this.applySharedScoring(anchorBoosted, query, trace);
+    // T-Mem triggers：联想入口在这里并入候选（相似度那一步之后、打分链之前）
+    const withTriggers = await this.applyTriggerRecall(anchorBoosted, queryVector, searchQuery, scopeFilter, category, includeArchived, trace);
+
+    const scored = this.applySharedScoring(withTriggers, query, trace);
 
     // Session suppression: temporarily penalize "do not disturb" memories (vector-only path)
     const afterSuppression = this.applySessionSuppression(scored);
@@ -1202,8 +1301,11 @@ export class MemoryRetriever {
     const anchorBoosted = applyAnchorBoost(multiVecBlended, searchQuery);
     trace?.endStage(anchorBoosted.length, anchorBoosted.map(r => r.score));
 
+    // T-Mem triggers：联想入口并入候选，在 min_score / rerank 之前
+    const withTriggers = await this.applyTriggerRecall(anchorBoosted, queryVector, searchQuery, scopeFilter, category, includeArchived, trace);
+
     // Apply minimum score threshold
-    trace?.startStage("min_score_filter", anchorBoosted.length);
+    trace?.startStage("min_score_filter", withTriggers.length);
     // P0.1: Lower minScore for short queries to widen the candidate pool;
     // minScoreOverride 用于 retrieve() 顶层的 0-hit fallback retry。
     const effectiveMinScore = minScoreOverride !== undefined
@@ -1211,7 +1313,7 @@ export class MemoryRetriever {
       : (isShortQuery(searchQuery)
           ? this.config.minScore * SHORT_QUERY_MIN_SCORE_FACTOR
           : this.config.minScore);
-    const filtered = anchorBoosted.filter(r => r.score >= effectiveMinScore);
+    const filtered = withTriggers.filter(r => r.score >= effectiveMinScore);
     trace?.endStage(filtered.length, filtered.map(r => r.score));
 
     // Rerank if enabled
@@ -1221,7 +1323,10 @@ export class MemoryRetriever {
       : filtered;
     trace?.endStage(reranked.length, reranked.map(r => r.score));
 
-    const scored = this.applySharedScoring(reranked, query, trace);
+    // T-Mem triggers：rerank 是相似度打分，经 trigger 到达的宿主要托底
+    const triggerFloored = applyTriggerFloor(reranked);
+
+    const scored = this.applySharedScoring(triggerFloored, query, trace);
 
     return this.finalizeResults(scored, {
       shortQ,

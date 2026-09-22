@@ -1,6 +1,7 @@
 import type { Embedder } from "./embedder.js";
 import { detectLang, tokenizeFts } from "./language-hook.js";
 import { generateAnchor } from "./anchor-generator.js";
+import { normalizeTriggerTexts } from "./trigger-store.js";
 import { extractErrorSignatures } from "./error-signature.js";
 import { verifyWrite } from "./write-verifier.js";
 // batchInternalDedup is available in ingest.ts for large-batch scenarios;
@@ -87,6 +88,22 @@ export interface PersistMemoryDeps {
    * Shadow-only: it observes and logs, it never rejects.
    */
   noisePrototypeBank?: NoisePrototypeBank | null;
+  /**
+   * T-Mem triggers 侧表（2026-09-22）。写入失败只 warn 不阻塞主写入：
+   * trigger 是召回入口不是证据，丢一次入口比丢一条记忆便宜得多。
+   */
+  triggerStore?: TriggerStoreDeps | null;
+  /** 给 trigger 用的 query 侧批量嵌入；缺省退回逐条 embedPassage */
+  embedQueryBatch?: (texts: string[]) => Promise<number[][]>;
+}
+
+export interface TriggerStoreDeps {
+  upsertForMemory(
+    memoryId: string,
+    scope: string,
+    texts: readonly string[],
+    embed: (texts: string[]) => Promise<number[][]>,
+  ): Promise<number>;
 }
 
 export interface DurableWriteInput {
@@ -703,6 +720,9 @@ function inferPromotedCategory(
 function buildStoreMemoryMetadata(input: StoreMemoryInput, canonicalKey: string): string {
   const anchor = generateAnchor(input.text);
   const anchorExtra = anchor ? { anchor } : undefined;
+  // T-Mem triggers：文本副本进 metadata（侧表可由它重建），向量进 memory_triggers 侧表
+  const triggers = normalizeTriggerTexts(input.triggers);
+  const triggerExtra = triggers.length > 0 ? { triggers } : undefined;
   // HP-ethics: Include privacyTier in metadata if non-default
   const privacyExtra = input.privacyTier && input.privacyTier !== "durable"
     ? { privacyTier: input.privacyTier }
@@ -713,7 +733,7 @@ function buildStoreMemoryMetadata(input: StoreMemoryInput, canonicalKey: string)
     capture: "store_memory_schema_v1",
     category: input.category,
     canonicalKey,
-    extra: mergeExtra(buildPreferenceSlotExtra(input.category, input.text), anchorExtra, privacyExtra),
+    extra: mergeExtra(buildPreferenceSlotExtra(input.category, input.text), anchorExtra, privacyExtra, triggerExtra),
     narrativeInput: { scope: input.scope, text: input.text },
   });
 }
@@ -1131,6 +1151,28 @@ export async function persistMemory(
     language,
     fts_text,
   });
+
+  // T-Mem triggers（2026-09-22）：宿主写完再写入口。conflict 时宿主没变、不写；
+  // deduped（同文本已存在）也写——老条目补 trigger 正是回填的常态，此时顺手把文本副本
+  // 补进旧行 metadata（侧表可由它重建）。失败只 warn：入口丢一次比记忆丢一条便宜。
+  const triggerTexts = normalizeTriggerTexts(input.triggers);
+  if (deps.triggerStore && triggerTexts.length > 0 && disposition !== "conflict") {
+    try {
+      const embedBatch = deps.embedQueryBatch
+        ?? (async (texts: string[]) => Promise.all(texts.map((t) => deps.embedder.embedPassage(t))));
+      await deps.triggerStore.upsertForMemory(entry.id, entry.scope || resolvedScope, triggerTexts, embedBatch);
+      if (disposition === "deduped" && deps.store.update) {
+        const parsedMeta: Record<string, unknown> = JSON.parse(entry.metadata || "{}");
+        const prev = Array.isArray(parsedMeta.triggers) ? (parsedMeta.triggers as unknown[]).join("\u0000") : "";
+        if (prev !== triggerTexts.join("\u0000")) {
+          parsedMeta.triggers = triggerTexts;
+          await deps.store.update(entry.id, { metadata: JSON.stringify(parsedMeta) });
+        }
+      }
+    } catch (err) {
+      console.error(`[recallnest] trigger write failed for ${entry.id} (memory stored, trigger 入口未写):`, err instanceof Error ? err.message : String(err));
+    }
+  }
 
   // Tier 4.1: Async KG triple extraction (non-blocking)
   // HP-ethics: Skip KG extraction for ephemeral/private memories — they must not leave graph traces

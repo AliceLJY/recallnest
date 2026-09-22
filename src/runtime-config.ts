@@ -6,6 +6,7 @@ import { metaDir } from "./compat.js";
 import { MemoryStore, validateStoragePath } from "./store.js";
 import { createEmbedder, getVectorDimensions, type EmbeddingConfig } from "./embedder.js";
 import { createRetriever, type RetrievalConfig, DEFAULT_RETRIEVAL_CONFIG } from "./retriever.js";
+import { TriggerStore } from "./trigger-store.js";
 import { applyRetrievalProfile } from "./retrieval-profiles.js";
 import { AccessTracker } from "./access-tracker.js";
 import { createAuditLogger } from "./audit-log.js";
@@ -182,6 +183,10 @@ export function createComponents(config: LocalMemoryConfig, profileName?: string
   const { profile, config: retrieverConfig } = applyRetrievalProfile(baseRetrievalConfig, profileName);
   const retriever = createRetriever(store, embedder, retrieverConfig);
 
+  // T-Mem triggers（2026-09-22）：侧表与主表同库同 dim；挂到 retriever 后检索多一条联想入口
+  const triggerStore = new TriggerStore({ dbPath, vectorDim: embedder.dimensions });
+  retriever.setTriggerStore(triggerStore);
+
   // Attach access tracker for reinforcement-based decay
   const accessTracker = new AccessTracker(store);
   accessTracker.registerExitFlush();
@@ -220,7 +225,7 @@ export function createComponents(config: LocalMemoryConfig, profileName?: string
     }
   }
 
-  return { store, embedder, retriever, profile, accessTracker, frequencyTracker, llm };
+  return { store, embedder, retriever, profile, accessTracker, frequencyTracker, llm, triggerStore };
 }
 
 export function createStoreOnly(config: LocalMemoryConfig): MemoryStore {

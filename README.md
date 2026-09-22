@@ -75,6 +75,7 @@ places where the obvious implementation was wrong — is in
 | Capability | Description |
 |---|---|
 | **Hybrid Retrieval** | 6-channel: vector + BM25 + L0/L1/L2 multi-vector + KG graph (PPR) |
+| **Write-time Triggers** | Each memory can carry 2–6 "how will this be asked about later" phrasings (`triggers`), embedded separately and used only for recall — never rendered as evidence. Borrowed from Tencent T-Mem (EMNLP 2026). |
 | **4 Retrieval Profiles** | default, writing, debug, fact-check — tuned for different tasks |
 | **Session Continuity** | `checkpoint_session` + `resume_context` (full/light/summary modes) with repo-state guard |
 | **Session Distiller** | 3-layer conversation compression: microcompact → LLM summary → knowledge extraction |
@@ -142,6 +143,7 @@ places where the obvious implementation was wrong — is in
 - **Weibull Decay + Emotion Modulation** — memories decay along a parametric Weibull curve; importance scores modulate the half-life, and emotional salience extends it further (up to 30%)
 - **Vector Pre-filter + LLM Dedup** — 90% of dedup decisions use cheap cosine similarity (>= 0.92); only borderline cases invoke LLM judgment, keeping costs low without sacrificing accuracy
 - **Category-Aware Merge Strategies** — `profile` and `preferences` use merge-on-conflict (latest wins); `events` and `cases` use append-only (history preserved)
+- **Write-time Rehearsal (Triggers)** — a memory stored with `triggers: ["别人的榜我们要不要也去排个名", ...]` gets each phrasing embedded on the query side into a side table (`memory_triggers`); at recall time the query is matched against triggers, the best-matching trigger pulls its host memory into the candidate pool (max-over-triggers attribution, cosine hard gate + lexical soft gate), and the host then goes through the normal scoring chain. Triggers never appear in results — they are an entry point, not evidence. `RECALLNEST_TRIGGER_RECALL=false` turns it off; `triggers-backfill` / `triggers-calibrate` CLI manage existing data
 - **Display Score vs Elimination Score** — dual-track retrieval: tier floor prevents core memories from ever dropping out, while decay boost lets fresh memories surface temporarily without permanently displacing stable ones
 
 > Full architecture deep-dive: [`docs/architecture.md`](docs/architecture.md)

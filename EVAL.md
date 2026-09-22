@@ -88,6 +88,19 @@ Whenever a new recurring workflow appears, add it to `eval/cases.json`.
 
 That turns “I hope this still works” into “I can prove it still works.”
 
+## 联想召回 canary（`canary-assoc-*`，2026-09-22 起）
+
+`eval/cases-canary.json` 里以 `canary-assoc-` 开头的用例是**零 / 低词面重合**的口语问法 + 已知目标 id：
+query 里不出现目标正文的关键词，绑定二者的只有一条语义弧（T-Mem 所谓「联想性召回」）。
+它们是 write-time triggers 的尺子：
+
+- 加新用例的判据：先用 `search_memory` 确认它**现在捞不到**或排在 limit 之外，再写进来，notes 里记基线名次；
+  不要拿已经能捞到的 query 充数。
+- 校准闸门：`bun src/cli.ts triggers-calibrate` 打印每条 query 对侧表全部 trigger 的最高余弦与词面重合，
+  真命中和无关噪声的分布重叠时，改 `RECALLNEST_TRIGGER_GATE` / `_SOFT_GATE` / `_MIN_OVERLAP`，
+  以「原有 canary 逐条不退」为硬约束（09-22：0.50 让 canary-A-mem0-borrow 掉 30 个点，0.55 才与基线一致）。
+- 这组用例不是优化靶子（同下一节的否决理由）：它只回答「联想入口通没通」，不回答「召回质量高不高」。
+
 ## 已否决：不跑公开记忆 benchmark（2026-07-25 Alice 拍板）
 
 **这一节写在这里，是因为改检索的人真正会读的是本文件，而不是 hippo。**

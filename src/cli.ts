@@ -23,6 +23,8 @@ import { archiveDirtyBriefAsset, assetSummaryLine, buildBriefAsset, buildPinAsse
 import { indexAsset, indexPinnedAsset } from "./asset-sync.js";
 import { createComponents, createStoreOnly, expandHome, loadConfig, loadDotEnv, resolveDbPath, type LocalMemoryConfig } from "./runtime-config.js";
 import { KGStore } from "./kg-store.js";
+import { extractTriggerCandidates, normalizeTriggerTexts } from "./trigger-store.js";
+import { isActiveMemory } from "./memory-evolution.js";
 import { isKGModeEnabled } from "./kg-extractor.js";
 import {
   formatDedupReasonSummary,
@@ -2069,6 +2071,94 @@ program
   });
 
 // ─── doctor ──────────────────────────────────────────────────────────────────
+
+program
+  .command("triggers-backfill")
+  .description("T-Mem triggers 回填：从正文抠「她以后会怎么问」句写入 memory_triggers 侧表（默认 dry-run，零 LLM）")
+  .option("-s, --scope <scope>", "限定 scope", "memory:pivot")
+  .option("-n, --limit <n>", "最多扫描条数", "5000")
+  .option("--apply", "真写入（默认只预览）")
+  .option("--include-batch", "连 tags 含 pivot-apply 的批量提炼条目一起回填（默认跳过：09-21 校准其走样率约七成，先别给它们加联想入口）")
+  .option("--rebuild", "不看正文，只按 metadata.triggers 重建侧表（迁移 / 回滚后恢复用）")
+  .option("--samples <n>", "预览时打印几条样例", "12")
+  .action(async (options) => {
+    const config = loadConfig();
+    const { store, embedder, triggerStore } = createComponents(config);
+    const scopeFilter = toScopeFilter(options.scope);
+    const limit = parseLimitOption(options.limit, 5000, 1, 100000);
+    const samples = parseLimitOption(options.samples, 12, 0, 200);
+    const entries = await store.list(scopeFilter, undefined, limit, 0);
+    const already = options.rebuild ? new Set<string>() : await triggerStore.listMemoryIds(scopeFilter);
+    const counts = { scanned: 0, skippedBatch: 0, skippedInactive: 0, skippedHas: 0, noLine: 0, planned: 0, written: 0, rows: 0 };
+    const preview: Array<{ id: string; triggers: string[] }> = [];
+    for (const entry of entries) {
+      counts.scanned += 1;
+      if (!isActiveMemory(entry.metadata)) { counts.skippedInactive += 1; continue; }
+      let meta: Record<string, unknown> = {};
+      try { meta = JSON.parse(entry.metadata || "{}"); } catch { meta = {}; }
+      const tags = Array.isArray(meta.tags) ? (meta.tags as unknown[]).map(String) : [];
+      let texts: string[];
+      if (options.rebuild) {
+        texts = normalizeTriggerTexts(Array.isArray(meta.triggers) ? (meta.triggers as unknown[]).map(String) : []);
+        if (texts.length === 0) { counts.noLine += 1; continue; }
+      } else {
+        if (!options.includeBatch && tags.includes("pivot-apply")) { counts.skippedBatch += 1; continue; }
+        const hasMeta = Array.isArray(meta.triggers) && (meta.triggers as unknown[]).length > 0;
+        if (already.has(entry.id) || hasMeta) { counts.skippedHas += 1; continue; }
+        texts = extractTriggerCandidates(entry.text);
+        if (texts.length === 0) { counts.noLine += 1; continue; }
+      }
+      counts.planned += 1;
+      if (preview.length < samples) preview.push({ id: entry.id.slice(0, 8), triggers: texts });
+      if (!options.apply) continue;
+      const n = await triggerStore.upsertForMemory(entry.id, entry.scope, texts, (t) => embedder.embedBatchQuery(t));
+      counts.rows += n;
+      counts.written += 1;
+      if (!options.rebuild) {
+        meta.triggers = texts;
+        await store.update(entry.id, { metadata: JSON.stringify(meta) });
+      }
+    }
+    const mode = options.apply ? "APPLY" : "DRY-RUN";
+    console.log(`[triggers-backfill ${mode}] scope=${options.scope} scanned=${counts.scanned} planned=${counts.planned}` +
+      ` skipped(batch=${counts.skippedBatch} inactive=${counts.skippedInactive} already=${counts.skippedHas}) noLine=${counts.noLine}` +
+      (options.apply ? ` written=${counts.written} rows=${counts.rows}` : ""));
+    for (const p of preview) console.log(`  ${p.id}  ${p.triggers.map((t) => `「${t}」`).join(" ")}`);
+    if (options.apply) {
+      const stat = await triggerStore.stats(scopeFilter);
+      console.log(`侧表现状：${stat.rows} 条 trigger / ${stat.memories} 个宿主（scope=${options.scope}）`);
+    } else {
+      console.log("（预览。加 --apply 真写入）");
+    }
+  });
+
+program
+  .command("triggers-calibrate")
+  .description("T-Mem trigger 硬闸校准：对 canary 用例逐条打印 query 对侧表 trigger 的最高余弦（不看 gate），用来定 RECALLNEST_TRIGGER_GATE")
+  .option("--cases <path>", "canary 文件", "eval/cases-canary.json")
+  .option("-s, --scope <scope>", "限定 scope（缺省用各 case 自己的 scope）")
+  .option("-k, --top <n>", "每条打印几个命中", "4")
+  .action(async (options) => {
+    const config = loadConfig();
+    const { embedder, triggerStore } = createComponents(config);
+    const { readFileSync } = require("node:fs");
+    const { resolve: resolvePath } = require("node:path");
+    const raw = JSON.parse(readFileSync(resolvePath(options.cases), "utf8"));
+    const cases: Array<{ name: string; query: string; scope?: string; targets?: string[] }> = Array.isArray(raw) ? raw : raw.cases;
+    const top = parseLimitOption(options.top, 4, 1, 20);
+    const stat = await triggerStore.stats();
+    console.log(`侧表：${stat.rows} 条 trigger / ${stat.memories} 个宿主`);
+    for (const c of cases) {
+      const scope = options.scope || c.scope;
+      const qv = await embedder.embedQuery(c.query);
+      const hits = await triggerStore.search(qv, top, scope ? [scope] : undefined, { minCosine: 0, softCosine: 0, minOverlap: 0, minQueryTokens: 0, queryText: c.query });
+      const targets = c.targets || [];
+      const line = hits
+        .map((h) => `${h.memoryId.slice(0, 8)}${targets.some((t) => h.memoryId.startsWith(t)) ? "✓" : " "} cos=${h.cosine.toFixed(3)} ov=${(h.overlap ?? 0).toFixed(2)}「${h.text.slice(0, 28)}」`)
+        .join(" | ");
+      console.log(`${c.name}\n  ${line || "(no trigger rows in scope)"}`);
+    }
+  });
 
 program
   .command("memory-utility")
