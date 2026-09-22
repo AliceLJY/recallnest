@@ -3,7 +3,7 @@ import { persistMemory } from "./capture-engine.js";
 import { composeLightResumeContext, composeResumeContext } from "./context-composer.js";
 import { renderMemories } from "./context-renderer.js";
 import { formatSearchResults, formatBriefResults, formatFullResults, formatCollapsedResults } from "./memory-output.js";
-import { DurableMemoryCategorySchema, StoreMemorySourceSchema, PrivacyTierSchema, isPredictiveMemoryEnabled } from "./memory-schema.js";
+import { DurableMemoryCategorySchema, StoreMemorySourceSchema, PrivacyTierSchema, isPredictiveMemoryEnabled, MemoryTriggersSchema } from "./memory-schema.js";
 import type { PredictionContext } from "./prediction-engine.js";
 import { setReminder, checkTriggers, fireReminder, suggestPredictedReminders, formatSuggestedReminders } from "./prospective-memory.js";
 import { resolveRecallMode } from "./runtime-config.js";
@@ -95,6 +95,7 @@ registerTool(
     canonicalKey: z.string().min(1).max(120).optional().describe("Optional stable key for merge/update semantics"),
     topicTag: z.string().min(1).max(60).optional().describe("Optional topic tag for intra-scope partitioning (e.g. 'auth', 'deploy', 'testing'). Auto-detected if omitted."),
     privacyTier: PrivacyTierSchema.default("durable").describe("Privacy tier: ephemeral (auto-expire, no KG), private (persist, no KG), durable (default), shared (cross-scope)"),
+    triggers: MemoryTriggersSchema.describe("写入时预演触发器：这条记忆「她以后会怎么问起」的 2–5 句口语问法，各说一个角度、别互为变体、别复述正文。只参与召回、不进正文。scope 为 memory:pivot 时必填（§5.3）。例：[\"那个跑分要不要再跑一次\", \"别人的榜我们要不要也去排个名\"]"),
     validUntil: z.union([z.string(), z.number()]).optional().describe("Optional expiration: ISO date string or ms timestamp. Memory will be deprioritized after this time."),
     eventTime: z.union([z.string(), z.number()]).optional().describe("Optional event time: when the event actually happened (ISO date or ms), distinct from storage time."),
     confidence: z.union([
@@ -106,8 +107,8 @@ registerTool(
     ]).optional().describe("Optional confidence override: number (0-1) or {score, reliability}. Auto-assigned from source if omitted."),
     dependsOn: DependsOnSchema.optional().describe("Optional freshness dependencies (borrowed). Declare what this memory depends on so recall shows a cheap validity verdict (exact/compatible/uncertain/invalid). Items: {kind:'file'|'git-rev', ref, expected?}. file → ref=path, expected=mtime-ms string; git-rev → ref=repo path, expected=commit hash (short ok). expected may be an array: first=exact, rest=compatible set. Omit expected for existence-only checks."),
   },
-  async ({ text, category, importance, scope, source, tags, canonicalKey, topicTag, privacyTier, validUntil, eventTime, confidence, dependsOn }) => {
-    const { store, embedder } = getComponents();
+  async ({ text, category, importance, scope, source, tags, canonicalKey, topicTag, privacyTier, triggers, validUntil, eventTime, confidence, dependsOn }) => {
+    const { store, embedder, triggerStore } = getComponents();
     const kgExtractor = getKGExtractor();
     const stored = await persistMemory({
       store,
@@ -115,6 +116,8 @@ registerTool(
       conflictStore,
       kgExtractor,
       auditLogger,
+      triggerStore,
+      embedQueryBatch: (texts: string[]) => embedder.embedBatchQuery(texts),
     }, {
       text,
       category,
@@ -125,6 +128,7 @@ registerTool(
       canonicalKey,
       topicTag,
       privacyTier,
+      triggers,
       // F3: Pass temporal validity params (extracted by persistMemory before Zod parse)
       validUntil,
       eventTime,
@@ -146,6 +150,10 @@ registerTool(
           `Canonical key: ${stored.canonicalKey}`,
           ...(stored.conflictId ? [`Conflict: ${stored.conflictId.slice(0, 8)}`] : []),
           `Stored at: ${stored.storedAt}`,
+          ...(triggers && triggers.length > 0 ? [`Triggers: ${triggers.length}`] : []),
+          ...((stored.resolvedScope || scope).startsWith("memory:pivot") && (!triggers || triggers.length === 0)
+            ? ["⚠️ pivot 记忆缺 triggers：§5.3 要求带 2–5 句「她以后会怎么问」。同 canonicalKey 再存一次并带 triggers 字段即可补上（deduped 也会写入口）。"]
+            : []),
         ].join("\n"),
       }],
     };

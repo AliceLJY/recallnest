@@ -248,6 +248,7 @@ function getRetrievalPath(result: RetrievalResult): string {
   if (result.sources.vector) parts.push("vector");
   if (result.sources.bm25) parts.push("bm25");
   if (result.sources.reranked) parts.push("reranked");
+  if (result.sources.trigger) parts.push("trigger");
   if (result.sources.narrativeSibling) parts.push("narrative");
   return parts.join("+") || "direct";
 }
@@ -377,6 +378,12 @@ function buildWhyMatched(query: string, result: RetrievalResult): string {
 
   if (result.sources.reranked) {
     reasons.push("reranked");
+  }
+
+  if (result.sources.trigger) {
+    // T-Mem：说清是哪句预演问法把它捞出来的（只在 explain 露面，不进 context）
+    const t = result.sources.trigger;
+    reasons.push(`trigger「${t.text}」cos=${t.cosine.toFixed(2)}${t.admittedBy === "soft" ? ` overlap=${(t.overlap ?? 0).toFixed(2)}` : ""}`);
   }
 
   if (matchedTerms.length > 0) {

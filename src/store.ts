@@ -133,7 +133,7 @@ function clampInt(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.floor(value)));
 }
 
-function escapeSqlLiteral(value: string): string {
+export function escapeSqlLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
 
@@ -232,7 +232,7 @@ const TABLE_NAME = "memories";
  * 应用层双检 `matchesScopeFilter(row, filter, mode)` 必须传同一个 mode，否则 SQL 收紧了
  * 应用层又放行（或反之），两层判据打架。
  */
-function scopeWhereClause(scopeFilter: string[], mode: ScopeMatchMode = "family"): string {
+export function scopeWhereClause(scopeFilter: string[], mode: ScopeMatchMode = "family"): string {
   return scopeFilter
     .map(scope => {
       const safe = escapeSqlLiteral(scope);

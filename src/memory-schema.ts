@@ -119,6 +119,16 @@ export const CaseMemorySolutionStepsSchema = normalizedStringListSchema("solutio
 export const CaseMemoryOutcomeSchema = optionalBoundedStringSchema(240);
 export const CaseMemoryToolsSchema = normalizedStringListSchema("tools", 6, 60);
 
+/**
+ * 写入时预演触发器（T-Mem 借鉴，2026-09-22）：这条记忆「她以后会怎么问起」的几句口语问法。
+ * 只参与召回、不进正文、不进证据；单独嵌入存侧表 memory_triggers。
+ * 2–5 条、各说一个角度、别互为变体、别复述正文（T-Mem 三条禁令）。
+ */
+export const MemoryTriggersSchema = z
+  .array(z.string().min(2).max(200))
+  .max(6)
+  .optional();
+
 export const StoreMemoryInputSchema = z.object({
   text: MemoryTextSchema,
   category: DurableMemoryCategorySchema.default("events"),
@@ -129,6 +139,7 @@ export const StoreMemoryInputSchema = z.object({
   canonicalKey: CanonicalKeySchema,
   topicTag: z.string().min(1).max(60).optional(),
   privacyTier: PrivacyTierSchema.default("durable"),
+  triggers: MemoryTriggersSchema,
 });
 
 // Keep in sync with RejectionReason in admission-control.ts
