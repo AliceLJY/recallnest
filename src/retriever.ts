@@ -250,7 +250,10 @@ export const DEFAULT_CATEGORY_MIN_SCORES: Record<string, number> = {
 // P1.2（2026-06-25）：默认 vector-only。canary eval 实测个人记忆库 vector 召回质量全面优于
 // hybrid（robustness 带 scope WITH 6/12 + 不带 scope WITHOUT 10/12，完胜 hybrid 的 3/9；BM25 在
 // 高度同质的个人记忆里是净噪声，会把 vector 本应 top 的目标如 dbcb317a 挤掉）。改频率层救低频
-// 目标实测是死结（动 hotness 必伤靠 hotness 上位的记忆）。hybrid 路径代码全保留，mode 改回
+// 目标实测是死结（动 hotness 必伤靠 hotness 上位的记忆）。〔2026-09-25：这个死结现在有一条开关后的出路——
+// RECALLNEST_POPULARITY_RANKING=bounded 把三个流行度加成合成一步、只加不减、上限 +20%，快照上靠热度上位的
+// canary rebuild-pool 仍过（γ=0.1 时掉到第 5，所以取 0.2）；默认仍是 legacy，切不切见 sync-bridge
+// AI产出/2026-09-24-recallnest-新条目排序/第二步-plan.md。〕hybrid 路径代码全保留，mode 改回
 // "hybrid" 即可切换（注：multiHopExpand 仍硬编码走 hybrid，默认 off，config.retrieval.multiHop
 // 开了会破纯 vector）。数据盲区：canary 全是语义 query，未覆盖 BM25 强项的精确关键词/token 召回
 // （变量名 / commit hash / alias-map 昵称）——待补 exact-token canary 验证。
