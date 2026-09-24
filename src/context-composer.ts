@@ -15,7 +15,7 @@ import {
 } from "./context-composer-task-results.js";
 import type { RetrievalContext, RetrievalResult } from "./retriever.js";
 import type { EssentialContext, ResumeContextResponse, SessionCheckpointRecord } from "./session-schema.js";
-import { ResumeContextRequestSchema, ResumeContextResponseSchema } from "./session-schema.js";
+import { COLLAPSED_ITEMS_MAX, ResumeContextRequestSchema, ResumeContextResponseSchema } from "./session-schema.js";
 import { formatCheckpointRecallSummary } from "./session-output.js";
 import {
   STRONG_WORKFLOW_CUE_TERMS,
@@ -454,8 +454,10 @@ export async function composeResumeContext(
     score: r.score,
     timestamp: r.entry.timestamp,
   }));
+  // collapseResults 按分数从高到低输出；五个分区（加补充查询）去重后可能超过 20 条，
+  // 超出部分截掉，否则整个 resume_context 被 schema 的上限拒掉（2026-09-24 limitPerSection=4 实测）
   const collapsedItems = collapseInput.length > 0
-    ? collapseResults(collapseInput)
+    ? collapseResults(collapseInput).slice(0, COLLAPSED_ITEMS_MAX)
     : undefined;
 
   // CC-8: Build essential context from pinned memories, top patterns, and open loops.

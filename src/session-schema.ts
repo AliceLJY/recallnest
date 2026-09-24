@@ -41,6 +41,9 @@ export const ResumeCheckpointSummarySchema = z.object({
 
 export const ResumeResponseModeSchema = z.enum(["default", "recall-only"]);
 
+/** resume_context 折叠视图最多条数。组装端（context-composer.ts）按分数截到这个数，schema 用同一个常量兜底。 */
+export const COLLAPSED_ITEMS_MAX = 20;
+
 export const CollapsedItemSchema = z.object({
   entryId: z.string(),
   text: z.string(),
@@ -61,8 +64,8 @@ export const ResumeContextResponseSchema = z.object({
   stableContext: normalizedStringListSchema("stableContext", 6, 220),
   relevantPatterns: normalizedStringListSchema("relevantPatterns", 6, 220),
   recentCases: normalizedStringListSchema("recentCases", 6, 220),
-  /** CC-7: Mixed-granularity collapsed view of all recalled items. */
-  collapsedItems: z.array(CollapsedItemSchema).max(20).optional(),
+  /** CC-7: Mixed-granularity collapsed view of all recalled items (composer caps it at COLLAPSED_ITEMS_MAX). */
+  collapsedItems: z.array(CollapsedItemSchema).max(COLLAPSED_ITEMS_MAX).optional(),
   /** CC-8: Essential context reconstructed after compact. */
   essentialContext: EssentialContextSchema.optional(),
   latestCheckpoint: ResumeCheckpointSummarySchema.optional(),
