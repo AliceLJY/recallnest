@@ -128,6 +128,11 @@ export interface RetrievalConfig {
    */
   utilityWeight: number;
   /**
+   * γ：`RECALLNEST_POPULARITY_RANKING=bounded` 下链尾那一步流行度加成的上限，
+   * score × (1 + γ · h)，h ∈ [0,1]。legacy 下不读。（default: 0.2，第二步 plan §一.4）
+   */
+  popularityBonusMax: number;
+  /**
    * Per-category score thresholds. When a result's category matches a key,
    * that threshold is used instead of hardMinScore. Categories not listed
    * fall back to hardMinScore. (default: see DEFAULT_CATEGORY_MIN_SCORES)
@@ -285,6 +290,7 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   timeDecayHalfLifeDays: 60,
   hotnessWeight: 0,
   utilityWeight: 0,
+  popularityBonusMax: 0.2,
 };
 
 /**
@@ -431,9 +437,18 @@ const ERROR_SIGNATURE_BOOST_FACTOR = 1.5;
  * (default) returns the input unchanged — bit-identical, so the pure-move eval baseline holds.
  * Only affects category="cases"; read and query side share extractErrorSignatures so the
  * signatures compare apples-to-apples.
+ *
+ * `clamp: false`（bounded 流行度下用）：不在这里截到 1——链尾的分数此时可以超过 1，
+ * 在这里截会把精确命中的 1.14 压成 1.00、排到未命中的 1.08 之后（第二步 R1 Codex C2）。
+ * 截平统一在 retrieve() 出口做。legacy 调用处不传参，行为不变。
  */
-export function applyErrorSignatureBoost(results: RetrievalResult[], query: string): RetrievalResult[] {
+export function applyErrorSignatureBoost(
+  results: RetrievalResult[],
+  query: string,
+  opts: { clamp?: boolean } = {},
+): RetrievalResult[] {
   if (!envConfig.errorSignatureBoost()) return results;
+  const clamp = opts.clamp ?? true;
   const querySignatures = extractErrorSignatures({ problem: query });
   if (querySignatures.length === 0) return results;
   const querySet = new Set(querySignatures.map(s => s.toLowerCase()));
@@ -443,7 +458,8 @@ export function applyErrorSignatureBoost(results: RetrievalResult[], query: stri
     if (!Array.isArray(sigs) || sigs.length === 0) return r;
     const hit = sigs.some(s => typeof s === "string" && querySet.has(s.toLowerCase()));
     if (!hit) return r;
-    return { ...r, score: Math.min(1, Math.max(0, r.score * ERROR_SIGNATURE_BOOST_FACTOR)) };
+    const boosted = r.score * ERROR_SIGNATURE_BOOST_FACTOR;
+    return { ...r, score: clamp ? Math.min(1, Math.max(0, boosted)) : Math.max(0, boosted) };
   });
 }
 
@@ -914,6 +930,14 @@ export class MemoryRetriever {
       });
     }
 
+    // 第二步（bounded 流行度）：检索器内部一律按原值排序，出口才截到 1——下游阈值与显示仍在 [0,1]。
+    // 必须在 BM25 补偿 / multiHop / topicTag / 有效期过滤之后：multiHopExpand 会按分数重排再截取，
+    // 截早了首轮 1.08 与跟进 1.14 都成 1.0、留下的是首轮那条（第二步 R3 Codex N2）。
+    // 也必须在下面挂 omitted / reconstruction 之前：那两个属性是之后才挂上的，这里 map 不会丢（R1 Agy A3）。
+    if (envConfig.popularityRanking() === "bounded" && results.length > 0) {
+      results = results.map(r => (r.score > 1 ? { ...r, score: 1 } : r));
+    }
+
     // P0.2: Record frequency hits for returned results (manual queries only)
     // Moved after topicTag filter so filtered-out entries are not reinforced.
     if (this.frequencyTracker && results.length > 0 && context.source !== "auto-recall") {
@@ -1328,7 +1352,7 @@ export class MemoryRetriever {
     // T-Mem triggers：rerank 是相似度打分，经 trigger 到达的宿主要托底
     const triggerFloored = applyTriggerFloor(reranked);
 
-    const scored = this.applySharedScoring(triggerFloored, query, trace);
+    const scored = this.applySharedScoring(triggerFloored, query, trace, TRIGGER_FLOOR_FACTOR);
 
     return this.finalizeResults(scored, {
       shortQ,
@@ -1345,8 +1369,66 @@ export class MemoryRetriever {
    * `query` feeds the emotion stage; `trace` carries per-stage trace spans.
    * Path-specific stages stay in the caller: anchor / min_score / rerank / multi-vector
    * blend run BEFORE this; vector-only session suppression runs AFTER this.
+   *
+   * `triggerPathBase`：开关 2 下「trigger 那一路」以 trigger 分的多少倍为底——vector 路径 1；
+   * hybrid 路径传 TRIGGER_FLOOR_FACTOR，与 applyTriggerFloor 给 rerank 之后托的底同口径。
    */
   private applySharedScoring(
+    results: RetrievalResult[],
+    query: string,
+    trace?: TraceCollector,
+    triggerPathBase = 1,
+  ): RetrievalResult[] {
+    const assetWeighted = this.applyPreLengthStages(results, query, trace);
+
+    trace?.startStage("length_norm", assetWeighted.length);
+    const normalized = this.applyLengthNormalization(assetWeighted);
+    // 开关 2（默认关，关时原样）：trigger 那一路不做长度归一，与正文那一路取大
+    const lengthNormalized = envConfig.triggerLengthExempt()
+      ? this.applyTriggerPathFloor(normalized, results, query, triggerPathBase)
+      : normalized;
+    trace?.endStage(lengthNormalized.length, lengthNormalized.map(r => r.score));
+
+    trace?.startStage("time_decay", lengthNormalized.length);
+    const timeDecayed = this.applyTimeDecay(lengthNormalized);
+    trace?.endStage(timeDecayed.length, timeDecayed.map(r => r.score));
+
+    // B-1/E-1: Evolution decay blend — boost memories with high composite decay score
+    const evolutionBlended = this.applyEvolutionDecayBlend(timeDecayed);
+
+    if (envConfig.popularityRanking() === "bounded") {
+      // 流行度只进排序、只加不减、有上限、只读一个计数器、只施加一次（第二步 plan §零.1）：
+      // 下面 legacy 的访问计数加成、热度混合、频次加成三环都不跑。这一环与错误指纹加成都不截平，
+      // 分数可以超过 1——检索器内部按原值排序，retrieve() 出口才截到 1。
+      trace?.startStage("popularity_bonus", evolutionBlended.length);
+      const bonused = this.applyPopularityBonus(evolutionBlended);
+      trace?.endStage(bonused.length, bonused.map(r => r.score));
+      return applyErrorSignatureBoost(bonused, query, { clamp: false });
+    }
+
+    // E-1: Access count boost — memories retrieved more often get a score nudge
+    const accessBoosted = this.applyAccessCountBoost(evolutionBlended);
+
+    // Hotness blend: boost frequently + recently accessed memories
+    trace?.startStage("hotness_blend", accessBoosted.length);
+    const hotnessBlended = this.applyHotnessBlend(accessBoosted);
+    trace?.endStage(hotnessBlended.length, hotnessBlended.map(r => r.score));
+
+    // P0.2: Frequency boost — repeatedly retrieved memories score higher
+    trace?.startStage("frequency_boost", hotnessBlended.length);
+    const frequencyBoosted = this.applyFrequencyBoost(hotnessBlended);
+    trace?.endStage(frequencyBoosted.length, frequencyBoosted.map(r => r.score));
+
+    // A1 error-signature 精确匹配 boost（flag 门控，默认 off → no-op、bit-identical）
+    return applyErrorSignatureBoost(frequencyBoosted, query);
+  }
+
+  /**
+   * 长度归一之前的 7 个环节（新近度 → importance → utility → confidence → emotion → boundary →
+   * 资产类型），从 applySharedScoring 原样挪出来，顺序与 trace 调用逐字不变。单独成方法是为了
+   * 开关 2 能让「trigger 那一路」走完全相同的前置环节（applyTriggerPathFloor，不带 trace）。
+   */
+  private applyPreLengthStages(
     results: RetrievalResult[],
     query: string,
     trace?: TraceCollector,
@@ -1385,32 +1467,57 @@ export class MemoryRetriever {
     const assetWeighted = this.applyAssetTypeWeight(boundaryWeighted);
     trace?.endStage(assetWeighted.length, assetWeighted.map(r => r.score));
 
-    trace?.startStage("length_norm", assetWeighted.length);
-    const lengthNormalized = this.applyLengthNormalization(assetWeighted);
-    trace?.endStage(lengthNormalized.length, lengthNormalized.map(r => r.score));
+    return assetWeighted;
+  }
 
-    trace?.startStage("time_decay", lengthNormalized.length);
-    const timeDecayed = this.applyTimeDecay(lengthNormalized);
-    trace?.endStage(timeDecayed.length, timeDecayed.map(r => r.score));
+  /**
+   * 开关 2（RECALLNEST_TRIGGER_LENGTH_EXEMPT）：trigger 那一路不做长度归一。
+   *
+   * 带 sources.trigger 的条目另算「只靠 trigger 这一路会是多少分」：以 trigger 分 × base 为底，
+   * 不带 trace 走一遍与正文完全相同的前置环节，不做长度归一；长度归一后的分数取两路较大。
+   * 它的相关度来自那句短 trigger、不来自正文，所以不该按正文长度打折。
+   *
+   * 不用「长度系数取 max(原系数, trigger 分 / 并入后分数)」（第二步 v2 的写法）：长度归一之前有
+   * 新近度加法，终分 ≈ (B + r)·M·T/B，向量分 B 变大时反而下降（R3 Codex 实测 0.79→0.81 终分降），
+   * 而且得往 sources 记占比、从 API 原样漏出去。两路各自对向量分、trigger 分单调，取大仍单调。
+   */
+  private applyTriggerPathFloor(
+    normalized: RetrievalResult[],
+    original: RetrievalResult[],
+    query: string,
+    base: number,
+  ): RetrievalResult[] {
+    const twins: RetrievalResult[] = [];
+    for (const r of original) {
+      const t = r.sources.trigger;
+      if (t) twins.push({ ...r, score: t.score * base });
+    }
+    if (twins.length === 0) return normalized;
+    const triggerPath = new Map(this.applyPreLengthStages(twins, query).map(r => [r.entry.id, r.score]));
+    return normalized
+      .map(r => {
+        const floor = triggerPath.get(r.entry.id);
+        return floor !== undefined && floor > r.score ? { ...r, score: floor } : r;
+      })
+      .sort((a, b) => b.score - a.score);
+  }
 
-    // B-1/E-1: Evolution decay blend — boost memories with high composite decay score
-    const evolutionBlended = this.applyEvolutionDecayBlend(timeDecayed);
-
-    // E-1: Access count boost — memories retrieved more often get a score nudge
-    const accessBoosted = this.applyAccessCountBoost(evolutionBlended);
-
-    // Hotness blend: boost frequently + recently accessed memories
-    trace?.startStage("hotness_blend", accessBoosted.length);
-    const hotnessBlended = this.applyHotnessBlend(accessBoosted);
-    trace?.endStage(hotnessBlended.length, hotnessBlended.map(r => r.score));
-
-    // P0.2: Frequency boost — repeatedly retrieved memories score higher
-    trace?.startStage("frequency_boost", hotnessBlended.length);
-    const frequencyBoosted = this.applyFrequencyBoost(hotnessBlended);
-    trace?.endStage(frequencyBoosted.length, frequencyBoosted.map(r => r.score));
-
-    // A1 error-signature 精确匹配 boost（flag 门控，默认 off → no-op、bit-identical）
-    return applyErrorSignatureBoost(frequencyBoosted, query);
+  /**
+   * bounded 流行度（第二步 plan §零.1）：score × (1 + γ·h)，h = min(1, log2(1 + evolution.accessCount) / 5)。
+   * 只读 evolution.accessCount——每次 manual 检索的每条返回都 +1、写锁内读改写、库内持久；
+   * 频次台账（跨进程丢更新）与顶层 accessCount 都不读。零访问 h = 0 原样放行，只加不减，不截平。
+   * # simplified: 31 次封顶的对数饱和、不看时间；要按「最近常用」加权再换成带衰减的计数（§一.4）
+   */
+  private applyPopularityBonus(results: RetrievalResult[]): RetrievalResult[] {
+    const raw = this.config.popularityBonusMax;
+    const gamma = Math.max(0, Number.isFinite(raw) ? raw : 0);
+    if (gamma <= 0) return results;
+    return results.map(r => {
+      const evo = parseEvolution(r.entry.metadata, r.entry.timestamp);
+      if (evo.accessCount <= 0) return r;
+      const h = Math.min(1, Math.log2(1 + evo.accessCount) / 5);
+      return { ...r, score: r.score * (1 + gamma * h) };
+    });
   }
 
   /**

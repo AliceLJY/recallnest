@@ -8,6 +8,7 @@ import { parseNarrative } from "./narrative-schema.js";
 import { getConfidence, getConfidenceMetadata } from "./confidence-tracker.js";
 import { estimateTokens } from "./context-collapse-renderer.js";
 import { evaluateEntryFreshness, createFreshnessCache } from "./freshness.js";
+import { fullTextScoreThreshold } from "./env-config.js";
 
 interface MemoryMetadata {
   source?: string;
@@ -548,7 +549,6 @@ export function formatSearchResults(
 }
 
 const ADAPTIVE_TOKEN_BUDGET = 8000;
-const ADAPTIVE_FULL_SCORE = 0.85;
 
 /**
  * P-fidelity (点4): adaptive 保真度渲染 — 借鉴 RepoPrompt CE「保真度阶梯」的内核
@@ -558,7 +558,7 @@ const ADAPTIVE_FULL_SCORE = 0.85;
  * collapse 的 l0 floor / 按 score 重排 / query-agnostic fallback 都是为 resume 场景定制，
  * 搬到 search 连续撞三个 P2（隐藏过滤 / 覆盖 highlight 排序 / 丢失匹配证据）。search 的语义
  * 不同——结果是"为什么这条命中"，必须 query-aware；故第一版自实现两档：
- *   - 高相关（score ≥ 0.85）→ 全文
+ *   - 高相关（score ≥ fullTextScoreThreshold()：legacy 0.85，bounded 流行度下 0.80）→ 全文
  *   - 其余 → query-aware snippet（pickBestSnippet，显示匹配证据）
  * 按 handler 传入顺序（normal=score / highlight=contextual）依次填入 token 预算，超预算时
  * 全文降级 snippet、snippet 仍超则停止（剩余计入 omitted）。完整三档保真度阶梯（每条记忆预存
@@ -574,10 +574,11 @@ export function formatCollapsedResults(
   let tokensUsed = 0;
   let shown = 0;
   let anyOrigShown = false;
+  const fullScore = fullTextScoreThreshold();
 
   // 保留传入顺序（不重排）：handler 已按 normal=score / highlight=contextual 排好。
   for (const r of results) {
-    const isFull = r.score >= ADAPTIVE_FULL_SCORE;
+    const isFull = r.score >= fullScore;
     let level = isFull ? "FULL" : "SNIP";
     // query-aware：snippet 取匹配词周围窗口、显示匹配证据（search 是"为什么命中"）。
     let text = isFull ? r.entry.text : adaptiveSnippet(context.query, r.entry.text);
@@ -615,7 +616,7 @@ export function formatCollapsedResults(
   const lines = [
     `Query   : ${context.query}`,
     `Profile : ${context.profile}`,
-    `Mode    : adaptive — full text for score ≥ ${ADAPTIVE_FULL_SCORE}, query-aware snippet otherwise, ${ADAPTIVE_TOKEN_BUDGET}-token budget`,
+    `Mode    : adaptive — full text for score ≥ ${fullScore}, query-aware snippet otherwise, ${ADAPTIVE_TOKEN_BUDGET}-token budget`,
     `Shown   : ${shown} of ${results.length}${omitted > 0 ? ` (${omitted} omitted: token budget)` : ""}`,
     ...(anyOrigShown ? [`Note    : ${DISTILLED_NOTE}`] : []),
     "",
