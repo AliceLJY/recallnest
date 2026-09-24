@@ -127,7 +127,7 @@ places where the obvious implementation was wrong — is in
   ──────────────────────     ───────────────────────     ────────────────────────────   ──────────────────────
 
   Claude Code                MCP over stdio              Retriever                      LanceDB
-  Codex                ───▶  44 tools, 3 tiers    ───▶   vector + BM25 + RRF     ───▶   vector + columnar
+  Codex                ───▶  44 tools, 3 tiers    ───▶   vector · hybrid opt-in  ───▶   vector + columnar
   Kimi · Antigravity                                     Classifier · 6 categories
   Doubao desktop                                         Context composer
                              HTTP API :4318              resume_context                 Jina embeddings v5
@@ -136,6 +136,10 @@ places where the obvious implementation was wrong — is in
   phone app            ───▶  read-only gateway     ───▶  Capture: evidence → durable
                              :8791, token-gated
 ```
+
+> Retriever: `retrieval.mode` defaults to `"vector"` (vector-only search). Setting it to `"hybrid"` in
+> `config.json` adds BM25 full-text search, merged with the vector results by weighted score fusion
+> (`vectorWeight` 0.7 / `bm25Weight` 0.3 by default).
 
 ### Internal Design
 

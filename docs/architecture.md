@@ -47,9 +47,12 @@ See [memory-boundary-contract.md](./memory-boundary-contract.md).
 │                                                              │
 │  ┌─────────────┐  ┌──────────────┐  ┌────────────────────┐  │
 │  │  Retriever   │  │  Classifier  │  │  Query Expander    │  │
-│  │ (hybrid:     │  │ (6 categories│  │  (synonym +        │  │
-│  │  vector +    │  │  auto-assign)│  │   semantic expand) │  │
-│  │  BM25 + RRF) │  │              │  │                    │  │
+│  │ (default:    │  │ (6 categories│  │  (synonym +        │  │
+│  │  vector-only;│  │  auto-assign)│  │   semantic expand) │  │
+│  │  optional    │  │              │  │                    │  │
+│  │  hybrid:     │  │              │  │                    │  │
+│  │  weighted    │  │              │  │                    │  │
+│  │  vector+BM25)│  │              │  │                    │  │
 │  └──────┬───────┘  └──────────────┘  └────────────────────┘  │
 │         │                                                    │
 │  ┌──────┴───────┐  ┌──────────────┐  ┌────────────────────┐  │
@@ -116,13 +119,15 @@ Query                                               Results
     │
     ▼
 ┌──────────────┐    ┌──────────────┐    ┌───────────────┐
-│ Query        │───►│ Hybrid       │───►│ Post-process  │──► Top-K
-│ Expander     │    │ Retrieval    │    │               │   Results
-│ (synonyms)   │    │              │    │ - Decay       │
-└──────────────┘    │ Vector: 0.7  │    │ - Access boost│
-                    │ BM25:   0.3  │    │ - Score floor │
-                    │ RRF merge    │    │ - Dedup       │
-                    └──────────────┘    └───────────────┘
+│ Query        │───►│ Retrieval    │───►│ Post-process  │──► Top-K
+│ Expander     │    │ default:     │    │               │   Results
+│ (synonyms)   │    │  vector-only │    │ - Decay       │
+└──────────────┘    │ hybrid mode: │    │ - Access boost│
+                    │  Vector: 0.7 │    │ - Score floor │
+                    │  BM25:   0.3 │    │ - Dedup       │
+                    │  weighted    │    └───────────────┘
+                    │  fusion      │
+                    └──────────────┘
 ```
 
 ## Key Design Decisions
@@ -131,8 +136,8 @@ Query                                               Results
 |----------|-----------|
 | **LanceDB** (not SQLite/Postgres) | Native vector search, columnar storage, zero-config, single-file DB |
 | **Jina v5** (not OpenAI embeddings) | Task-aware embeddings (query vs passage), better multilingual, 1024-dim sweet spot |
-| **Hybrid retrieval** (vector + BM25) | Vector alone misses keyword matches; BM25 alone misses semantic similarity |
-| **RRF fusion** | Reciprocal Rank Fusion is parameter-free and robust across score distributions |
+| **Hybrid retrieval** (vector + BM25, optional) | Vector alone misses keyword matches; BM25 alone misses semantic similarity. Default `retrieval.mode` is `"vector"` (vector-only search; `DEFAULT_RETRIEVAL_CONFIG` in `src/retriever.ts`, `config.json.example`). Set `retrieval.mode` to `"hybrid"` in `config.json` to add BM25 full-text search; if the store has no full-text index, retrieval stays vector-only |
+| **Weighted score fusion** (hybrid mode only) | Applies only when `retrieval.mode` is `"hybrid"` (default is `"vector"`). Hybrid mode combines vector and BM25 scores as a weighted average (defaults `vectorWeight: 0.7`, `bm25Weight: 0.3`), with a 5% bonus when both legs return the same memory; a memory found by only one leg is scored by that leg alone (BM25-only hits get ×1.15 on short queries). For short queries (≤ 4 tokens) the vector weight is multiplied by 0.7 and the BM25 weight by 1.5, capped at 0.6 (`fuseResults()` in `src/retriever.ts`) |
 | **Weibull decay** (not exponential) | Better models human forgetting: slow start, accelerating fade |
 | **6 categories** (not free-form tags) | Structured enough for filtering and lifecycle rules, simple enough to auto-classify |
 | **HTTP API + MCP** (not just MCP) | MCP is great for CLI tools, but HTTP API works with any language/framework |
@@ -146,7 +151,7 @@ src/
 ├── mcp-server.ts          # MCP server (stdio transport)
 ├── cli.ts                 # CLI entry point (lm command)
 ├── store.ts               # LanceDB storage layer
-├── retriever.ts           # Hybrid retrieval (vector + BM25 + RRF)
+├── retriever.ts           # Hybrid retrieval (vector + BM25, weighted score fusion)
 ├── embedder.ts            # Jina embedding client
 ├── ingest.ts              # Multi-source ingestion pipeline
 ├── chunker.ts             # Text chunking with noise filtering
