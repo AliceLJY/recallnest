@@ -13,6 +13,7 @@ import { join, basename, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import { detectLang, tokenizeFts } from "./language-hook.js";
 import { redactSecrets } from "./pii-detector.js";
+import { normalizeDedupText } from "./text-fingerprint.js";
 import type { MemoryStore, MemoryEntry } from "./store.js";
 import type { Embedder } from "./embedder.js";
 import { chunkDocument, type ChunkerConfig } from "./chunker.js";
@@ -34,6 +35,8 @@ import {
 } from "./preference-slots.js";
 import { compressToolOutput } from "./tool-output-compressor.js";
 import { tagNarrativeIfEnabled } from "./narrative-tagger.js";
+
+export { normalizeDedupText };
 
 // ============================================================================
 // Types
@@ -183,22 +186,6 @@ export function formatDedupReasonSummary(result: IngestResult): string {
   return `hard:${counts.hard}, exact:${counts.exact}, llm-skip:${counts["llm-skip"]}, llm-merge:${counts["llm-merge"]}`;
 }
 
-/**
- * Two-stage dedup: vector pre-filter + optional LLM semantic decision.
- *
- * Returns: "store" | "skip"
- *
- * Note: when the LLM says MERGE, we currently keep the new chunk instead of
- * dropping it. We do not have a structured ingest-time merge path yet, and
- * swallowing "same topic + new information" transcript chunks is worse for
- * recall fidelity than storing an incremental near-duplicate.
- */
-export function normalizeDedupText(value: string): string {
-  return value
-    .replace(/^\[(用户|助手)\]\s*/gm, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
 /**
  * Detect content that carries temporal events, file operations, or explicit
@@ -308,6 +295,16 @@ function shouldForceCreateToolChoicePreference(
     : { shouldForceCreate: false };
 }
 
+/**
+ * Two-stage dedup: vector pre-filter + optional LLM semantic decision.
+ *
+ * Returns: "store" | "skip"
+ *
+ * Note: when the LLM says MERGE, we currently keep the new chunk instead of
+ * dropping it. We do not have a structured ingest-time merge path yet, and
+ * swallowing "same topic + new information" transcript chunks is worse for
+ * recall fidelity than storing an incremental near-duplicate.
+ */
 export async function dedupCheck(
   store: MemoryStore,
   vector: number[],

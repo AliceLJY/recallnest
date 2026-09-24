@@ -199,6 +199,21 @@ export function locksDir(lockDir?: string): string {
  * lock-file path. The key is sanitized for the filesystem and suffixed with a short
  * hash of the raw key so distinct keys never collide after sanitization/truncation.
  */
+/**
+ * 只读查看一把命名锁：在不在、持有者进程活没活、锁文件多久没更新。不改任何东西。
+ * 记忆文件对账用它区分「dream / GC 正常在跑」和「某个进程占着锁很久没动静」（后者要报警，不然对账会一直静默跳过）。
+ */
+export function inspectLock(key: string, lockDir?: string): { exists: boolean; pid: number | null; pidAlive: boolean; ageMs: number | null } {
+  const lockPath = lockPathForKey(key, lockDir);
+  try {
+    const pid = parsePid(readFileSync(lockPath, "utf-8"));
+    const ageMs = Date.now() - statSync(lockPath).mtimeMs;
+    return { exists: true, pid: isNaN(pid) ? null : pid, pidAlive: !isNaN(pid) && isPidAlive(pid), ageMs };
+  } catch {
+    return { exists: false, pid: null, pidAlive: false, ageMs: null };
+  }
+}
+
 export function lockPathForKey(key: string, lockDir?: string): string {
   const safe = key.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
   const hash = createHash("sha256").update(key).digest("hex").slice(0, 8);
