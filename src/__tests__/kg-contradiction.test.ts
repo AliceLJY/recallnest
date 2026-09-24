@@ -5,10 +5,17 @@ import { join } from "node:path";
 
 import {
   compareRegexWithCandidates,
+  computePredicateStats,
+  DEFAULT_FUNCTIONAL_MIN_SUBJECTS,
+  filterKGCandidates,
   findKGContradictionCandidates,
+  formatCandidateReport,
+  formatFunnel,
+  hasCandidateFilter,
   loadRegexInput,
   loadScopeTriples,
   normalizeKGValue,
+  parseCandidateFilterArgs,
   regexHitPairs,
   sampleCandidates,
   type RegexHitPair,
@@ -169,6 +176,232 @@ describe("findKGContradictionCandidates", () => {
     expect(sampleCandidates(items, 10, 7)).not.toEqual(sampleCandidates(items, 10, 8));
     expect(new Set(sampleCandidates(items, 10, 7)).size).toBe(10);
     expect(sampleCandidates(items, 100, 1)).toHaveLength(30);
+  });
+});
+
+// ----------------------------------------------------------------------------
+// 函数型谓词过滤与证据门槛
+// ----------------------------------------------------------------------------
+
+/**
+ * 过滤夹具（同一 scope）：
+ * - located_in：5 个 subject，只有 tool-e 两个取值（各 2 条来源）；tool-a 的 "Hooks" / " hooks。" 归一化同值。
+ *   subjects 5 / pairs 6 → 0.833…
+ * - has：2 个 subject，proj-x 三个取值、proj-y 两个取值 → 2 / 5 = 0.4
+ * - owned_by：4 个 subject，只有 repo-d 两个取值 → 4 / 5 = 0.8（恰在 0.8 边界上）
+ * - runs_on：2 个 subject，只有 svc-b 两个取值 → 2 / 3（subject 数不足 3）
+ */
+function filterFixture(): KGTriple[] {
+  return [
+    triple({ subject: "tool-a", predicate: "located_in", object: "Hooks" }, ["m1"]),
+    triple({ subject: "tool-a", predicate: "located_in", object: " hooks。" }, ["m2"]),
+    triple({ subject: "tool-b", predicate: "located_in", object: "bin" }, ["m3"]),
+    triple({ subject: "tool-c", predicate: "located_in", object: "bin" }, ["m4"]),
+    triple({ subject: "tool-d", predicate: "located_in", object: "opt" }, ["m5"]),
+    triple({ subject: "tool-e", predicate: "located_in", object: "~/.claude/hooks" }, ["e1", "e2"]),
+    triple({ subject: "tool-e", predicate: "located_in", object: "~/.Trash" }, ["e3", "e4"]),
+    triple({ subject: "proj-x", predicate: "has", object: "tests" }, ["m6"]),
+    triple({ subject: "proj-x", predicate: "has", object: "docs" }, ["m7"]),
+    triple({ subject: "proj-x", predicate: "has", object: "ci" }, ["m8"]),
+    triple({ subject: "proj-y", predicate: "has", object: "cli" }, ["m9"]),
+    triple({ subject: "proj-y", predicate: "has", object: "ui" }, ["m10"]),
+    triple({ subject: "repo-a", predicate: "owned_by", object: "alice" }, ["m11"]),
+    triple({ subject: "repo-b", predicate: "owned_by", object: "bob" }, ["m12"]),
+    triple({ subject: "repo-c", predicate: "owned_by", object: "carol" }, ["m13"]),
+    triple({ subject: "repo-d", predicate: "owned_by", object: "dave" }, ["m14", "m15"]),
+    triple({ subject: "repo-d", predicate: "owned_by", object: "erin" }, ["m16"]),
+    triple({ subject: "svc-a", predicate: "runs_on", object: "mini" }, ["m17"]),
+    triple({ subject: "svc-b", predicate: "runs_on", object: "mini" }, ["m18"]),
+    triple({ subject: "svc-b", predicate: "runs_on", object: "macbook" }, ["m19", "m20"]),
+  ];
+}
+
+function groupsOf(cs: ReadonlyArray<{ subject: string; predicate: string }>): string[] {
+  return cs.map((c) => `${c.subject}/${c.predicate}`);
+}
+
+describe("computePredicateStats", () => {
+  it("subjects / pairs / functionality / multiValuedSubjects，按 functionality 降序", () => {
+    const stats = computePredicateStats(filterFixture());
+    expect(stats.map((s) => [s.predicate, s.subjects, s.pairs, s.multiValuedSubjects])).toEqual([
+      ["located_in", 5, 6, 1],
+      ["owned_by", 4, 5, 1],
+      ["runs_on", 2, 3, 1],
+      ["has", 2, 5, 2],
+    ]);
+    expect(stats[0].functionality).toBeCloseTo(5 / 6, 12);
+    expect(stats[1].functionality).toBe(0.8);
+    expect(stats[2].functionality).toBeCloseTo(2 / 3, 12);
+    expect(stats[3].functionality).toBe(0.4);
+  });
+
+  it("归一化后同值不重复计对", () => {
+    const [s] = computePredicateStats([
+      triple({ subject: "tool-a", predicate: "located_in", object: "Hooks" }),
+      triple({ subject: "tool-a", predicate: "located_in", object: "  ＨＯＯＫＳ。" }),
+      triple({ subject: "tool-b", predicate: "located_in", object: "bin" }),
+    ]);
+    expect(s).toEqual({ scope: "memory:pivot", predicate: "located_in", subjects: 2, pairs: 2, functionality: 1, multiValuedSubjects: 0 });
+  });
+
+  it("归一化为空的取值不计对；只有空取值的 subject 不计 subject", () => {
+    const [s] = computePredicateStats([
+      triple({ subject: "a", predicate: "p", object: "x" }),
+      triple({ subject: "a", predicate: "p", object: " 。" }),
+      triple({ subject: "b", predicate: "p", object: "..." }),
+    ]);
+    expect([s.subjects, s.pairs, s.functionality]).toEqual([1, 1, 1]);
+  });
+
+  it("同 functionality 按 subjects 降序，再按谓词字典序；不同 scope 分开统计", () => {
+    const stats = computePredicateStats([
+      triple({ subject: "a", predicate: "zeta", object: "1" }),
+      triple({ subject: "a", predicate: "alpha", object: "1" }),
+      triple({ subject: "a", predicate: "big", object: "1" }),
+      triple({ subject: "b", predicate: "big", object: "1" }),
+      triple({ subject: "a", predicate: "alpha", object: "2", scope: "cc:other" }),
+    ]);
+    expect(stats.map((s) => `${s.scope}|${s.predicate}|${s.subjects}`)).toEqual([
+      "memory:pivot|big|2",
+      "cc:other|alpha|1",
+      "memory:pivot|alpha|1",
+      "memory:pivot|zeta|1",
+    ]);
+  });
+
+  it("谓词本身不归一化：大小写不同是两个谓词", () => {
+    const stats = computePredicateStats([
+      triple({ subject: "a", predicate: "located_in", object: "x" }),
+      triple({ subject: "a", predicate: "Located_In", object: "y" }),
+    ]);
+    expect(stats.map((s) => [s.predicate, s.pairs]).sort()).toEqual([["Located_In", 1], ["located_in", 1]]);
+  });
+});
+
+describe("parseCandidateFilterArgs / hasCandidateFilter", () => {
+  it("合法值：谓词去空白去重去空项，比例与整数照原值", () => {
+    expect(parseCandidateFilterArgs({ predicates: " located_in, owned_by,,located_in ", functionalMin: "0.8", functionalMinSubjects: "4", minSecondMentions: "2" })).toEqual({
+      predicates: ["located_in", "owned_by"],
+      functionalMin: 0.8,
+      functionalMinSubjects: 4,
+      minSecondMentions: 2,
+    });
+    expect(parseCandidateFilterArgs({ functionalMin: "1" })).toEqual({ functionalMin: 1 });
+  });
+
+  it("非法值直接拒绝，不静默改成默认值", () => {
+    for (const functionalMin of ["0", "-0.1", "1.01", "abc", "", "NaN"]) {
+      expect(() => parseCandidateFilterArgs({ functionalMin })).toThrow("--functional-min");
+    }
+    for (const n of ["0", "2.5", "-1", "x", ""]) {
+      expect(() => parseCandidateFilterArgs({ functionalMinSubjects: n })).toThrow("--functional-min-subjects");
+      expect(() => parseCandidateFilterArgs({ minSecondMentions: n })).toThrow("--min-second-mentions");
+    }
+    expect(() => parseCandidateFilterArgs({ predicates: " , ," })).toThrow("--predicates");
+  });
+
+  it("一个都没给才算没有过滤", () => {
+    expect(hasCandidateFilter(parseCandidateFilterArgs({}))).toBe(false);
+    expect(hasCandidateFilter({ predicates: ["p"] })).toBe(true);
+    expect(hasCandidateFilter({ functionalMin: 0.8 })).toBe(true);
+    expect(hasCandidateFilter({ functionalMinSubjects: 3 })).toBe(true);
+    expect(hasCandidateFilter({ minSecondMentions: 2 })).toBe(true);
+  });
+});
+
+describe("filterKGCandidates", () => {
+  const triples = filterFixture();
+  const all = findKGContradictionCandidates(triples);
+
+  it("夹具的全部候选组", () => {
+    expect(groupsOf(all)).toEqual(["tool-e/located_in", "proj-x/has", "proj-y/has", "repo-d/owned_by", "svc-b/runs_on"]);
+  });
+
+  it("--predicates 正例：白名单里的留下，顺序不变", () => {
+    const r = filterKGCandidates(all, triples, { predicates: ["has", "located_in"] });
+    expect(groupsOf(r.candidates)).toEqual(["tool-e/located_in", "proj-x/has", "proj-y/has"]);
+  });
+
+  it("--predicates 反例：精确匹配，大小写或写法不同不算", () => {
+    const r = filterKGCandidates(all, triples, { predicates: ["Located_In", "located in", "位于"] });
+    expect(r.candidates).toEqual([]);
+  });
+
+  it("--functional-min 正例：0.8 留下 located_in（5/6）与恰在边界的 owned_by（4/5）", () => {
+    const r = filterKGCandidates(all, triples, { functionalMin: 0.8 });
+    expect(groupsOf(r.candidates)).toEqual(["tool-e/located_in", "repo-d/owned_by"]);
+  });
+
+  it("--functional-min 反例：宽泛谓词 has（0.4）被砍；阈值抬到 0.84 连 located_in 也砍", () => {
+    expect(groupsOf(filterKGCandidates(all, triples, { functionalMin: 0.5 }).candidates)).not.toContain("proj-x/has");
+    expect(filterKGCandidates(all, triples, { functionalMin: 0.84 }).candidates).toEqual([]);
+  });
+
+  it("subject 数不足按不满足处理：runs_on（2 个 subject，2/3）默认被砍，门槛降到 2 才留下", () => {
+    expect(DEFAULT_FUNCTIONAL_MIN_SUBJECTS).toBe(3);
+    expect(groupsOf(filterKGCandidates(all, triples, { functionalMin: 0.6 }).candidates)).toEqual(["tool-e/located_in", "repo-d/owned_by"]);
+    expect(groupsOf(filterKGCandidates(all, triples, { functionalMin: 0.6, functionalMinSubjects: 2 }).candidates)).toEqual([
+      "tool-e/located_in",
+      "repo-d/owned_by",
+      "svc-b/runs_on",
+    ]);
+    // 门槛抬到 5：owned_by 只有 4 个 subject，被砍
+    expect(groupsOf(filterKGCandidates(all, triples, { functionalMin: 0.8, functionalMinSubjects: 5 }).candidates)).toEqual(["tool-e/located_in"]);
+  });
+
+  it("functionality 按整批三元组算，不只看有候选的 subject", () => {
+    // 只把 located_in 的候选组交进来，统计照样数到 5 个 subject
+    const only = all.filter((c) => c.predicate === "located_in");
+    const r = filterKGCandidates(only, triples, { functionalMin: 0.8 });
+    expect(r.candidates.map((c) => c.subject)).toEqual(["tool-e"]);
+    expect(r.predicateStats.find((s) => s.predicate === "located_in")?.subjects).toBe(5);
+  });
+
+  it("--min-second-mentions 正例与反例", () => {
+    // 第二多取值的 mention_count：tool-e 2、svc-b 1（mini 两个 subject 各 1）、repo-d 1、has 1
+    expect(groupsOf(filterKGCandidates(all, triples, { minSecondMentions: 2 }).candidates)).toEqual(["tool-e/located_in"]);
+    expect(filterKGCandidates(all, triples, { minSecondMentions: 3 }).candidates).toEqual([]);
+    expect(filterKGCandidates(all, triples, { minSecondMentions: 1 }).candidates).toEqual(all);
+  });
+
+  it("funnel：同一批三元组上依次报每一步剩多少、砍多少，没启用的标 skipped", () => {
+    const r = filterKGCandidates(all, triples, { predicates: ["located_in", "owned_by", "has"], functionalMin: 0.8, minSecondMentions: 2 });
+    expect(r.funnel.map((f) => [f.step, f.status, f.remaining, f.removed])).toEqual([
+      ["all", "applied", 5, 0],
+      ["predicates", "applied", 4, 1],
+      ["functional", "applied", 2, 2],
+      ["min-second-mentions", "applied", 1, 1],
+    ]);
+    expect(groupsOf(r.candidates)).toEqual(["tool-e/located_in"]);
+
+    const partial = filterKGCandidates(all, triples, { functionalMin: 0.8 });
+    expect(partial.funnel.map((f) => [f.step, f.status, f.remaining, f.removed, f.criterion])).toEqual([
+      ["all", "applied", 5, 0, ""],
+      ["predicates", "skipped", 5, 0, ""],
+      ["functional", "applied", 2, 3, "functionality >= 0.8 and subjects >= 3"],
+      ["min-second-mentions", "skipped", 2, 0, ""],
+    ]);
+  });
+
+  it("没给任何选项：候选原样返回，每一步都是 skipped", () => {
+    const r = filterKGCandidates(all, triples, {});
+    expect(r.candidates).toEqual(all);
+    expect(r.funnel.map((f) => f.status)).toEqual(["applied", "skipped", "skipped", "skipped"]);
+    expect(r.funnel.every((f) => f.remaining === all.length)).toBe(true);
+  });
+
+  it("文本报告：给了 funnel 才多出漏斗几行，不给与原来一样", () => {
+    const r = filterKGCandidates(all, triples, { functionalMin: 0.8 });
+    const withFunnel = formatCandidateReport("memory:pivot", triples.length, r.candidates.length, r.candidates, "top 20", r.funnel);
+    const without = formatCandidateReport("memory:pivot", triples.length, r.candidates.length, r.candidates, "top 20");
+    expect(withFunnel).toBe(without.replace("(top 20)\n", `(top 20)\n${formatFunnel(r.funnel).join("\n")}\n`));
+    expect(formatFunnel(r.funnel)).toEqual([
+      "funnel (same triples, steps applied in order):",
+      "  all candidate groups    5",
+      "  predicate whitelist     skipped",
+      "  functional predicates   2 (-3)  functionality >= 0.8 and subjects >= 3",
+      "  min 2nd-value mentions  skipped",
+    ]);
   });
 });
 

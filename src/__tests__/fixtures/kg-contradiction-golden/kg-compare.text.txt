@@ -1,0 +1,27 @@
+Regex vs KG-group candidates — scope=memory:pivot
+regex input: 4 active memories; triples: 16
+regex pairs=1  candidate groups=5
+  both (regex pair covered by a group): 1 pairs / 1 groups
+  direction 1 — regex only: 0 (no triples: 0, method blind spot: 0)
+  direction 2 — group candidates regex missed: 4
+
+## Direction 1a — regex only, memory has no triples (KG extraction gap) (0)
+
+## Direction 1b — regex only, both have triples but no collision (grouping blind spot) (0)
+
+## Direction 2 — group candidates the regex missed (4)
+1. [tool-e] —located_in→ 2 values (2nd mentions=2)
+     - "~/.claude/hooks"  mentions=2  first_seen=2025-06-15  last=2025-06-15  src=mem-e1,mem-e2
+     - "~/.Trash"  mentions=2  first_seen=2025-06-15  last=2025-06-15  src=mem-e3,mem-e4
+     sources outside regex input (inactive/unscanned): mem-e1,mem-e2,mem-e3,mem-e4
+2. [proj-x] —has→ 3 values (2nd mentions=1)
+     - "ci"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-8
+     - "docs"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-7
+     - "tests"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-6
+     sources outside regex input (inactive/unscanned): mem-8,mem-7,mem-6
+  … 2 more (raise --limit or use --json)
+
+## Both — regex pairs covered by a group (1)
+1. mem-b × mem-a  "always deploy from the macbook" vs "never deploy from the macbook anymore"
+     groups: [部署机]—是
+

@@ -1,0 +1,11 @@
+KG contradiction candidates — scope=memory:pivot
+候选，不是判决：同组多值可能是合法多值、先后变更或真矛盾，需人工判断。未做时间过滤。
+triples=16  candidate groups=5  showing=2 (random sample n=2 seed=7)
+
+1. [负责人] —是→ 2 values (2nd mentions=1)
+     - "张三"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-c
+     - "李四"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-d
+2. [proj-x] —has→ 3 values (2nd mentions=1)
+     - "ci"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-8
+     - "docs"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-7
+     - "tests"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-6

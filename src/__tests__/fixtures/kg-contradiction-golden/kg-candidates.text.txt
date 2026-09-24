@@ -1,0 +1,20 @@
+KG contradiction candidates — scope=memory:pivot
+候选，不是判决：同组多值可能是合法多值、先后变更或真矛盾，需人工判断。未做时间过滤。
+triples=16  candidate groups=5  showing=5 (top 20)
+
+1. [tool-e] —located_in→ 2 values (2nd mentions=2)
+     - "~/.claude/hooks"  mentions=2  first_seen=2025-06-15  last=2025-06-15  src=mem-e1,mem-e2
+     - "~/.Trash"  mentions=2  first_seen=2025-06-15  last=2025-06-15  src=mem-e3,mem-e4
+2. [proj-x] —has→ 3 values (2nd mentions=1)
+     - "ci"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-8
+     - "docs"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-7
+     - "tests"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-6
+3. [proj-y] —has→ 2 values (2nd mentions=1)
+     - "cli"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-9
+     - "ui"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-10
+4. [负责人] —是→ 2 values (2nd mentions=1)
+     - "张三"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-c
+     - "李四"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-d
+5. [部署机] —是→ 2 values (2nd mentions=1)
+     - "MacBook"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-a
+     - "mini"  mentions=1  first_seen=2025-06-15  last=2025-06-15  src=mem-b
