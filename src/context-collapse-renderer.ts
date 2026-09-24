@@ -11,6 +11,8 @@
  * Reuses existing L0/L1/L2 text stored in metadata by the multi-vector pipeline.
  */
 
+import { fullTextScoreThreshold } from "./env-config.js";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -137,7 +139,12 @@ export function collapseResults(
   items: CollapseInput[],
   config?: Partial<CollapseConfig>,
 ): CollapseOutput[] {
-  const cfg: CollapseConfig = { ...DEFAULT_COLLAPSE_CONFIG, ...config };
+  // L2 的默认线跟着流行度模式走（legacy 0.85、bounded 0.80，每次调用现读）；调用方显式传的 thresholds 原样用。
+  const defaults: CollapseConfig = {
+    ...DEFAULT_COLLAPSE_CONFIG,
+    thresholds: { ...DEFAULT_COLLAPSE_CONFIG.thresholds, l2: fullTextScoreThreshold() },
+  };
+  const cfg: CollapseConfig = { ...defaults, ...config };
   const { thresholds, tokenBudget, stalenessThresholdDays } = cfg;
 
   // Sort by score descending (highest relevance first)

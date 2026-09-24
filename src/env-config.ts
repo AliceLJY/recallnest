@@ -123,6 +123,34 @@ export const layerAdmissionMin = (): number => {
   return Number.isFinite(n) && n > 0 ? n : 3;
 };
 
+// --- 排序上把相关度与流行度拆开（2026-09-25，open-loops「RecallNest 检索评分链」症状 C）---
+
+/**
+ * 流行度信号怎么进排序：
+ *   legacy  — 默认，现行为逐字节不变：访问计数加成、热度混合（hotnessWeight）、频次加成三环，各自截在 1.0
+ *   bounded — 三环都不跑；链尾一步 score × (1 + popularityBonusMax · h)，h = min(1, log2(1+evolution.accessCount)/5)，
+ *             只加不减、这一环不截平（检索器内部按原值排序，retrieve() 出口才截到 1）；下游「给全文」档用 0.80
+ * 切默认是生产行为变更，要 Alice 拍板。
+ */
+export const popularityRanking = (): "legacy" | "bounded" =>
+  process.env.RECALLNEST_POPULARITY_RANKING === "bounded" ? "bounded" : "legacy";
+
+/**
+ * trigger 那一路不做长度归一：以 trigger 分为底走一遍与正文相同的前置环节，长度归一后取两路较大。
+ * trigger 独自带入或主导的宿主两路相同，等于免长度归一。默认关。
+ */
+export const triggerLengthExempt = (): boolean =>
+  process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT === "true";
+
+/**
+ * 下游「给全文」那一档的分数线（adaptive 全文、resume_context 折叠视图 L2）。
+ * bounded 下热门条目不再被乘到 1.0，分数回到相关度的水平，0.85 那条线就太高了——
+ * 同一份快照上判过分档的前 5 条目里，正确答案拿全文的从 26 条掉到 18 条；0.80 是 32 条
+ * （第二步 plan §一.1，正式 shadow 用整组渲染回放复核）。legacy 下仍是 0.85。
+ */
+export const fullTextScoreThreshold = (): number =>
+  popularityRanking() === "bounded" ? 0.80 : 0.85;
+
 // --- String settings with `||` default (empty string falls through) ---
 
 export const dataDir = (): string => process.env.RECALLNEST_DATA_DIR || "data";
