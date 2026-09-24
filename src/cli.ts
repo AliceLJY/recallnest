@@ -1750,16 +1750,17 @@ program
       const journalPath = resolve(String(options.undo));
       let r: Awaited<ReturnType<typeof undoMemoryReconcile>>;
       try {
-        r = await undoMemoryReconcile({ store, auditLogger: createAuditLogger() }, journalPath);
+        r = await undoMemoryReconcile({ store, auditLogger: createAuditLogger() }, journalPath, { auditPath: join(paths.dataDir, "audit.jsonl") });
       } catch (err) {
         console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
         process.exitCode = 2;
         return;
       }
       const ids8 = (ids: string[]) => `${ids.slice(0, 20).map((id) => id.slice(0, 8)).join(" ")}${ids.length > 20 ? ` …（共 ${ids.length}）` : ""}`;
-      console.log(`撤销完成：写回 ${r.restored} 条，本轮插入的 ${r.insertsRetired} 条改为下架，期间被改过而跳过 ${r.skippedConflict.length} 条，合并链依赖未满足而保留 ${r.skippedDependency.length} 条`);
+      console.log(`撤销完成：写回 ${r.restored} 条，本轮插入的 ${r.insertsRetired} 条改为下架，期间被改过而跳过 ${r.skippedConflict.length} 条，合并链依赖未满足而保留 ${r.skippedDependency.length} 条，文字已被 forget 而保留非活跃 ${r.skippedForgotten.length} 条`);
       if (r.skippedConflict.length > 0) console.log(`  被改过而跳过的 id（前 8 位）: ${ids8(r.skippedConflict)}`);
-      if (r.skippedDependency.length > 0) console.log(`  保留的合并链成员 id（它原来指向的那一行已不活跃，撤了会断链）: ${ids8(r.skippedDependency)}`);
+      if (r.skippedDependency.length > 0) console.log(`  保留的合并链成员 id（它原来指向的那一行已不活跃、或本次撤销会把它撤掉，撤了会断链）: ${ids8(r.skippedDependency)}`);
+      if (r.skippedForgotten.length > 0) console.log(`  文字已被 forget、没撤回活跃的 id: ${ids8(r.skippedForgotten)}`);
       if (r.unparsedLines > 0) console.log(`  ⚠️ 日志里有 ${r.unparsedLines} 行解析不了（多半是写到一半的截断尾行），已跳过`);
       console.log(`撤销日志: ${r.undoJournalPath}`);
       console.log("⚠️ 撤销后把 sources.memory.path 改回 auto 或暂停导入，否则下一轮对账会按现行文件重新对一遍");

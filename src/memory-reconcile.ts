@@ -135,7 +135,12 @@ export interface PlannedReactivate {
   id: string;
   file: string | null;
   kind: ReactivateKind;
-  /** broken-consolidation 专用：链是不是因为合并目标本轮要被下架才断的（是 → 下架被护栏拦下时不恢复） */
+  /**
+   * 同一段文字的全部合并成员里，合并目标本轮要被下架的那些目标 id。这段文字此刻还靠它们撑着（链还没断），
+   * 恢复没成功就不能下架它们（上线前代码单审 N3、第二次单审 F2：不只看被选中的那一行）。
+   */
+  dependentRetireIds: string[];
+  /** 等价于 dependentRetireIds 非空：链是本轮下架才断的（下架被护栏拦下时，broken-consolidation 不恢复） */
   targetRetiredThisRun: boolean;
   norm: string;
   expect: RowState;
@@ -406,23 +411,27 @@ export function planMemoryReconcile(input: PlanInput): MemoryReconcilePlan {
       exceptionForgotten++;
       continue;
     }
+    // 同文组全部合并成员里、本轮要被下架的合并目标：恢复没成功时它们要延后下架
+    const dependentRetireIds = [...new Set(consolidated
+      .map((r) => rowState(r.meta).consolidatedInto)
+      .filter((t): t is string => t !== null && retireIds.has(t)))];
     // 3. 对账下架过的 → 恢复
     const retiredByUs = rows.filter((r) => isMemoryDocSlice(r.meta) && isReconcileRetired(rowState(r.meta)));
     if (retiredByUs.length > 0) {
       const row = pickPreferred(retiredByUs, chunk.text);
-      reactivate.push({ id: row.id, file: fileOf(row.meta), kind: "reconcile-retired", targetRetiredThisRun: false, norm, expect: rowState(row.meta), before: journalFields(row.meta) });
+      reactivate.push({ id: row.id, file: fileOf(row.meta), kind: "reconcile-retired", dependentRetireIds, targetRetiredThisRun: dependentRetireIds.length > 0, norm, expect: rowState(row.meta), before: journalFields(row.meta) });
       continue;
     }
     // 4. 合并链已断（目标不活跃、不存在，或本轮要被下架）→ 恢复被合并的那一行
     const brokenConsolidation = consolidated.filter((r) => isMemoryDocSlice(r.meta));
     if (brokenConsolidation.length > 0) {
       const row = pickPreferred(brokenConsolidation, chunk.text);
-      const target = rowState(row.meta).consolidatedInto;
       reactivate.push({
         id: row.id,
         file: fileOf(row.meta),
         kind: "broken-consolidation",
-        targetRetiredThisRun: target !== null && retireIds.has(target),
+        dependentRetireIds,
+        targetRetiredThisRun: dependentRetireIds.length > 0,
         norm,
         expect: rowState(row.meta),
         before: journalFields(row.meta),
@@ -510,6 +519,14 @@ function collectForgets(chunk: string, into: ForgetSet): void {
       if (m) into.norms.add(m[1]);
     } catch { /* 跳过坏行 */ }
   }
+}
+
+/** 这段文字是否已被 forget：行自己的 id、这段文字的确定性 id 或备用 id、归一指纹，任一在 forget 记录里都算 */
+function isTextForgotten(forgets: ForgetSet, text: string, rowId?: string): boolean {
+  return (rowId !== undefined && forgets.ids.has(rowId))
+    || forgets.ids.has(deterministicId(MEMORY_DOC_SCOPE, text))
+    || forgets.ids.has(altInsertId(text))
+    || forgets.norms.has(textFingerprint(text));
 }
 
 /** 审计日志里 scope "memory" 的 forget 事件。文件不在就是空集（识别失效，不报错）。 */
@@ -600,6 +617,8 @@ export interface ApplyResult {
   reactivatedReconcileRetired: number;
   reactivatedBrokenConsolidation: number;
   reactivateSkippedStateChanged: number;
+  /** 规划之后这段文字被 forget 了：不恢复（第二次代码单审 F1） */
+  reactivateSkippedForgotten: number;
   retired: number;
   /** 所在文件还有没插进去的段落，本轮先不下 */
   retireDeferredPendingInsert: number;
@@ -677,24 +696,34 @@ async function applyInserts(
         meta.reconcile = { v: 1, action: "inserted", at: ctx.isoNow, run: ctx.runId };
         return { ...built, category: built.category as MemoryEntry["category"], id: item.id, metadata: JSON.stringify(meta) };
       });
-      // 写库前先落意图：崩溃在写库与写结果之间时，撤销还能认出这批插入（行上有本轮的 reconcile 标记）
-      ctx.journal.write([{ run: ctx.runId, phase: "intent", action: "insert", ids: entries.map((e) => e.id) }]);
+      // 写库前先落意图（含插入后应有的字段与正文指纹）：崩溃在写库与写结果之间时，撤销照样能核对这一行之后有没有被改过
+      ctx.journal.write([{
+        run: ctx.runId,
+        phase: "intent",
+        action: "insert",
+        items: entries.map((e) => ({ id: e.id, after: journalFields(parseMeta(e.metadata)), textFp: textFingerprint(e.text) })),
+      }]);
       const res = await deps.store.insertIfAbsent(entries);
       result.inserted += res.inserted.length;
       for (const id of res.inserted) settled.add(id);
       const itemById = new Map(toInsert.map(({ item }) => [item.id, item]));
       // 撞 id 被跳过：只有占着这个 id 的行正是同一段文字（别的写方刚插了同文），才算有了着落；
       // 正文不同说明 id 被另一段文字占着，这段文字仍没有代表——记为没插进去（所在文件本轮不下架、要人看）
+      const skippedLines: object[] = [];
       for (const id of res.skippedExisting) {
         const item = itemById.get(id)!;
         const holder = await deps.store.getById(id);
-        if (holder && normalizeDedupText(holder.text) === item.chunk.norm) {
+        const sameText = !!holder && normalizeDedupText(holder.text) === item.chunk.norm;
+        if (sameText) {
           result.insertSkippedExisting++;
           settled.add(id);
         } else {
           result.insertErrors.push(`id ${id.slice(0, 8)} 已被另一段文字占着，未插入（${item.chunk.file}）`);
         }
+        // 没插进去也落一条结果：撤销据此知道这个 id 上的行不是本轮写的，不去动它
+        skippedLines.push({ run: ctx.runId, action: "insert", id, file: item.chunk.file, inserted: false, skipped: sameText ? "same-text-exists" : "id-occupied" });
       }
+      ctx.journal.write(skippedLines);
       const entryById = new Map(entries.map((e) => [e.id, e]));
       ctx.journal.write(res.inserted.map((id) => {
         const item = itemById.get(id)!;
@@ -742,7 +771,8 @@ async function applyPatches<T extends PatchItem>(
     const pending: object[] = [];
     const batchApplied: T[] = [];
     const seen = new Set<string>();
-    // 写库前先落意图（含规划时的前值）：崩溃在写库与写结果之间时，撤销靠它与行上的本轮标记还原
+    // 写库前先落意图：崩溃在写库与写结果之间时，撤销据此知道这些行可能被本轮写过，再按行上的本轮标记
+    // （提交时在写锁内记下的真实前值）核对与还原；这里的 before 是规划时的值，只供人工排查
     ctx.journal.write([{
       run: ctx.runId,
       phase: "intent",
@@ -797,6 +827,7 @@ export async function applyMemoryReconcile(
     reactivatedReconcileRetired: 0,
     reactivatedBrokenConsolidation: 0,
     reactivateSkippedStateChanged: 0,
+    reactivateSkippedForgotten: 0,
     retired: 0,
     retireDeferredPendingInsert: 0,
     retireDeferredDependency: 0,
@@ -808,9 +839,19 @@ export async function applyMemoryReconcile(
   const pendingFiles = new Set(plan.insert.filter((item) => !settled.has(item.id)).flatMap((item) => item.files));
 
   // 2. 恢复（在下架之前：先有代表再撤旧的）。因目标本轮下架而断的合并链，只在下架照常进行时才恢复。
-  const toReactivate = plan.reactivate.filter((item) =>
-    item.kind === "reconcile-retired" || !item.targetRetiredThisRun || ctx.retireAllowed);
+  //    恢复前再读一次审计日志：规划之后被 forget 的文字（删的可能是同文的另一行）不恢复（第二次代码单审 F1）。
+  ctx.forgetWatcher?.refresh();
   const deferRetireIds = new Set<string>();
+  const toReactivate: PlannedReactivate[] = [];
+  for (const item of plan.reactivate) {
+    if (item.kind === "broken-consolidation" && item.targetRetiredThisRun && !ctx.retireAllowed) continue;
+    if (ctx.forgetWatcher?.isForgotten(item.id, item.norm)) {
+      result.reactivateSkippedForgotten++;
+      for (const t of item.dependentRetireIds) deferRetireIds.add(t);
+      continue;
+    }
+    toReactivate.push(item);
+  }
   if (toReactivate.length > 0) {
     const { applied, skipped } = await applyPatches(
       deps,
@@ -837,12 +878,8 @@ export async function applyMemoryReconcile(
     result.reactivatedReconcileRetired = applied.filter((i) => i.kind === "reconcile-retired").length;
     result.reactivatedBrokenConsolidation = applied.filter((i) => i.kind === "broken-consolidation").length;
     result.reactivateSkippedStateChanged = skipped.length;
-    // 合并链成员没恢复成功：它指向的、本轮要下架的那一行是这段现行文字仅剩的代表，先别下（上线前代码单审 N3）
-    for (const item of skipped) {
-      if (item.kind === "broken-consolidation" && item.targetRetiredThisRun && item.expect.consolidatedInto) {
-        deferRetireIds.add(item.expect.consolidatedInto);
-      }
-    }
+    // 恢复没成功：这段文字此刻还靠那些本轮要下架的合并目标撑着，先别下（上线前代码单审 N3、第二次 F2）
+    for (const item of skipped) for (const t of item.dependentRetireIds) deferRetireIds.add(t);
   }
 
   // 3. 下架：重复文本随时可下（同文的保留行仍活跃）；其余要等所在文件的新段落都有了着落；依赖未满足的都延后
@@ -1104,6 +1141,7 @@ export function formatReconcileSummary(outcome: ReconcileOutcome): string {
     const extra: string[] = [];
     if (a.insertSkippedExisting) extra.push(`插入时已存在同文 ${a.insertSkippedExisting}`);
     if (a.insertSkippedForgotten) extra.push(`插入前刚被 forget ${a.insertSkippedForgotten}`);
+    if (a.reactivateSkippedForgotten) extra.push(`恢复前刚被 forget ${a.reactivateSkippedForgotten}`);
     if (a.retireDeferredPendingInsert) extra.push(`待插入文件的下架延后 ${a.retireDeferredPendingInsert}`);
     if (a.retireDeferredDependency) extra.push(`合并链成员没恢复成的下架延后 ${a.retireDeferredDependency}`);
     const changed = a.retireSkippedStateChanged + a.reactivateSkippedStateChanged;
@@ -1126,8 +1164,13 @@ export interface UndoResult {
   restored: number;
   insertsRetired: number;
   skippedConflict: string[];
-  /** 合并链成员的恢复没撤：它原来指向的那一行现在不活跃，撤了会造出断链 */
+  /**
+   * 撤了会造出断链而没撤的：合并链成员的恢复（它原来指向的那一行现在不活跃、或本次撤销会把它撤成不活跃），
+   * 以及此刻有合并成员指向的插入行 / 恢复行
+   */
   skippedDependency: string[];
+  /** 撤回去会让一段已被 forget 的文字重新活跃：保留非活跃 */
+  skippedForgotten: string[];
   /** 日志里解析不了的行（比如写到一半崩溃留下的截断尾行） */
   unparsedLines: number;
   undoJournalPath: string;
@@ -1137,11 +1180,12 @@ interface UndoRecord {
   run: string;
   action: "insert" | "retire" | "reactivate";
   id: string;
-  /** 有结果行时来自结果行；只有意图行时来自规划时的前值 */
+  /** 结果行的实际前值（只有意图行时不用它，改用行上 reconcile.prev 存的提交时前值） */
   before?: JournalFields;
+  /** 结果行的实际后值；插入的意图行也带（插入前就知道） */
   after?: JournalFields;
   textFp?: string;
-  /** 只有意图、没有结果（崩溃在写库与写结果之间）：靠行上的本轮标记判断当时写没写成 */
+  /** 只有意图、没有结果（崩溃在写库与写结果之间） */
   intentOnly: boolean;
 }
 
@@ -1155,6 +1199,8 @@ function asJournalFields(value: unknown): JournalFields | undefined {
 function readUndoRecords(journalPath: string): { records: UndoRecord[]; unparsed: number } {
   const results = new Map<string, UndoRecord>();
   const intents = new Map<string, UndoRecord>();
+  /** 插入时撞 id 被跳过的：这个 id 上的行不是本轮写的 */
+  const notWritten = new Set<string>();
   let unparsed = 0;
   for (const line of readFileSync(journalPath, "utf-8").split("\n")) {
     if (!line.trim()) continue;
@@ -1169,17 +1215,27 @@ function readUndoRecords(journalPath: string): { records: UndoRecord[]; unparsed
     const run = rec.run;
     const action = rec.action as UndoRecord["action"];
     if (rec.phase === "intent") {
-      if (action === "insert" && Array.isArray(rec.ids)) {
-        for (const id of rec.ids) if (typeof id === "string") intents.set(id, { run, action, id, intentOnly: true });
-      } else if (Array.isArray(rec.items)) {
+      if (Array.isArray(rec.items)) {
         for (const it of rec.items) {
           const item = asRecord(it);
-          if (item && typeof item.id === "string") intents.set(item.id, { run, action, id: item.id, before: asJournalFields(item.before), intentOnly: true });
+          if (!item || typeof item.id !== "string") continue;
+          intents.set(item.id, {
+            run,
+            action,
+            id: item.id,
+            after: action === "insert" ? asJournalFields(item.after) : undefined,
+            textFp: typeof item.textFp === "string" ? item.textFp : undefined,
+            intentOnly: true,
+          });
         }
       }
       continue;
     }
     if (typeof rec.id !== "string") continue;
+    if (action === "insert" && rec.inserted === false) {
+      notWritten.add(rec.id);
+      continue;
+    }
     results.set(rec.id, {
       run,
       action,
@@ -1190,14 +1246,47 @@ function readUndoRecords(journalPath: string): { records: UndoRecord[]; unparsed
       intentOnly: false,
     });
   }
-  for (const [id, rec] of intents) if (!results.has(id)) results.set(id, rec);
+  for (const [id, rec] of intents) if (!results.has(id) && !notWritten.has(id)) results.set(id, rec);
   return { records: [...results.values()], unparsed };
 }
 
 /**
+ * 只有意图行时，从行上的本轮标记推出「当时写成了什么样」与「写之前是什么样」（reconcile.prev 是提交时在写锁内记下的真实前值）。
+ * 推不出来（标记不是本轮这个动作、没有前值）就返回 null，调用方按冲突跳过。
+ */
+function expectedFromMarker(meta: Record<string, unknown>, rec: UndoRecord): { before: JournalFields; after: JournalFields } | null {
+  const marker = asRecord(meta.reconcile);
+  const expectedAction = rec.action === "retire" ? "retired" : "reactivated";
+  if (!marker || marker.run !== rec.run || marker.action !== expectedAction) return null;
+  const prev = asJournalFields(marker.prev);
+  if (!prev) return null;
+  if (rec.action === "retire") {
+    const at = typeof marker.at === "string" ? Date.parse(marker.at) : NaN;
+    if (!Number.isFinite(at) || typeof marker.reason !== "string") return null;
+    return {
+      before: prev,
+      after: { status: "archived", validUntil: at, evolutionNote: `${RECONCILE_NOTE_PREFIX} ${marker.reason}`, consolidatedInto: prev.consolidatedInto, reconcile: marker },
+    };
+  }
+  return {
+    before: prev,
+    after: {
+      status: "active",
+      validUntil: null,
+      evolutionNote: null,
+      consolidatedInto: marker.kind === "broken-consolidation" ? null : prev.consolidatedInto,
+      reconcile: marker,
+    },
+  };
+}
+
+/**
  * 按对账日志逐条撤销，整轮持有与对账相同的三把锁。
- * - 下架、恢复：只在「当前值 == 日志里的 after」时写回 before；只有意图行的，要求行上带着本轮同一动作的标记。
- * - 合并链成员的恢复：它原来指向的那一行此刻必须活跃才撤（先撤下架，旧代表回来了才撤成员），否则保留并列出。
+ * - 下架、恢复：只在「当前值 == 当时写成的样子」时写回写之前的值。有结果行用结果行；只有意图行的，用行上本轮标记里
+ *   存的提交时前值，并按标记推出当时写成的样子来核对——之后被改过就跳过，绝不拿规划时的旧值覆盖。
+ * - 合并链成员的恢复：它原来指向的那一行必须此刻活跃、而且不在本次撤销要撤成不活跃的名单里，否则保留成员并列出。
+ * - 插入与恢复的撤销会让行失活：此刻已有合并成员指向它的（对账之后 dream 合并进来的），保留并列出。
+ * - 撤回去会让一行重新活跃的（撤下架），先查审计里的 forget：这段文字已被 forget 就保留非活跃并列出。
  * - 插入：当前字段与正文指纹都等于插入时的样子才改成 archived（undo-insert），不删行；之后被改过的保留。
  * 后做的先撤：下架 → 恢复 → 插入。撤销之后要么把 sources.memory.path 改回 auto，要么暂停导入——
  * 否则下一轮对账会按现行文件重新对一遍。
@@ -1205,7 +1294,7 @@ function readUndoRecords(journalPath: string): { records: UndoRecord[]; unparsed
 export async function undoMemoryReconcile(
   deps: { store: MemoryStore; auditLogger?: Pick<AuditLogger, "log"> | null },
   journalPath: string,
-  opts: { now?: () => number } = {},
+  opts: { now?: () => number; auditPath?: string } = {},
 ): Promise<UndoResult> {
   const outcome = await underReconcileLocks(() => undoUnlocked(deps, journalPath, opts));
   if (!outcome.ran) {
@@ -1217,20 +1306,36 @@ export async function undoMemoryReconcile(
 async function undoUnlocked(
   deps: { store: MemoryStore; auditLogger?: Pick<AuditLogger, "log"> | null },
   journalPath: string,
-  opts: { now?: () => number },
+  opts: { now?: () => number; auditPath?: string },
 ): Promise<UndoResult> {
   const { records, unparsed } = readUndoRecords(journalPath);
+  const forgets = opts.auditPath ? loadForgetSet(opts.auditPath) : null;
   const nowMs = (opts.now ?? Date.now)();
   const isoNow = new Date(nowMs).toISOString();
   const undoRun = `undo-${isoNow.replace(/[:.]/g, "-")}`;
   const undoJournalPath = `${journalPath.replace(/\.jsonl$/, "")}.${undoRun}.jsonl`;
   const journal = new Journal(undoJournalPath);
-  const result: UndoResult = { restored: 0, insertsRetired: 0, skippedConflict: [], skippedDependency: [], unparsedLines: unparsed, undoJournalPath };
-
-  const markerMatches = (meta: Record<string, unknown>, rec: UndoRecord, action: string): boolean => {
-    const m = asRecord(meta.reconcile);
-    return !!m && m.run === rec.run && m.action === action;
+  const result: UndoResult = {
+    restored: 0,
+    insertsRetired: 0,
+    skippedConflict: [],
+    skippedDependency: [],
+    skippedForgotten: [],
+    unparsedLines: unparsed,
+    undoJournalPath,
   };
+
+  // 本次撤销会撤成不活跃的行：插入的行（改成 archived）与恢复过的行（撤回原来的非活跃状态）。
+  // 合并链成员原来指向的若在其中，撤成员就会和它一起失活——按撤销完成后的样子判依赖（第二次代码单审 F3）。
+  const willDeactivate = new Set(records.filter((r) => r.action === "insert" || r.action === "reactivate").map((r) => r.id));
+  // 反过来：此刻已有合并成员指向的行（比如对账之后 dream 把别的行合并进了本轮插入或恢复的行），撤成不活跃也会造出断链
+  const targetsInUse = new Set<string>();
+  if (willDeactivate.size > 0) {
+    for (const row of await loadMemoryScopeRows(deps.store)) {
+      const st = rowState(row.meta);
+      if (st.status === "consolidated" && st.consolidatedInto) targetsInUse.add(st.consolidatedInto);
+    }
+  }
 
   const restore = (meta: Record<string, unknown>, before: JournalFields) => {
     patchEvolutionOnMeta(meta, {
@@ -1248,15 +1353,19 @@ async function undoUnlocked(
     const list = records.filter((r) => r.action === phase);
     for (let i = 0; i < list.length; i += PATCH_BATCH) {
       const batch = list.slice(i, i + PATCH_BATCH);
-      // 合并链成员的恢复要撤，先确认它原来指向的那一行此刻活跃（本次撤销的下架阶段已先跑完）
       const dependencyOk = new Set<string>();
       if (phase === "reactivate") {
         for (const rec of batch) {
-          const target = rec.before?.status === "consolidated" ? rec.before.consolidatedInto : null;
+          const current = await deps.store.getById(rec.id);
+          const before = rec.intentOnly
+            ? (current ? expectedFromMarker(parseMeta(current.metadata), rec)?.before : undefined)
+            : rec.before;
+          const target = before?.status === "consolidated" ? before.consolidatedInto : null;
           if (!target) {
             dependencyOk.add(rec.id);
             continue;
           }
+          if (willDeactivate.has(target)) continue;
           const holder = await deps.store.getById(target);
           if (holder && isActiveStatus(rowState(parseMeta(holder.metadata)).status)) dependencyOk.add(rec.id);
         }
@@ -1270,10 +1379,14 @@ async function undoUnlocked(
           const r = byId.get(entry.id)!;
           seen.add(entry.id);
           const current = journalFields(meta);
+          if (r.action !== "retire" && targetsInUse.has(entry.id)) {
+            result.skippedDependency.push(r.id);
+            return meta;
+          }
           if (r.action === "insert") {
-            const untouched = r.intentOnly
-              ? markerMatches(meta, r, "inserted") && isActiveStatus(current.status)
-              : !!r.after && stableStringify(current) === stableStringify(r.after) && (!r.textFp || r.textFp === textFingerprint(entry.text));
+            const untouched = !!r.after
+              && stableStringify(current) === stableStringify(r.after)
+              && !!r.textFp && r.textFp === textFingerprint(entry.text);
             if (!untouched) {
               result.skippedConflict.push(r.id);
               return meta;
@@ -1288,15 +1401,19 @@ async function undoUnlocked(
             result.skippedDependency.push(r.id);
             return meta;
           }
-          const expectedAction = r.action === "retire" ? "retired" : "reactivated";
-          const unchanged = r.intentOnly
-            ? markerMatches(meta, r, expectedAction)
-            : !!r.after && stableStringify(current) === stableStringify(r.after);
-          if (!unchanged || !r.before) {
+          const expected = r.intentOnly
+            ? expectedFromMarker(meta, r)
+            : (r.before && r.after ? { before: r.before, after: r.after } : null);
+          if (!expected || stableStringify(current) !== stableStringify(expected.after)) {
             result.skippedConflict.push(r.id);
             return meta;
           }
-          restore(meta, r.before);
+          // 撤回去会重新活跃（撤下架）：这段文字已被 forget 就不撤
+          if (isActiveStatus(expected.before.status) && forgets && isTextForgotten(forgets, entry.text, entry.id)) {
+            result.skippedForgotten.push(r.id);
+            return meta;
+          }
+          restore(meta, expected.before);
           pending.push({ run: undoRun, action: `undo-${r.action}`, id: r.id, before: current, after: journalFields(meta) });
           result.restored++;
           return meta;
@@ -1307,7 +1424,7 @@ async function undoUnlocked(
     }
   }
   try {
-    deps.auditLogger?.log({ operation: "update", scope: MEMORY_DOC_SCOPE, actor: "system", details: `${RECONCILE_NOTE_PREFIX} undo restored=${result.restored} insertsRetired=${result.insertsRetired} conflicts=${result.skippedConflict.length} dependency=${result.skippedDependency.length}` });
+    deps.auditLogger?.log({ operation: "update", scope: MEMORY_DOC_SCOPE, actor: "system", details: `${RECONCILE_NOTE_PREFIX} undo restored=${result.restored} insertsRetired=${result.insertsRetired} conflicts=${result.skippedConflict.length} dependency=${result.skippedDependency.length} forgotten=${result.skippedForgotten.length}` });
   } catch { /* 审计失败不影响撤销 */ }
   return result;
 }
