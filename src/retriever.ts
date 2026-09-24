@@ -1516,9 +1516,11 @@ export class MemoryRetriever {
     const gamma = Math.max(0, Number.isFinite(raw) ? raw : 0);
     if (gamma <= 0) return results;
     return results.map(r => {
-      const evo = parseEvolution(r.entry.metadata, r.entry.timestamp);
-      if (evo.accessCount <= 0) return r;
-      const h = Math.min(1, Math.log2(1 + evo.accessCount) / 5);
+      const n: unknown = parseEvolution(r.entry.metadata, r.entry.timestamp).accessCount;
+      // parseEvolution 不校验类型：元数据里的计数若是字符串 / 负数 / 非有限数，一律按零访问。
+      // 这一环不截平，NaN 会一路漏到出口（legacy 那几环有 clamp01 的非有限兜底，这里没有；第二步实现互审 Codex 实测 "broken" → NaN%）
+      if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return r;
+      const h = Math.min(1, Math.log2(1 + n) / 5);
       return { ...r, score: r.score * (1 + gamma * h) };
     });
   }

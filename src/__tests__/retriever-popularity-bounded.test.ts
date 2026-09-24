@@ -243,6 +243,19 @@ describe("bounded 流行度", () => {
     });
   });
 
+  it("4b · 访问计数不是有限非负数（字符串、数字字符串、负数）时按零访问：分数与零访问条目相同、是有限数", async () => {
+    const zero = mem("dddddddd-0000-4000-8000-00000000004b", [0, 0, 1]);
+    const bad = ["broken", "5", -3].map((n, i) =>
+      mem(`bbbbbbbb-0000-4000-8000-0000000004b${i}`, [i === 0 ? 1 : 0, i === 1 ? 1 : 0, 0.1 * (i + 1)], { meta: { evolution: { accessCount: n } } }),
+    );
+    bounded();
+    const out = byId(await search(createRetriever(fakeStore([zero, ...bad].map((entry) => ({ entry, score: 0.7 }))), embedder(), CFG)));
+    for (const e of bad) {
+      expect(Number.isFinite(out.get(e.id)!.score)).toBe(true);
+      expect(out.get(e.id)!.score).toBe(out.get(zero.id)!.score);
+    }
+  });
+
   it("5 · 链尾不截平、出口截平：加成把两条都推过 1 且改变先后——按原值排；返回分数截到 1；omitted 仍在", async () => {
     // p 加成前更高（0.99）但只访问 3 次，q 加成前 0.95、访问 40 次：原值 q 1.146 > p 1.070，都 > 1。
     // 要是链里哪一环把它们截成 1.0，两条就会并列、按加成前的先后留下 p 在前。
@@ -345,7 +358,11 @@ describe("5c · 返回条目的 sources 键集合与改前一致", () => {
         .sort((a, b) => a.id.localeCompare(b.id));
 
     const base = keysOf(await search(retriever));
-    expect(base.find((k) => k.id === host.id)!.trigger).toEqual(["admittedBy", "cosine", "overlap", "score", "text"]);
+    // 钉死改前（origin/main）的形状，不只做三种模式之间互比——互比抓不到「所有模式都多了同一个字段」（实现互审 Codex）
+    expect(base).toEqual([
+      { id: cand.id, top: ["vector"], trigger: null },
+      { id: host.id, top: ["trigger", "vector"], trigger: ["admittedBy", "cosine", "overlap", "score", "text"] },
+    ]);
     process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT = "true";
     expect(keysOf(await search(retriever))).toEqual(base);
     bounded();
@@ -517,11 +534,13 @@ describe("8 · 真实临时 LanceDB", () => {
 // ---------------------------------------------------------------------------
 
 describe("9 · 全文档跟着流行度模式走", () => {
+  // 正文要长过 adaptive 的片段窗口，否则「给全文」与「给片段」看起来一样（实现互审 Codex：只看标签的断言抓不到只给片段的实现）
+  const LONG_TEXT = `开头一句只在全文里有。${"中间的铺垫文字，".repeat(80)}这一条的分数落在 0.80 与 0.85 之间。${"结尾的补充说明，".repeat(20)}最后一句也只在全文里有。`;
   const result = (score: number): RetrievalResult =>
     ({
       entry: {
         id: "99999999-0000-4000-8000-000000000009",
-        text: "全文正文：这一条的分数落在 0.80 与 0.85 之间。",
+        text: LONG_TEXT,
         vector: [1, 0, 0],
         category: "events",
         scope: "test",
@@ -537,10 +556,12 @@ describe("9 · 全文档跟着流行度模式走", () => {
     const l = formatCollapsedResults([result(0.82)], { query: "分数", profile: "default" } as never);
     expect(l).toContain("[SNIP]");
     expect(l).toContain("full text for score ≥ 0.85,");
+    expect(l).not.toContain(LONG_TEXT);
     bounded();
     const b = formatCollapsedResults([result(0.82)], { query: "分数", profile: "default" } as never);
     expect(b).toContain("[FULL]");
     expect(b).toContain("full text for score ≥ 0.8,");
+    expect(b).toContain(LONG_TEXT);
   });
 
   it("折叠视图：默认配置下 0.82 legacy 是 L1、bounded 是 L2；调用方显式传 thresholds 的不受模式影响；导出的默认常量不变", () => {
