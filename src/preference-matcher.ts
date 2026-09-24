@@ -61,7 +61,7 @@ export interface PreferenceMatchResult {
  * @param vector   Pre-computed embedding vector for the text
  * @param scope    The scope to search within
  * @param store    Memory store
- * @param llm      LLM client (null = always create)
+ * @param llm      LLM client (null → no LLM: top similarity ≥0.92 skips, otherwise create)
  * @param config   Optional config overrides
  */
 export async function matchPreference(

@@ -120,6 +120,14 @@ export interface DurableWriteInput {
   sourceBoundary?: ReturnType<typeof extractBoundaryMetadata>;
   language?: string;
   fts_text?: string;
+  /**
+   * 显式同 key 修订的目标行（2026-09-24）：persistMemory 在本 scope 找到后传入。
+   * 传入时写入端只拿这一行做全文判等与 latest-wins，不再全局选行——findCanonicalMatches 不分 scope，
+   * 窗口外的确定性 id 分支遇同文会用新 metadata 覆盖版本链，修订路径不能走那两条。
+   */
+  revisionTarget?: MemoryEntry;
+  /** persistMemory 已扫过的同 key 结果；传入时写入端不再自扫，一次写入只扫一遍整表。 */
+  precomputedMatches?: MemoryEntry[];
 }
 
 const CANONICAL_SCAN_LIMIT = 1000;
@@ -471,6 +479,82 @@ async function findCanonicalMatches(
   });
 }
 
+/**
+ * 「显式同 key 修订」的判定（2026-09-24，互审见 AI产出/2026-09-24-recallnest-同key偏好修订/）。
+ *
+ * 只扫一次整表；扫描结果不论是否找到目标行都交给 writeDurableEntry 复用，写入端不再自扫。
+ * 目标行 = 同 scope、同 canonicalKey、同类别、活跃、durable。同 scope 里若还有同 key 的
+ * 其他类别活跃行，不当修订（target=null），让原路径照旧产生跨类别冲突。
+ */
+async function resolveSameKeyRevision(
+  store: StoreDeps,
+  scope: string,
+  canonicalKey: string,
+  category: DurableMemoryCategory,
+): Promise<{ matches: MemoryEntry[]; target: MemoryEntry | null }> {
+  const matches = await findCanonicalMatches(store, canonicalKey);
+  const inScope = matches.filter((entry) => entry.scope === scope);
+  if (inScope.some((entry) => entry.category !== category)) return { matches, target: null };
+  const inScan = inScope
+    .filter((entry) => entry.category === category)
+    .sort((a, b) => b.timestamp - a.timestamp)[0];
+  if (inScan) return { matches, target: inScan };
+  // 扫描窗口（最近 CANONICAL_SCAN_LIMIT 行，store.list 按 timestamp 倒序）外的旧行：按确定性 id 直查。
+  // durable 判定比 writeDurableEntry 自己的 id 回查严格，有意为之——只把确认合格的行当修订目标；
+  // 判定失败时 target=null，写入照旧走原逻辑。
+  if (!store.getById) return { matches, target: null };
+  const row = await store.getById(deterministicId(scope, canonicalKey));
+  const qualifies =
+    row !== null &&
+    row.scope === scope &&
+    row.category === category &&
+    extractBoundaryMetadata(row.metadata)?.layer === "durable" &&
+    isActiveMemory(row.metadata);
+  return { matches, target: qualifies ? row : null };
+}
+
+/**
+ * latest-wins 的原位替换：先把旧版本归档成 superseded 历史行，再把新文本写回同一 id。
+ * 原地覆盖曾经连旧文本带向量一起删掉，「上个月我信的是什么」因此无从回答。
+ */
+async function replaceBeliefInPlace(
+  deps: PersistMemoryDeps,
+  latest: MemoryEntry,
+  params: DurableWriteInput,
+): Promise<{ entry: MemoryEntry; disposition: "updated" | "promoted"; supersededPrevious: true }> {
+  if (!deps.store.update) {
+    throw new Error(`store.update is required to replace canonical memory ${latest.id}`);
+  }
+  const now = Date.now();
+  const previousEvo = parseEvolution(latest.metadata, latest.timestamp);
+  const { historyId } = await archiveBeliefVersion(
+    { store: deps.store, embedder: deps.embedder },
+    latest,
+    { now },
+  );
+
+  const updated = await deps.store.update(latest.id, {
+    text: params.text,
+    vector: params.vector,
+    importance: params.importance,
+    category: params.category,
+    // Merge rather than replace: a bare params.metadata would wipe the evolution block
+    // (version, access stats, supersede links) along with the text.
+    metadata: buildSupersedingBeliefMetadata(params.metadata, previousEvo, historyId, now),
+    timestamp: now,
+    ...(params.language ? { language: params.language } : {}),
+    ...(params.fts_text ? { fts_text: params.fts_text } : {}),
+  });
+  if (!updated) {
+    throw new Error(`Failed to update canonical memory ${latest.id}`);
+  }
+  return {
+    entry: updated,
+    disposition: params.promotedFrom ? "promoted" : "updated",
+    supersededPrevious: true,
+  };
+}
+
 export async function writeDurableEntry(
   deps: PersistMemoryDeps,
   params: DurableWriteInput,
@@ -488,7 +572,21 @@ export async function writeDurableEntry(
    */
   supersededPrevious?: boolean;
 }> {
-  const matches = await findCanonicalMatches(deps.store, params.canonicalKey);
+  const conflictPolicy = getConflictPolicyForCategory(params.category);
+
+  // 显式同 key 修订：只拿 persistMemory 在本 scope 找到的那一行做判等与原位替换。
+  // 写之前按 id 重读一次——F2 干扰预警可能刚改过它的 metadata；已不再活跃就退回原逻辑。
+  if (params.revisionTarget && !params.promotedFrom && conflictPolicy === "latest-wins" && deps.store.update) {
+    const fresh = deps.store.getById ? await deps.store.getById(params.revisionTarget.id) : params.revisionTarget;
+    if (fresh && isActiveMemory(fresh.metadata)) {
+      if (normalizeMemoryText(fresh.text) === normalizeMemoryText(params.text)) {
+        return { entry: fresh, disposition: "deduped" };
+      }
+      return await replaceBeliefInPlace(deps, fresh, params);
+    }
+  }
+
+  const matches = params.precomputedMatches ?? await findCanonicalMatches(deps.store, params.canonicalKey);
   const categoryMatches = matches.filter((entry) => entry.category === params.category);
   const crossCategoryMatches = matches.filter((entry) => entry.category !== params.category);
   const normalizedIncoming = normalizeMemoryText(params.text);
@@ -547,7 +645,6 @@ export async function writeDurableEntry(
     };
   }
 
-  const conflictPolicy = getConflictPolicyForCategory(params.category);
   if (conflictPolicy === "latest-wins" && categoryMatches.length > 0 && deps.store.update) {
     const latest = [...categoryMatches].sort((a, b) => b.timestamp - a.timestamp)[0];
     if (params.promotedFrom) {
@@ -602,37 +699,8 @@ export async function writeDurableEntry(
       }
     }
 
-    // latest-wins is where beliefs change. Archive the version being replaced first —
-    // overwriting in place used to delete the old text + vector outright, which is what
-    // made "what did I believe last month?" unanswerable no matter how retrieval queried.
-    const now = Date.now();
-    const previousEvo = parseEvolution(latest.metadata, latest.timestamp);
-    const { historyId } = await archiveBeliefVersion(
-      { store: deps.store, embedder: deps.embedder },
-      latest,
-      { now },
-    );
-
-    const updated = await deps.store.update(latest.id, {
-      text: params.text,
-      vector: params.vector,
-      importance: params.importance,
-      category: params.category,
-      // Merge rather than replace: a bare params.metadata would wipe the evolution block
-      // (version, access stats, supersede links) along with the text.
-      metadata: buildSupersedingBeliefMetadata(params.metadata, previousEvo, historyId, now),
-      timestamp: now,
-      ...(params.language ? { language: params.language } : {}),
-      ...(params.fts_text ? { fts_text: params.fts_text } : {}),
-    });
-    if (!updated) {
-      throw new Error(`Failed to update canonical memory ${latest.id}`);
-    }
-    return {
-      entry: updated,
-      disposition: params.promotedFrom ? "promoted" : "updated",
-      supersededPrevious: true,
-    };
+    // latest-wins is where beliefs change: archive the version being replaced, then write in place.
+    return await replaceBeliefInPlace(deps, latest, params);
   }
 
   // No canonical match was found, so this falls through to store(). With a canonicalKey the
@@ -834,6 +902,36 @@ function buildPromotionMetadata(
   });
 }
 
+/**
+ * T-Mem triggers（2026-09-22）：宿主写完再写入口。deduped（同文本已存在）也写——老条目补 trigger
+ * 正是回填的常态，此时顺手把文本副本补进旧行 metadata（侧表可由它重建）。失败只 warn：入口丢一次
+ * 比记忆丢一条便宜。
+ */
+async function writeTriggersForEntry(
+  deps: PersistMemoryDeps,
+  entry: MemoryEntry,
+  resolvedScope: string,
+  triggerTexts: string[],
+  backfillMetadata: boolean,
+): Promise<void> {
+  if (!deps.triggerStore || triggerTexts.length === 0) return;
+  try {
+    const embedBatch = deps.embedQueryBatch
+      ?? (async (texts: string[]) => Promise.all(texts.map((t) => deps.embedder.embedPassage(t))));
+    await deps.triggerStore.upsertForMemory(entry.id, entry.scope || resolvedScope, triggerTexts, embedBatch);
+    if (backfillMetadata && deps.store.update) {
+      const parsedMeta: Record<string, unknown> = JSON.parse(entry.metadata || "{}");
+      const prev = Array.isArray(parsedMeta.triggers) ? (parsedMeta.triggers as unknown[]).join("\u0000") : "";
+      if (prev !== triggerTexts.join("\u0000")) {
+        parsedMeta.triggers = triggerTexts;
+        await deps.store.update(entry.id, { metadata: JSON.stringify(parsedMeta) });
+      }
+    }
+  } catch (err) {
+    console.error(`[recallnest] trigger write failed for ${entry.id} (memory stored, trigger 入口未写):`, err instanceof Error ? err.message : String(err));
+  }
+}
+
 export async function persistMemory(
   deps: PersistMemoryDeps,
   rawInput: unknown,
@@ -958,11 +1056,30 @@ export async function persistMemory(
     canonicalKey: input.canonicalKey,
   });
 
+  // 显式同 key 修订（2026-09-24）：调用方带着显式 key 改写本 scope 已有的同类别偏好时，
+  // 不再交给 Tier 3.6 做语义判重——相似度 ≥0.92 会被直接跳过，修订因此丢掉；改由
+  // writeDurableEntry 对目标行做全文判等与原位替换。新 key、无 key 的写入照旧判重。
+  const explicitKey = input.canonicalKey ? normalizeCanonicalKey(input.canonicalKey) : "";
+  const sameKey =
+    input.category === "preferences" && explicitKey !== ""
+      ? await resolveSameKeyRevision(deps.store, resolvedScope, canonicalKey, input.category)
+      : null;
+  const revisionTarget = sameKey?.target ?? null;
+
+  // 同 key 且全文相同：赶在 A-2 / F2 之前按 deduped 返回。原版在 Tier 3.6 判重处就提前返回，这类写入
+  // 从不触发 F2 干扰预警；放到后面，一次 deduped 写入会把别的行标成 pending_review（实施后 Codex 审查，
+  // 真实临时库复现）。triggers 回填照做。
+  if (revisionTarget && normalizeMemoryText(revisionTarget.text) === normalizeMemoryText(input.text)) {
+    await writeTriggersForEntry(deps, revisionTarget, resolvedScope, normalizeTriggerTexts(input.triggers), true);
+    return toStoredRecord(input, revisionTarget, "deduped", canonicalKey);
+  }
+
   // Tier 3.6: For preferences, check if similar preference already exists.
   // If matched, merge into existing or skip — avoids duplicate accumulation.
   if (
     input.category === "preferences" &&
-    deps.store.vectorSearch
+    deps.store.vectorSearch &&
+    !revisionTarget
   ) {
     const matchResult = await matchPreference(
       input.text,
@@ -1150,28 +1267,13 @@ export async function persistMemory(
     source: input.source,
     language,
     fts_text,
+    ...(revisionTarget ? { revisionTarget } : {}),
+    ...(sameKey ? { precomputedMatches: sameKey.matches } : {}),
   });
 
-  // T-Mem triggers（2026-09-22）：宿主写完再写入口。conflict 时宿主没变、不写；
-  // deduped（同文本已存在）也写——老条目补 trigger 正是回填的常态，此时顺手把文本副本
-  // 补进旧行 metadata（侧表可由它重建）。失败只 warn：入口丢一次比记忆丢一条便宜。
-  const triggerTexts = normalizeTriggerTexts(input.triggers);
-  if (deps.triggerStore && triggerTexts.length > 0 && disposition !== "conflict") {
-    try {
-      const embedBatch = deps.embedQueryBatch
-        ?? (async (texts: string[]) => Promise.all(texts.map((t) => deps.embedder.embedPassage(t))));
-      await deps.triggerStore.upsertForMemory(entry.id, entry.scope || resolvedScope, triggerTexts, embedBatch);
-      if (disposition === "deduped" && deps.store.update) {
-        const parsedMeta: Record<string, unknown> = JSON.parse(entry.metadata || "{}");
-        const prev = Array.isArray(parsedMeta.triggers) ? (parsedMeta.triggers as unknown[]).join("\u0000") : "";
-        if (prev !== triggerTexts.join("\u0000")) {
-          parsedMeta.triggers = triggerTexts;
-          await deps.store.update(entry.id, { metadata: JSON.stringify(parsedMeta) });
-        }
-      }
-    } catch (err) {
-      console.error(`[recallnest] trigger write failed for ${entry.id} (memory stored, trigger 入口未写):`, err instanceof Error ? err.message : String(err));
-    }
+  // T-Mem triggers：conflict 时宿主没变、不写；其余见 writeTriggersForEntry。
+  if (disposition !== "conflict") {
+    await writeTriggersForEntry(deps, entry, resolvedScope, normalizeTriggerTexts(input.triggers), disposition === "deduped");
   }
 
   // Tier 4.1: Async KG triple extraction (non-blocking)
