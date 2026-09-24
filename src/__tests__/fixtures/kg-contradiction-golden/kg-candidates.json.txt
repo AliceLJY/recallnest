@@ -1,0 +1,198 @@
+{
+  "scope": "memory:pivot",
+  "tripleCount": 16,
+  "candidateCount": 5,
+  "mode": "top 20",
+  "candidates": [
+    {
+      "scope": "memory:pivot",
+      "subject": "tool-e",
+      "predicate": "located_in",
+      "values": [
+        {
+          "object": "~/.claude/hooks",
+          "normalized": "~/.claude/hooks",
+          "rawObjects": [
+            "~/.claude/hooks"
+          ],
+          "mention_count": 2,
+          "source_memory_ids": [
+            "mem-e1",
+            "mem-e2"
+          ],
+          "first_seen": 1750000000000,
+          "timestamp": 1750000000000
+        },
+        {
+          "object": "~/.Trash",
+          "normalized": "~/.trash",
+          "rawObjects": [
+            "~/.Trash"
+          ],
+          "mention_count": 2,
+          "source_memory_ids": [
+            "mem-e3",
+            "mem-e4"
+          ],
+          "first_seen": 1750000000000,
+          "timestamp": 1750000000000
+        }
+      ],
+      "distinctValueCount": 2,
+      "secondMentionCount": 2
+    },
+    {
+      "scope": "memory:pivot",
+      "subject": "proj-x",
+      "predicate": "has",
+      "values": [
+        {
+          "object": "ci",
+          "normalized": "ci",
+          "rawObjects": [
+            "ci"
+          ],
+          "mention_count": 1,
+          "source_memory_ids": [
+            "mem-8"
+          ],
+          "first_seen": 1750000000000,
+          "timestamp": 1750000000000
+        },
+        {
+          "object": "docs",
+          "normalized": "docs",
+          "rawObjects": [
+            "docs"
+          ],
+          "mention_count": 1,
+          "source_memory_ids": [
+            "mem-7"
+          ],
+          "first_seen": 1750000000000,
+          "timestamp": 1750000000000
+        },
+        {
+          "object": "tests",
+          "normalized": "tests",
+          "rawObjects": [
+            "tests"
+          ],
+          "mention_count": 1,
+          "source_memory_ids": [
+            "mem-6"
+          ],
+          "first_seen": 1750000000000,
+          "timestamp": 1750000000000
+        }
+      ],
+      "distinctValueCount": 3,
+      "secondMentionCount": 1
+    },
+    {
+      "scope": "memory:pivot",
+      "subject": "proj-y",
+      "predicate": "has",
+      "values": [
+        {
+          "object": "cli",
+          "normalized": "cli",
+          "rawObjects": [
+            "cli"
+          ],
+          "mention_count": 1,
+          "source_memory_ids": [
+            "mem-9"
+          ],
+          "first_seen": 1750000000000,
+          "timestamp": 1750000000000
+        },
+        {
+          "object": "ui",
+          "normalized": "ui",
+          "rawObjects": [
+            "ui"
+          ],
+          "mention_count": 1,
+          "source_memory_ids": [
+            "mem-10"
+          ],
+          "first_seen": 1750000000000,
+          "timestamp": 1750000000000
+        }
+      ],
+      "distinctValueCount": 2,
+      "secondMentionCount": 1
+    },
+    {
+      "scope": "memory:pivot",
+      "subject": "负责人",
+      "predicate": "是",
+      "values": [
+        {
+          "object": "张三",
+          "normalized": "张三",
+          "rawObjects": [
+            "张三"
+          ],
+          "mention_count": 1,
+          "source_memory_ids": [
+            "mem-c"
+          ],
+          "first_seen": 1750000000000,
+          "timestamp": 1750000000000
+        },
+        {
+          "object": "李四",
+          "normalized": "李四",
+          "rawObjects": [
+            "李四"
+          ],
+          "mention_count": 1,
+          "source_memory_ids": [
+            "mem-d"
+          ],
+          "first_seen": 1750000000000,
+          "timestamp": 1750000000000
+        }
+      ],
+      "distinctValueCount": 2,
+      "secondMentionCount": 1
+    },
+    {
+      "scope": "memory:pivot",
+      "subject": "部署机",
+      "predicate": "是",
+      "values": [
+        {
+          "object": "MacBook",
+          "normalized": "macbook",
+          "rawObjects": [
+            "MacBook"
+          ],
+          "mention_count": 1,
+          "source_memory_ids": [
+            "mem-a"
+          ],
+          "first_seen": 1750000000000,
+          "timestamp": 1750000000000
+        },
+        {
+          "object": "mini",
+          "normalized": "mini",
+          "rawObjects": [
+            "mini"
+          ],
+          "mention_count": 1,
+          "source_memory_ids": [
+            "mem-b"
+          ],
+          "first_seen": 1750000000000,
+          "timestamp": 1750000000000
+        }
+      ],
+      "distinctValueCount": 2,
+      "secondMentionCount": 1
+    }
+  ]
+}

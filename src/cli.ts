@@ -1148,61 +1148,108 @@ conflictsCommand
     console.log(formatConflictResolution(result));
   });
 
-conflictsCommand
-  .command("kg-candidates")
-  .description("只读：KG 三元组按 (subject, predicate) 分组的多值候选（影子期，候选非判决）")
-  .requiredOption("--scope <scope>", "scope（精确匹配）")
-  .option("-n, --limit <n>", "按排序取前 n 组", "20")
-  .option("--sample <n>", "改为随机抽 n 组（确定性，配 --seed）")
-  .option("--seed <seed>", "抽样种子", "1")
-  .option("--json", "JSON 格式输出")
-  .action(async (options) => {
-    const { findKGContradictionCandidates, loadScopeTriples, sampleCandidates, formatCandidateReport } = await import("./kg-contradiction.js");
-    const dbPath = resolveDbPath(loadConfig());
-    const triples = await loadScopeTriples(dbPath, options.scope);
-    const candidates = findKGContradictionCandidates(triples);
-    const sampling = options.sample !== undefined;
-    const n = sampling ? parseRequiredLimitOption(options.sample, "--sample", 1, 1000) : parseLimitOption(options.limit, 20, 1, 1000);
-    const seed = Number.parseInt(String(options.seed), 10) || 1;
-    const shown = sampling ? sampleCandidates(candidates, n, seed) : candidates.slice(0, n);
-    const mode = sampling ? `random sample n=${n} seed=${seed}` : `top ${n}`;
+const kgFilterHelp = (cmd: string) => `
+过滤选项（默认全关；一个都不传时输出与不带这组选项时完全一样）：
+  ${cmd === "kg-compare" ? "只过滤分组候选一侧，再拿过滤后的候选做双向对照；正则一侧不变。\n  " : ""}依次过 谓词白名单 → 函数型判定 → 证据门槛，输出 funnel：每一步还剩多少组，没启用的标 skipped。
+  JSON 另带 predicateStats：本 scope 每个谓词的 subjects / pairs / functionality / multiValuedSubjects，
+  按 functionality 降序。
+  functionality = 用到该谓词的不同 subject 数 ÷ 不同 (subject, 归一化 object) 对数，取值 (0, 1]，
+  越接近 1 越像「一个主体同一时间只有一个值」（located_in 这类）。有候选组的谓词恒 < 1。
 
-    if (options.json) {
-      console.log(JSON.stringify({ scope: options.scope, tripleCount: triples.length, candidateCount: candidates.length, mode, candidates: shown }, null, 2));
-      return;
-    }
-    console.log(formatCandidateReport(options.scope, triples.length, candidates.length, shown, mode));
-  });
+示例：
+  conflicts ${cmd} --scope memory:pivot --functional-min 0.8 --json
+  conflicts ${cmd} --scope memory:pivot --functional-min 0.8 --min-second-mentions 2
+  conflicts ${cmd} --scope memory:pivot --predicates located_in,owned_by
+`;
 
-conflictsCommand
-  .command("kg-compare")
-  .description("只读：同一 scope 上现有正则矛盾检测 (memory lint) 与 KG 分组候选的双向对照")
-  .requiredOption("--scope <scope>", "scope（精确匹配）")
-  .option("-n, --limit <n>", "文本输出每节最多列几条；0 = 全部", "0")
-  .option("--json", "JSON 格式输出（始终完整）")
-  .action(async (options) => {
-    const {
-      compareRegexWithCandidates,
-      findKGContradictionCandidates,
-      formatComparisonReport,
-      loadRegexInput,
-      loadScopeTriples,
-      regexHitPairs,
-    } = await import("./kg-contradiction.js");
-    const dbPath = resolveDbPath(loadConfig());
-    const [triples, regexInput] = await Promise.all([loadScopeTriples(dbPath, options.scope), loadRegexInput(dbPath, options.scope)]);
-    const candidates = findKGContradictionCandidates(triples);
-    const pairs = regexHitPairs(regexInput.entries);
-    const cmp = compareRegexWithCandidates(pairs, candidates, triples, new Set(regexInput.entries.map((e) => e.id)));
-    const meta = { tripleCount: triples.length, regexInputCount: regexInput.entries.length, scanLimited: regexInput.scanLimited };
+/** 四个过滤选项挂到命令上（kg-candidates / kg-compare 共用）。 */
+function withKGFilterOptions(command: Command): Command {
+  const kgFilterHelpText = kgFilterHelp(command.name());
+  return command
+    .option("--predicates <list>", "谓词白名单，逗号分隔，精确匹配（谓词本身不归一化）")
+    .option("--functional-min <ratio>", "只留 functionality ≥ ratio 的谓词上的候选组，ratio ∈ (0, 1]，例如 0.8")
+    .option("--functional-min-subjects <n>", "配合 --functional-min：谓词的 subject 少于 n 个按不满足处理（默认 3）")
+    .option("--min-second-mentions <n>", "只留第二多取值的 mention_count ≥ n 的组（默认 1，即不过滤）")
+    .addHelpText("after", kgFilterHelpText);
+}
 
-    if (options.json) {
-      console.log(JSON.stringify({ scope: options.scope, ...meta, ...cmp }, null, 2));
-      return;
-    }
-    const limit = Number.parseInt(String(options.limit), 10);
-    console.log(formatComparisonReport(options.scope, meta, cmp, Number.isFinite(limit) && limit > 0 ? limit : 0));
-  });
+withKGFilterOptions(
+  conflictsCommand
+    .command("kg-candidates")
+    .description("只读：KG 三元组按 (subject, predicate) 分组的多值候选（影子期，候选非判决）")
+    .requiredOption("--scope <scope>", "scope（精确匹配）")
+    .option("-n, --limit <n>", "按排序取前 n 组", "20")
+    .option("--sample <n>", "改为随机抽 n 组（确定性，配 --seed）")
+    .option("--seed <seed>", "抽样种子", "1")
+    .option("--json", "JSON 格式输出"),
+).action(async (options) => {
+  const {
+    filterKGCandidates,
+    findKGContradictionCandidates,
+    formatCandidateReport,
+    hasCandidateFilter,
+    loadScopeTriples,
+    parseCandidateFilterArgs,
+    sampleCandidates,
+  } = await import("./kg-contradiction.js");
+  const filterOpts = parseCandidateFilterArgs(options);
+  const dbPath = resolveDbPath(loadConfig());
+  const triples = await loadScopeTriples(dbPath, options.scope);
+  const all = findKGContradictionCandidates(triples);
+  const filtered = hasCandidateFilter(filterOpts) ? filterKGCandidates(all, triples, filterOpts) : undefined;
+  const candidates = filtered ? filtered.candidates : all;
+  const sampling = options.sample !== undefined;
+  const n = sampling ? parseRequiredLimitOption(options.sample, "--sample", 1, 1000) : parseLimitOption(options.limit, 20, 1, 1000);
+  const seed = Number.parseInt(String(options.seed), 10) || 1;
+  const shown = sampling ? sampleCandidates(candidates, n, seed) : candidates.slice(0, n);
+  const mode = sampling ? `random sample n=${n} seed=${seed}` : `top ${n}`;
+
+  if (options.json) {
+    const filterFields = filtered ? { funnel: filtered.funnel, predicateStats: filtered.predicateStats } : {};
+    console.log(JSON.stringify({ scope: options.scope, tripleCount: triples.length, candidateCount: candidates.length, mode, ...filterFields, candidates: shown }, null, 2));
+    return;
+  }
+  console.log(formatCandidateReport(options.scope, triples.length, candidates.length, shown, mode, filtered?.funnel));
+});
+
+withKGFilterOptions(
+  conflictsCommand
+    .command("kg-compare")
+    .description("只读：同一 scope 上现有正则矛盾检测 (memory lint) 与 KG 分组候选的双向对照")
+    .requiredOption("--scope <scope>", "scope（精确匹配）")
+    .option("-n, --limit <n>", "文本输出每节最多列几条；0 = 全部", "0")
+    .option("--json", "JSON 格式输出（始终完整）"),
+).action(async (options) => {
+  const {
+    compareRegexWithCandidates,
+    filterKGCandidates,
+    findKGContradictionCandidates,
+    formatComparisonReport,
+    hasCandidateFilter,
+    loadRegexInput,
+    loadScopeTriples,
+    parseCandidateFilterArgs,
+    regexHitPairs,
+  } = await import("./kg-contradiction.js");
+  const filterOpts = parseCandidateFilterArgs(options);
+  const dbPath = resolveDbPath(loadConfig());
+  const [triples, regexInput] = await Promise.all([loadScopeTriples(dbPath, options.scope), loadRegexInput(dbPath, options.scope)]);
+  const all = findKGContradictionCandidates(triples);
+  // 过滤只作用在分组候选一侧；正则一侧与判断「有没有三元组」用的全部三元组都不变
+  const filtered = hasCandidateFilter(filterOpts) ? filterKGCandidates(all, triples, filterOpts) : undefined;
+  const candidates = filtered ? filtered.candidates : all;
+  const pairs = regexHitPairs(regexInput.entries);
+  const cmp = compareRegexWithCandidates(pairs, candidates, triples, new Set(regexInput.entries.map((e) => e.id)));
+  const meta = { tripleCount: triples.length, regexInputCount: regexInput.entries.length, scanLimited: regexInput.scanLimited };
+
+  if (options.json) {
+    const filterFields = filtered ? { funnel: filtered.funnel, predicateStats: filtered.predicateStats } : {};
+    console.log(JSON.stringify({ scope: options.scope, ...meta, ...filterFields, ...cmp }, null, 2));
+    return;
+  }
+  const limit = Number.parseInt(String(options.limit), 10);
+  console.log(formatComparisonReport(options.scope, meta, cmp, Number.isFinite(limit) && limit > 0 ? limit : 0, filtered?.funnel));
+});
 
 program
   .command("seed-patterns [file]")
