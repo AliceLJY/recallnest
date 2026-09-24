@@ -10,7 +10,7 @@
  */
 
 import { Command } from "commander";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
@@ -21,7 +21,7 @@ import { applyRetrievalProfile, listRetrievalProfiles } from "./retrieval-profil
 import { distillResults, formatExplainResults, formatSearchResults, selectBriefSeedResults, summarizeResults } from "./memory-output.js";
 import { archiveDirtyBriefAsset, assetSummaryLine, buildBriefAsset, buildPinAsset, getExportsDir, listDirtyBriefAssets, listMemoryAssets, listPinAssets, pinSummaryLine, saveBriefAsset, savePinAsset, writeExportArtifact } from "./memory-assets.js";
 import { indexAsset, indexPinnedAsset } from "./asset-sync.js";
-import { createComponents, createStoreOnly, expandHome, loadConfig, loadDotEnv, resolveDbPath, type LocalMemoryConfig } from "./runtime-config.js";
+import { createComponents, createStoreOnly, expandHome, loadConfig, loadDotEnv, resolveDataDir, resolveDbPath, type LocalMemoryConfig } from "./runtime-config.js";
 import { KGStore } from "./kg-store.js";
 import { extractTriggerCandidates, normalizeTriggerTexts } from "./trigger-store.js";
 import { isActiveMemory } from "./memory-evolution.js";
@@ -51,10 +51,16 @@ import {
   formatSynthesisPromoteResult,
 } from "./memory-promotion.js";
 import { runDream, formatDreamResult, formatDreamMetrics, DEFAULT_DREAM_CONFIG, classifyDreamFailure, shouldBlockDreamRun, partitionAutoDreamScopes } from "./dream-pipeline.js";
-import { dreamBudgetMs } from "./env-config.js";
+import { dataDir as envDataDir, dreamBudgetMs } from "./env-config.js";
 import { listScopesAboveThreshold, pruneWriteCounts } from "./activity-counter.js";
 import { isTranscriptScope } from "./memory-boundaries.js";
 import { maybeRunGc } from "./auto-gc.js";
+import {
+  formatReconcileSummary,
+  reconcileMemoryDocuments,
+  undoMemoryReconcile,
+  type ReconcileOutcome,
+} from "./memory-reconcile.js";
 import {
   CaseMemoryInputSchema,
   type CaseMemoryInput,
@@ -272,6 +278,39 @@ function parseRequiredLimitOption(value: string | undefined, field: string, min 
     throw new Error(`${field} must be an integer`);
   }
   return Math.min(max, Math.max(min, parsed));
+}
+
+/**
+ * 记忆对账动手前的路径核对。锁与审计日志走 envConfig.dataDir()（RECALLNEST_DATA_DIR，否则当前目录下的 data），
+ * 库走 config.dbPath（相对路径按代码所在仓库解析）——两者必须是同一个 data 目录，否则对账拿的锁不是 dream / GC
+ * 用的那把、forget 记录也读错地方；从别的工作区跑时尤其容易错位（第三轮互审 N1）。库里必须已有 memories 表，
+ * 免得路径写错时对着一个新建的空库「对账」。
+ */
+function checkReconcilePaths(config: LocalMemoryConfig): { ok: boolean; reason: string; dataDir: string; dbPath: string } {
+  const dbPath = resolveDbPath(config);
+  const dataDir = resolve(envDataDir());
+  const real = (p: string): string => {
+    try { return realpathSync(p); } catch { return p; }
+  };
+  if (real(dataDir) !== real(resolveDataDir(config))) {
+    return { ok: false, reason: `锁与审计目录 ${dataDir} 和库所在目录 ${resolveDataDir(config)} 不一致（从仓库根目录运行，或设 RECALLNEST_DATA_DIR）`, dataDir, dbPath };
+  }
+  if (!existsSync(join(dbPath, "memories.lance"))) {
+    return { ok: false, reason: `库目录里没有 memories 表：${dbPath}`, dataDir, dbPath };
+  }
+  return { ok: true, reason: "", dataDir, dbPath };
+}
+
+function reconcileToIngestResult(outcome: ReconcileOutcome): IngestResult {
+  return {
+    source: "memory",
+    filesProcessed: outcome.plan?.currentFiles ?? 0,
+    chunksIngested: outcome.applied?.inserted ?? 0,
+    chunksSkipped: 0,
+    chunksDeduped: 0,
+    dedupReasonCounts: { hard: 0, exact: 0, "llm-skip": 0, "llm-merge": 0, unique: 0 },
+    errors: outcome.applied?.insertErrors ?? [],
+  };
 }
 
 function toScopeFilter(scope?: string): string[] | undefined {
@@ -1426,6 +1465,8 @@ program
       return;
     }
     const results: any[] = [];
+    // 记忆对账没执行 / 出错 / 护栏拦下（24 小时去抖后）→ 整条 ingest 以退出码 3 结束，调用脚本据此发专门的报警
+    let memoryReconcileAlert = false;
 
     // Pre-flight: validate embedding API before processing any files
     console.log("\n🔑 验证 Embedding API...");
@@ -1575,7 +1616,8 @@ program
     if (source === "all" || source === "memory") {
       console.log("📚 导入记忆文件...");
       const memSource = config.sources.memory;
-      if (memSource) {
+      if (memSource && memSource.path === "auto") {
+        // auto 路径保持旧行为（追加式导入 + 全库判重）；对账只在显式配置路径时启用（互审 K4）
         const memPath = resolveSourcePath(memSource.path, "memory");
         const r = await ingestMarkdownFiles(store, embedder, memPath, "memory", {
           verbose,
@@ -1585,6 +1627,36 @@ program
         });
         results.push(r);
         console.log(`  ✅ Memory: ${formatIngestSummary(r)}`);
+      } else if (memSource) {
+        // 显式路径：按文件对账（src/memory-reconcile.ts）。它每轮全量比对现行文件，--recent / --limit 不适用（互审 K2）
+        if (recentHours !== undefined || limit !== undefined) {
+          console.log("  ℹ️  记忆文件走对账（每轮全量比对现行文件），--recent / --limit 对它不生效");
+        }
+        const paths = checkReconcilePaths(config);
+        if (!paths.ok) {
+          console.log(`  ⚠️ Memory: 对账没有执行——${paths.reason}`);
+          memoryReconcileAlert = true;
+        } else {
+          try {
+            const outcome = await reconcileMemoryDocuments({
+              store,
+              embedder,
+              llm: effectiveLlm,
+              auditLogger: createAuditLogger(),
+              memDir: resolveSourcePath(memSource.path, "memory"),
+              dataDir: paths.dataDir,
+              explicitPath: true,
+              apply: true,
+            });
+            results.push(reconcileToIngestResult(outcome));
+            console.log(`  ✅ Memory: ${formatReconcileSummary(outcome)}`);
+            if (outcome.journalPath) console.log(`     对账日志: ${outcome.journalPath}`);
+            if (outcome.alert) memoryReconcileAlert = true;
+          } catch (err) {
+            console.log(`  ❌ Memory: 对账出错——${err instanceof Error ? err.message : String(err)}`);
+            memoryReconcileAlert = true;
+          }
+        }
       }
     }
 
@@ -1644,6 +1716,122 @@ program
       `  总计: ${totalChunks} chunks 已索引, ${totalDeduped} chunks 去重 (hard:${totalDedupReasons.hard}, exact:${totalDedupReasons.exact}, llm-skip:${totalDedupReasons["llm-skip"]}, llm-merge:${totalDedupReasons["llm-merge"]}), ${totalErrors} errors`,
     );
     console.log();
+    if (memoryReconcileAlert) {
+      console.log("⚠️ 记忆对账需要人看（见上面 Memory: 行），以退出码 3 结束");
+      process.exitCode = 3;
+    }
+  });
+
+// ─── reconcile-memory ────────────────────────────────────────────────────────
+// 记忆文件对账的手动入口：默认只打印计划不写库；--apply 执行；--undo 按对账日志逐条撤销。
+// 定时导入（ingest）在显式配置 sources.memory.path 时自动做同一件事，这里是给首轮存量清理、
+// 护栏拦下后人工放行、以及出问题时撤销用的。输出只有数量、文件名和 id 前 8 位，不打印切片正文。
+
+program
+  .command("reconcile-memory")
+  .description("记忆文件对账：让 memory 源的文档切片与现行记忆文件一一对应（默认只看计划，不写库）")
+  .option("--apply", "执行：插入 → 恢复 → 下架")
+  .option("--max-retire <n>", "本次下架上限（默认 max(300, 活跃文档切片数的 25%)，也可用 RECALLNEST_MEMORY_RECONCILE_MAX_RETIRE）")
+  .option("--undo <journal>", "按对账日志（data/reconcile-journals/*.jsonl）逐条撤销")
+  .option("--json", "以 JSON 输出计划与结果")
+  .action(async (options) => {
+    const config = loadConfig();
+    const paths = checkReconcilePaths(config);
+    console.log(`库: ${paths.dbPath}`);
+    console.log(`数据目录（锁 / 审计 / 对账日志）: ${paths.dataDir}`);
+    if (!paths.ok) {
+      console.error(`❌ ${paths.reason}`);
+      process.exitCode = 2;
+      return;
+    }
+    const { store, embedder, llm } = createComponents(config);
+
+    if (options.undo) {
+      const journalPath = resolve(String(options.undo));
+      const r = await undoMemoryReconcile({ store, auditLogger: createAuditLogger() }, journalPath);
+      console.log(`撤销完成：写回 ${r.restored} 条，本轮插入的 ${r.insertsRetired} 条改为下架，期间被改过而跳过 ${r.skippedConflict.length} 条`);
+      if (r.skippedConflict.length > 0) console.log(`  跳过的 id（前 8 位）: ${r.skippedConflict.slice(0, 20).map((id) => id.slice(0, 8)).join(" ")}${r.skippedConflict.length > 20 ? ` …（共 ${r.skippedConflict.length}）` : ""}`);
+      console.log(`撤销日志: ${r.undoJournalPath}`);
+      console.log("⚠️ 撤销后把 sources.memory.path 改回 auto 或暂停导入，否则下一轮对账会按现行文件重新对一遍");
+      return;
+    }
+
+    const memSource = config.sources.memory;
+    if (!memSource || memSource.path === "auto") {
+      console.error("❌ 需要在 config.json 里显式配置 sources.memory.path（当前为 auto 或未配置）");
+      process.exitCode = 2;
+      return;
+    }
+    const memDir = resolveSourcePath(memSource.path, "memory");
+    console.log(`记忆目录: ${memDir}`);
+    const maxRetire = options.maxRetire !== undefined
+      ? parseRequiredLimitOption(options.maxRetire, "--max-retire", 0, Number.MAX_SAFE_INTEGER)
+      : undefined;
+
+    const outcome = await reconcileMemoryDocuments({
+      store,
+      embedder,
+      llm,
+      auditLogger: createAuditLogger(),
+      memDir,
+      dataDir: paths.dataDir,
+      explicitPath: true,
+      apply: Boolean(options.apply),
+      maxRetire,
+    });
+
+    const plan = outcome.plan;
+    const countBy = <T,>(items: T[], key: (item: T) => string): Record<string, number> => {
+      const out: Record<string, number> = {};
+      for (const item of items) out[key(item)] = (out[key(item)] ?? 0) + 1;
+      return out;
+    };
+    const topFiles = (items: Array<{ file: string | null }>): Array<[string, number]> =>
+      Object.entries(countBy(items, (i) => i.file ?? "(无文件名)")).sort((a, b) => b[1] - a[1]).slice(0, 10);
+
+    if (options.json) {
+      console.log(JSON.stringify({
+        ran: outcome.ran,
+        skippedReason: outcome.skippedReason ?? null,
+        mode: options.apply ? "apply" : "dry-run",
+        maxRetire: outcome.maxRetire,
+        guard: outcome.guard,
+        alert: outcome.alert,
+        journalPath: outcome.journalPath,
+        plan: plan && {
+          currentFiles: plan.currentFiles,
+          currentChunks: plan.currentChunks,
+          currentDistinct: plan.currentDistinct,
+          existingRows: plan.existingRows,
+          activeDocRows: plan.activeDocRows,
+          filesWithActiveDocRows: plan.filesWithActiveDocRows,
+          keep: plan.keep,
+          insert: plan.insert.length,
+          insertByFile: topFiles(plan.insert.map((i) => ({ file: i.chunk.file }))),
+          retire: plan.retire.length,
+          retireByReason: countBy(plan.retire, (r) => r.reason),
+          retireByFile: topFiles(plan.retire),
+          reactivate: countBy(plan.reactivate, (r) => `${r.kind}${r.kind === "broken-consolidation" && r.targetRetiredThisRun ? "(目标本轮下架)" : ""}`),
+          representedByConsolidation: plan.representedByConsolidation,
+          exceptionForgotten: plan.exceptionForgotten,
+          exceptionOtherInactive: plan.exceptionOtherInactive,
+          exceptionOtherInactiveIds: plan.exceptionOtherInactiveIds.map((id) => id.slice(0, 8)),
+        },
+        applied: outcome.applied,
+      }, null, 2));
+    } else {
+      console.log(`\n${options.apply ? "执行结果" : "计划（未写库，加 --apply 执行）"}: ${formatReconcileSummary(outcome)}`);
+      if (plan) {
+        console.log(`  库里 scope "memory" 共 ${plan.existingRows} 行，其中活跃文档切片 ${plan.activeDocRows} 条、涉及 ${plan.filesWithActiveDocRows} 个文件；单轮下架上限 ${outcome.maxRetire}`);
+        const byReason = countBy(plan.retire, (r) => r.reason);
+        if (plan.retire.length > 0) console.log(`  下架按原因: ${Object.entries(byReason).map(([k, v]) => `${k} ${v}`).join("，")}`);
+        if (plan.retire.length > 0) console.log(`  下架最多的文件: ${topFiles(plan.retire).map(([f, n]) => `${f} ${n}`).join("，")}`);
+        if (plan.insert.length > 0) console.log(`  插入最多的文件: ${topFiles(plan.insert.map((i) => ({ file: i.chunk.file }))).map(([f, n]) => `${f} ${n}`).join("，")}`);
+        if (plan.exceptionOtherInactive > 0) console.log(`  例外②（同文只剩被别的机制下架的行，未推翻）id 前 8 位: ${plan.exceptionOtherInactiveIds.slice(0, 20).map((id) => id.slice(0, 8)).join(" ")}`);
+      }
+      if (outcome.journalPath) console.log(`  对账日志（撤销用）: ${outcome.journalPath}`);
+    }
+    if (outcome.alert) process.exitCode = 3;
   });
 
 // ─── dream ───────────────────────────────────────────────────────────────────
