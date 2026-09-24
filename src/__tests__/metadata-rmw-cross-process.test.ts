@@ -50,6 +50,31 @@ async function evolutionOf(store: MemoryStore, id: string): Promise<Record<strin
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * 让 store 在「锁内读完、写回之前」那一刻先执行 hook：把表的 mergeInsert 构造器包一层代理，execute 前先跑 hook。
+ * 用来确定性地复现「读之后、写之前，另一个进程用不拿锁的 delete() 删了这一行」。
+ */
+function runBeforeNextWrite(store: MemoryStore, hook: () => Promise<void>): void {
+  const holder = store as unknown as { table: Record<string, unknown> };
+  const table = holder.table;
+  const original = table.mergeInsert as (on: string) => unknown;
+  let fired = false;
+  const wrap = (builder: unknown): unknown => new Proxy(builder as object, {
+    get(target, prop) {
+      const value = (target as Record<string | symbol, unknown>)[prop];
+      if (typeof value !== "function") return value;
+      if (prop === "execute") {
+        return async (...args: unknown[]) => {
+          if (!fired) { fired = true; await hook(); }
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      return (...args: unknown[]) => wrap((value as (...a: unknown[]) => unknown).apply(target, args));
+    },
+  });
+  table.mergeInsert = (on: string) => wrap(original.call(table, on));
+}
+
 describe("元数据读改写在写锁内读最新行（跨进程）", () => {
   const dirs: string[] = [];
   let originalDataDir: string | undefined;
@@ -89,6 +114,28 @@ describe("元数据读改写在写锁内读最新行（跨进程）", () => {
     const meta = JSON.parse(entry!.metadata ?? "{}") as Record<string, unknown>;
     expect((meta.evolution as Record<string, unknown>).status).toBe("archived");
     expect(meta.accessCount).toBe(1);
+  });
+
+  it("patchMetadata：锁内读完之后行被别的进程用 delete() 删掉（不拿写锁，如 forget）→ 不插回来、返回 null", async () => {
+    const { a, b } = await setup();
+    await a.getById(ID); // 初始化，确保 a 的表句柄已建好
+    runBeforeNextWrite(a, async () => { await b.delete(ID); });
+    const result = await a.patchMetadata(ID, (meta) => {
+      meta.accessCount = 1;
+      return meta;
+    });
+    expect(result).toBeNull();
+    expect(await a.getById(ID)).toBeNull();
+    expect(await b.getById(ID)).toBeNull();
+  });
+
+  it("patchMetadataBatch：锁内读完之后行被删掉 → 不插回来，返回实际更新数 0", async () => {
+    const { a, b } = await setup();
+    await a.getById(ID);
+    runBeforeNextWrite(a, async () => { await b.delete(ID); });
+    const written = await a.patchMetadataBatch([{ id: ID, patchFn: (meta) => { meta.accessCount = 1; return meta; } }]);
+    expect(written).toBe(0);
+    expect(await a.getById(ID)).toBeNull();
   });
 
   it("检索后的访问计数：检索与写回之间别的进程提交的下架不会被盖掉", async () => {
