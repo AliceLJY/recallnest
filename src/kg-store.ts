@@ -522,7 +522,7 @@ export class KGStore {
 // Row mapping
 // ============================================================================
 
-function rowToTriple(row: Record<string, unknown>): KGTriple {
+export function rowToTriple(row: Record<string, unknown>): KGTriple {
   const sourceMemoryId = row.source_memory_id as string;
   return {
     id: row.id as string,

@@ -185,7 +185,7 @@ function groupEntries(entries: MemoryEntry[]): Map<string, MemoryEntry[]> {
 // Check 1: Contradictions
 // ---------------------------------------------------------------------------
 
-function findContradictions(entries: MemoryEntry[]): LintFinding[] {
+export function findContradictions(entries: MemoryEntry[]): LintFinding[] {
   const findings: LintFinding[] = [];
 
   // Only check merge-type categories where contradictions are meaningful
