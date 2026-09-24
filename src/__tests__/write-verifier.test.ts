@@ -1,5 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import { verifyWrite } from "../write-verifier.js";
+import { buildStructuredMetadata } from "../capture-engine.js";
 import type { MemoryEntry } from "../store.js";
 
 function mockStore(entry: MemoryEntry | null) {
@@ -16,9 +17,10 @@ function makeEntry(overrides: Partial<MemoryEntry> = {}): MemoryEntry {
     text: "User prefers dark mode",
     vector: [0.1, 0.2, 0.3],
     category: "preferences",
+    scope: "project:test",
     importance: 0.75,
     timestamp: Date.now(),
-    metadata: JSON.stringify({ scope: "project:test", importance: 0.75 }),
+    metadata: JSON.stringify({ source: "manual", canonicalKey: "preferences:user-prefers-dark-mode" }),
     ...overrides,
   };
 }
@@ -29,6 +31,22 @@ describe("HP-2: write-verifier", () => {
     expect(result.ok).toBe(true);
     expect(result.issues).toEqual([]);
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("passes for a row shaped like a real durable write (scope / importance live in columns, not metadata)", async () => {
+    // 回归：原实现在 metadata 里找 scope / importance，而真实写入的 metadata 从不带这两个字段，
+    // 于是每一次真实写入都报 missing_scope + missing_importance。
+    const metadata = buildStructuredMetadata({
+      source: "manual",
+      tags: [],
+      capture: "store_memory_schema_v1",
+      category: "preferences",
+      canonicalKey: "preferences:user-prefers-dark-mode",
+    });
+    expect(JSON.parse(metadata).scope).toBeUndefined();
+    const result = await verifyWrite(mockStore(makeEntry({ metadata })), "test-id");
+    expect(result.issues).toEqual([]);
+    expect(result.ok).toBe(true);
   });
 
   it("detects missing entry", async () => {
@@ -55,18 +73,18 @@ describe("HP-2: write-verifier", () => {
     expect(result.issues).toContain("empty_text");
   });
 
-  it("detects missing scope in metadata", async () => {
+  it("detects a missing scope column", async () => {
     const result = await verifyWrite(
-      mockStore(makeEntry({ metadata: JSON.stringify({ importance: 0.7 }) })),
+      mockStore(makeEntry({ scope: "  " })),
       "test-id",
     );
     expect(result.ok).toBe(false);
     expect(result.issues).toContain("missing_scope");
   });
 
-  it("detects missing importance in metadata", async () => {
+  it("detects a missing importance column", async () => {
     const result = await verifyWrite(
-      mockStore(makeEntry({ metadata: JSON.stringify({ scope: "test" }) })),
+      mockStore(makeEntry({ importance: Number.NaN })),
       "test-id",
     );
     expect(result.ok).toBe(false);
@@ -79,7 +97,7 @@ describe("HP-2: write-verifier", () => {
       "test-id",
     );
     expect(result.ok).toBe(false);
-    expect(result.issues).toContain("missing_scope");
+    expect(result.issues).toEqual(["corrupt_metadata"]);
   });
 
   it("respects enabled=false config", async () => {
@@ -113,10 +131,10 @@ describe("HP-2: write-verifier", () => {
 
   it("reports multiple issues at once", async () => {
     const result = await verifyWrite(
-      mockStore(makeEntry({ text: "", vector: [], metadata: "{}" })),
+      mockStore(makeEntry({ text: "", vector: [], scope: "" })),
       "test-id",
     );
     expect(result.ok).toBe(false);
-    expect(result.issues.length).toBeGreaterThanOrEqual(3);
+    expect([...result.issues].sort()).toEqual(["empty_text", "missing_scope", "missing_vector"]);
   });
 });
