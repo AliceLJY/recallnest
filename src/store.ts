@@ -1147,7 +1147,29 @@ export class MemoryStore implements MemoryStorePort {
       throw new Error(`Memory ${id} is outside accessible scopes`);
     }
 
-    // Build updated entry, preserving original timestamp and language fields
+    const updated = this.buildUpdatedEntry(row as Record<string, unknown>, updates);
+
+    // Atomic upsert via mergeInsert — replaces the previous delete+add two-step,
+    // which could lose the row entirely on a crash between steps and exposed a
+    // window where concurrent reads saw the id momentarily vanish.
+    //
+    // 2026-08-14: 包进 store-write 锁与 upsert/storeBatch 对齐 —— 此前 update 是唯一
+    // 裸奔的写路径（dream 的 3a/3b/auto-gc 全走它），与其他进程的 mergeInsert 并发时
+    // 靠 LanceDB 乐观重试硬扛，是 commit conflict 的隐性源之一。
+    await withWriteLock("store-write", async () => {
+      await this.table!
+        .mergeInsert("id")
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute([updated]);
+    }, { expireMs: 30_000 });
+
+    return updated;
+  }
+
+  /** 由库里的一行加上改动拼出写回的整行，保留原 timestamp / language（update 与 patchMetadata 共用） */
+  private buildUpdatedEntry(row: Record<string, unknown>, updates: MemoryStoreUpdate): MemoryEntry {
+    const rowScope = (row.scope as string | undefined) ?? "";
     const updated: MemoryEntry = {
       id: row.id as string,
       text: updates.text ?? (row.text as string),
@@ -1173,22 +1195,6 @@ export class MemoryStore implements MemoryStorePort {
         updated.metadata = JSON.stringify(meta);
       }
     }
-
-    // Atomic upsert via mergeInsert — replaces the previous delete+add two-step,
-    // which could lose the row entirely on a crash between steps and exposed a
-    // window where concurrent reads saw the id momentarily vanish.
-    //
-    // 2026-08-14: 包进 store-write 锁与 upsert/storeBatch 对齐 —— 此前 update 是唯一
-    // 裸奔的写路径（dream 的 3a/3b/auto-gc 全走它），与其他进程的 mergeInsert 并发时
-    // 靠 LanceDB 乐观重试硬扛，是 commit conflict 的隐性源之一。
-    await withWriteLock("store-write", async () => {
-      await this.table!
-        .mergeInsert("id")
-        .whenMatchedUpdateAll()
-        .whenNotMatchedInsertAll()
-        .execute([updated]);
-    }, { expireMs: 30_000 });
-
     return updated;
   }
 
@@ -1205,11 +1211,14 @@ export class MemoryStore implements MemoryStorePort {
    * metadata object. A throwing patchFn abandons that patch — the error
    * propagates to the caller, later queued patches still run.
    *
-   * Scope of guarantee: in-process only. Cross-process writers (multiple
-   * mcp-server instances) and the remaining direct update() callers
-   * (consolidation/capture/forget/prospective/conflict engines, auto-gc)
-   * are NOT serialized by this queue. Long-term direction: make this the
-   * only legal metadata write path.
+   * Scope of guarantee: the per-id queue orders patches within this process;
+   * since 2026-09-24 the read and the write both happen inside the
+   * cross-process store-write lock, so a commit made by another process
+   * between them (reconcile retirement, dream consolidation, GC archive) is
+   * read and kept instead of overwritten. Direct update() callers that pass a
+   * metadata string they read earlier can still overwrite — they are not
+   * read-modify-write. Long-term direction: make this the only legal metadata
+   * write path.
    */
   async patchMetadata(
     id: string,
@@ -1230,9 +1239,17 @@ export class MemoryStore implements MemoryStorePort {
       fullId = resolved.id;
     }
 
-    const run = async (): Promise<MemoryEntry | null> => {
-      const entry = await this.getById(fullId);
-      if (!entry) return null;
+    // 读与写都在 store-write 锁内（2026-09-24）：原先在锁外 getById、再经 update() 写回，别的进程在这两步之间的提交
+    // （对账下架、dream 合并、GC 归档）会被这里拿旧行算出的元数据整行盖掉。锁不可重入，所以锁内不调 update()，
+    // 直接按同样的规则拼整行写回。
+    const run = async (): Promise<MemoryEntry | null> => withWriteLock("store-write", async () => {
+      const rows = await this.table!.query().where(`id = '${escapeSqlLiteral(fullId)}'`).limit(1).toArray();
+      if (rows.length === 0) return null;
+      const row = rows[0] as Record<string, unknown>;
+      if (!matchesScopeFilter((row.scope as string | undefined) ?? "", scopeFilter)) {
+        throw new Error(`Memory ${fullId} is outside accessible scopes`);
+      }
+      const entry = this.buildUpdatedEntry(row, {});
       let meta: Record<string, unknown>;
       try {
         const parsed: unknown = JSON.parse(entry.metadata || "{}");
@@ -1243,8 +1260,10 @@ export class MemoryStore implements MemoryStorePort {
         meta = {};
       }
       const patched = patchFn(meta, entry);
-      return this.update(fullId, { metadata: JSON.stringify(patched) }, scopeFilter);
-    };
+      const updated: MemoryEntry = { ...entry, metadata: JSON.stringify(patched) };
+      await this.table!.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute([updated]);
+      return updated;
+    }, { expireMs: 30_000 });
 
     const prev = this.metadataPatchQueues.get(fullId) ?? Promise.resolve();
     // Isolate prior failures so one rejected patch can't wedge the queue.
