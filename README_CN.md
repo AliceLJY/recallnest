@@ -122,7 +122,7 @@ Hits    : 5
   ──────────────────────     ───────────────────────     ────────────────────────────   ──────────────────────
 
   Claude Code                MCP over stdio              Retriever                      LanceDB
-  Codex                ───▶  44 tools, 3 tiers    ───▶   weighted vector + BM25  ───▶   vector + columnar
+  Codex                ───▶  44 tools, 3 tiers    ───▶   vector · hybrid opt-in  ───▶   vector + columnar
   Kimi · Antigravity                                     Classifier · 6 categories
   Doubao desktop                                         Context composer
                              HTTP API :4318              resume_context                 Jina embeddings v5
@@ -134,6 +134,9 @@ Hits    : 5
 
 > 图内保留英文术语：等宽字体下中文占两格，混排会把对齐打乱。四段从左到右分别是
 > 客户端、接入层（MCP / HTTP / 只读网关）、核心引擎、存储层。
+>
+> Retriever 一格：`retrieval.mode` 默认是 `"vector"`（纯向量检索）；在 `config.json` 里改成 `"hybrid"`
+> 后，会加上 BM25 全文检索，并与向量结果做加权分数融合（默认 `vectorWeight` 0.7 / `bm25Weight` 0.3）。
 
 ### 内部设计
 
