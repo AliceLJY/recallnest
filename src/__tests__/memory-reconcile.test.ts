@@ -1050,6 +1050,36 @@ describe("memory-reconcile 真实 LanceDB", () => {
     expect((await env.store.getById(s.freshId))!.metadata).toBe(before);
   });
 
+  it("没插成的备用 id 正是本轮下架的那一行、下架结果行丢了：撤销照样把它撤回（第三次代码单审 F6）", async () => {
+    writeMem("a.md", [["Taken", "这一段的确定性 id 和备用 id 都被别的正文占着，备用 id 那行来自一个已经删掉的文件。"]]);
+    const [c] = chunksOf("a.md");
+    const primary = deterministicId(MEMORY_DOC_SCOPE, c.text);
+    const alt = altInsertId(c.text);
+    const rows = [
+      { id: primary, text: `${c.text}（旧导入合并时改写进来的内容）`, file: "a.md" },
+      { id: alt, text: "一段毫不相干的正文，却占着上面那段文字的备用 id。", file: "removed.md" },
+    ];
+    const extractions = await smartExtractBatch(rows.map((r) => r.text), null);
+    await env.store.storeBatch(rows.map((r, i) => {
+      const built = buildIngestedEntry({ source: "memory", scope: MEMORY_DOC_SCOPE, text: r.text, vector: vec(r.text), extraction: extractions[i], file: r.file, heading: "h" });
+      return { ...built, id: r.id, category: built.category as MemoryEntry["category"] };
+    }));
+    const out = await run();
+    expect(out.guard?.reason).toBe("insert-failed");
+    expect(out.applied).toMatchObject({ inserted: 0, retired: 1, retireDeferredPendingInsert: 1 });
+    expect((await stateOf(alt)).status).toBe("archived");
+    // 崩溃在下架写库与写结果之间：只留下架的意图行
+    const kept = readFileSync(out.journalPath!, "utf-8").split("\n").filter(Boolean)
+      .filter((l) => { const j = JSON.parse(l); return !(j.action === "retire" && j.phase !== "intent"); });
+    writeFileSync(out.journalPath!, kept.join("\n") + "\n");
+    expect(journalLines(out.journalPath!)).toContainEqual(expect.objectContaining({ action: "insert", id: alt, inserted: false, skipped: "id-occupied" }));
+    const undo = await undoMemoryReconcile({ store: env.store }, out.journalPath!);
+    expect(undo.restored).toBe(1);
+    expect(undo.skippedConflict).toEqual([]);
+    expect((await stateOf(alt)).status).toBe("active");
+    expect((await stateOf(primary)).status).toBe("active");
+  });
+
   it("不是显式路径 / 目录不存在：拒绝执行", async () => {
     await expect(run({ explicitPath: false })).rejects.toThrow("显式配置");
     await expect(run({ memDir: join(env.root, "nope") })).rejects.toThrow("记忆目录不存在");

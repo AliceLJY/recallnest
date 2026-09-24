@@ -1197,10 +1197,13 @@ function asJournalFields(value: unknown): JournalFields | undefined {
 }
 
 function readUndoRecords(journalPath: string): { records: UndoRecord[]; unparsed: number } {
+  // 按「动作 + id」分开记：同一个 id 可能既是没插成的插入目标、又是本轮的下架对象（备用 id 被一行别的正文占着、
+  // 那一行又因文件已删而下架），混在一起会让插入的「没写」吞掉下架的意图（第三次代码单审 F6）
+  const key = (action: string, id: string) => `${action}\u0000${id}`;
   const results = new Map<string, UndoRecord>();
   const intents = new Map<string, UndoRecord>();
-  /** 插入时撞 id 被跳过的：这个 id 上的行不是本轮写的 */
-  const notWritten = new Set<string>();
+  /** 插入时撞 id 被跳过的：这个 id 上的行不是本轮插入的 */
+  const insertNotWritten = new Set<string>();
   let unparsed = 0;
   for (const line of readFileSync(journalPath, "utf-8").split("\n")) {
     if (!line.trim()) continue;
@@ -1219,7 +1222,7 @@ function readUndoRecords(journalPath: string): { records: UndoRecord[]; unparsed
         for (const it of rec.items) {
           const item = asRecord(it);
           if (!item || typeof item.id !== "string") continue;
-          intents.set(item.id, {
+          intents.set(key(action, item.id), {
             run,
             action,
             id: item.id,
@@ -1233,10 +1236,10 @@ function readUndoRecords(journalPath: string): { records: UndoRecord[]; unparsed
     }
     if (typeof rec.id !== "string") continue;
     if (action === "insert" && rec.inserted === false) {
-      notWritten.add(rec.id);
+      insertNotWritten.add(rec.id);
       continue;
     }
-    results.set(rec.id, {
+    results.set(key(action, rec.id), {
       run,
       action,
       id: rec.id,
@@ -1246,7 +1249,10 @@ function readUndoRecords(journalPath: string): { records: UndoRecord[]; unparsed
       intentOnly: false,
     });
   }
-  for (const [id, rec] of intents) if (!results.has(id) && !notWritten.has(id)) results.set(id, rec);
+  for (const [k, rec] of intents) {
+    if (results.has(k) || (rec.action === "insert" && insertNotWritten.has(rec.id))) continue;
+    results.set(k, rec);
+  }
   return { records: [...results.values()], unparsed };
 }
 
