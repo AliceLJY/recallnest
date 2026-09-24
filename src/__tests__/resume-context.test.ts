@@ -44,6 +44,40 @@ function withMetadata(result: RetrievalResult, metadata: Record<string, unknown>
 }
 
 describe("composeResumeContext", () => {
+  it("caps collapsedItems at the schema limit instead of throwing when the sections recall more than 20 distinct items", async () => {
+    // 2026-09-24：limitPerSection=4 的真实调用返回 zod 错「collapsedItems: Array must contain at most 20」。
+    // 五个分区（外加各自的补充查询）的结果去重后全部进折叠视图，工具参数又允许 1–6，超过 20 条就整个调用失败。
+    let seq = 0;
+    const scoreById = new Map<string, number>();
+    const retriever = {
+      async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
+        const category = (context.category ?? "fact") as "profile" | "preferences" | "entities" | "patterns" | "cases" | "fact";
+        return Array.from({ length: 8 }, (_, i) => {
+          seq += 1;
+          const result = buildResult(`${category}-${seq}`, category, `${category} item ${seq}: search_memory before coding, keep checkpoints small (${i}).`);
+          const score = 0.5 + (seq % 40) / 100;
+          scoreById.set(result.entry.id, score);
+          return { ...result, score };
+        });
+      },
+    };
+    const response = await composeResumeContext({
+      retriever,
+      checkpointStore: { async getLatest() { return null; } },
+      listPins: () => [],
+    }, {
+      task: "continue the RecallNest work",
+      limitPerSection: 6,
+      includeLatestCheckpoint: false,
+    });
+    expect(response.collapsedItems).toBeDefined();
+    expect(response.collapsedItems!.length).toBe(20);
+    // 折叠视图按分数从高到低排，截掉的是分数最低的那一截
+    const scores = response.collapsedItems!.map((item) => scoreById.get(item.entryId) ?? -1);
+    expect(scores.every((x) => x >= 0)).toBe(true);
+    expect([...scores].sort((a, b) => b - a)).toEqual(scores);
+  });
+
   it("uses the latest checkpoint to recover task bias and shared scope", async () => {
     const calls: RetrievalContext[] = [];
     const checkpoint: SessionCheckpointRecord = {
