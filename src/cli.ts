@@ -1148,6 +1148,62 @@ conflictsCommand
     console.log(formatConflictResolution(result));
   });
 
+conflictsCommand
+  .command("kg-candidates")
+  .description("只读：KG 三元组按 (subject, predicate) 分组的多值候选（影子期，候选非判决）")
+  .requiredOption("--scope <scope>", "scope（精确匹配）")
+  .option("-n, --limit <n>", "按排序取前 n 组", "20")
+  .option("--sample <n>", "改为随机抽 n 组（确定性，配 --seed）")
+  .option("--seed <seed>", "抽样种子", "1")
+  .option("--json", "JSON 格式输出")
+  .action(async (options) => {
+    const { findKGContradictionCandidates, loadScopeTriples, sampleCandidates, formatCandidateReport } = await import("./kg-contradiction.js");
+    const dbPath = resolveDbPath(loadConfig());
+    const triples = await loadScopeTriples(dbPath, options.scope);
+    const candidates = findKGContradictionCandidates(triples);
+    const sampling = options.sample !== undefined;
+    const n = sampling ? parseRequiredLimitOption(options.sample, "--sample", 1, 1000) : parseLimitOption(options.limit, 20, 1, 1000);
+    const seed = Number.parseInt(String(options.seed), 10) || 1;
+    const shown = sampling ? sampleCandidates(candidates, n, seed) : candidates.slice(0, n);
+    const mode = sampling ? `random sample n=${n} seed=${seed}` : `top ${n}`;
+
+    if (options.json) {
+      console.log(JSON.stringify({ scope: options.scope, tripleCount: triples.length, candidateCount: candidates.length, mode, candidates: shown }, null, 2));
+      return;
+    }
+    console.log(formatCandidateReport(options.scope, triples.length, candidates.length, shown, mode));
+  });
+
+conflictsCommand
+  .command("kg-compare")
+  .description("只读：同一 scope 上现有正则矛盾检测 (memory lint) 与 KG 分组候选的双向对照")
+  .requiredOption("--scope <scope>", "scope（精确匹配）")
+  .option("-n, --limit <n>", "文本输出每节最多列几条；0 = 全部", "0")
+  .option("--json", "JSON 格式输出（始终完整）")
+  .action(async (options) => {
+    const {
+      compareRegexWithCandidates,
+      findKGContradictionCandidates,
+      formatComparisonReport,
+      loadRegexInput,
+      loadScopeTriples,
+      regexHitPairs,
+    } = await import("./kg-contradiction.js");
+    const dbPath = resolveDbPath(loadConfig());
+    const [triples, regexInput] = await Promise.all([loadScopeTriples(dbPath, options.scope), loadRegexInput(dbPath, options.scope)]);
+    const candidates = findKGContradictionCandidates(triples);
+    const pairs = regexHitPairs(regexInput.entries);
+    const cmp = compareRegexWithCandidates(pairs, candidates, triples, new Set(regexInput.entries.map((e) => e.id)));
+    const meta = { tripleCount: triples.length, regexInputCount: regexInput.entries.length, scanLimited: regexInput.scanLimited };
+
+    if (options.json) {
+      console.log(JSON.stringify({ scope: options.scope, ...meta, ...cmp }, null, 2));
+      return;
+    }
+    const limit = Number.parseInt(String(options.limit), 10);
+    console.log(formatComparisonReport(options.scope, meta, cmp, Number.isFinite(limit) && limit > 0 ? limit : 0));
+  });
+
 program
   .command("seed-patterns [file]")
   .description("批量写入 continuity / workflow pattern seeds")
