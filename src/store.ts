@@ -1261,8 +1261,10 @@ export class MemoryStore implements MemoryStorePort {
       }
       const patched = patchFn(meta, entry);
       const updated: MemoryEntry = { ...entry, metadata: JSON.stringify(patched) };
-      await this.table!.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute([updated]);
-      return updated;
+      // 只更新已存在的行：delete() 不拿 store-write 锁，锁内读完之后这一行可能已被删掉（比如 forget），
+      // 不能把它插回来（2026-09-24 上线前代码单审）
+      const res = await this.table!.mergeInsert("id").whenMatchedUpdateAll().execute([updated]);
+      return res.numUpdatedRows > 0 ? updated : null;
     }, { expireMs: 30_000 });
 
     const prev = this.metadataPatchQueues.get(fullId) ?? Promise.resolve();
@@ -1367,8 +1369,9 @@ export class MemoryStore implements MemoryStorePort {
           }
         }
         if (toWrite.length === 0) return 0;
-        await this.table!.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute(toWrite);
-        return toWrite.length;
+        // 只更新已存在的行：锁内读完之后被不拿锁的 delete() 删掉的行不插回来，返回实际更新数（2026-09-24 上线前代码单审）
+        const res = await this.table!.mergeInsert("id").whenMatchedUpdateAll().execute(toWrite);
+        return res.numUpdatedRows;
       }, { expireMs: 30_000 });
     }
     return written;
