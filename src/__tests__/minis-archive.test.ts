@@ -6,7 +6,8 @@
  * - 同名不同内容时两版都留——同一场对话可能被 Minis 同名覆盖导出好几次；
  * - 一行可用对话都没有的留在原处报错——台账照样会把它记成已处理，悄悄收走就没人知道格式坏了。
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -126,16 +127,26 @@ describe("archiveIngestedMinisFiles", () => {
     const src = join(drop, "conversation-20260911-读不出来.jsonl");
     writeFileSync(src, conversation(3));
     const ledger = ledgerOf(src);
-    chmodSync(src, 0o000);
+    // 让读原件那一步抛错，模拟 iCloud 占位文件的 EDEADLK。不用 chmod 000：root 不受文件权限限制，
+    // 云端容器以 root 跑时照样读得出来，这条用例就测不到读取失败
+    const realReadFileSync = fs.readFileSync;
+    const readSpy = spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
+      if (args[0] === src) {
+        throw Object.assign(new Error(`EDEADLK: resource deadlock would occur, read '${src}'`), { code: "EDEADLK" });
+      }
+      return realReadFileSync(...args);
+    }) as typeof fs.readFileSync);
     try {
       const result = archiveIngestedMinisFiles(drop, archive, ledger);
+      expect(readSpy).toHaveBeenCalledWith(src);
       expect(result.archived).toEqual([]);
       expect(result.errors).toHaveLength(1);
       expect(result.errors[0]).toContain("conversation-20260911-读不出来.jsonl");
+      expect(result.errors[0]).toContain("EDEADLK");
       expect(existsSync(src)).toBe(true);
       expect(existsSync(archive) ? readdirSync(archive) : []).toEqual([]);
     } finally {
-      chmodSync(src, 0o644);
+      readSpy.mockRestore();
     }
   });
 
