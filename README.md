@@ -127,7 +127,7 @@ places where the obvious implementation was wrong — is in
   ──────────────────────     ───────────────────────     ────────────────────────────   ──────────────────────
 
   Claude Code                MCP over stdio              Retriever                      LanceDB
-  Codex                ───▶  44 tools, 3 tiers    ───▶   vector + BM25 + RRF     ───▶   vector + columnar
+  Codex                ───▶  44 tools, 3 tiers    ───▶   weighted vector + BM25  ───▶   vector + columnar
   Kimi · Antigravity                                     Classifier · 6 categories
   Doubao desktop                                         Context composer
                              HTTP API :4318              resume_context                 Jina embeddings v5
