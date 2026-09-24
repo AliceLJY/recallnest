@@ -158,6 +158,15 @@ export function recordAccess(metadata: string | undefined): string {
   });
 }
 
+/**
+ * recordAccess 的对象版：给 patchMetadataBatch 的 patchFn 用——在写锁内、以库里最新的元数据为底座加访问计数，
+ * 不再拿检索时读到的元数据整行写回（那样会把检索与写回之间别的进程写下的状态盖掉）。
+ */
+export function recordAccessOnMeta(meta: Record<string, unknown>, now: number = Date.now()): Record<string, unknown> {
+  const evo = parseEvolution(JSON.stringify(meta));
+  return patchEvolutionOnMeta(meta, { accessCount: evo.accessCount + 1, lastAccessedAt: now });
+}
+
 // ---------------------------------------------------------------------------
 // Supersede / Consolidate helpers
 // ---------------------------------------------------------------------------

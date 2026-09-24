@@ -26,7 +26,7 @@ import { FrequencyTracker } from "./frequency-tracker.js";
 import { applyConfidenceWeight } from "./confidence-tracker.js";
 import { deduplicateByVersionGroup } from "./version-manager.js";
 import { deduplicateByClusterInsight } from "./consolidation-engine.js";
-import { isActiveMemory, recordAccess as recordEvolutionAccess, parseEvolution, computeDecayScore } from "./memory-evolution.js";
+import { isActiveMemory, recordAccessOnMeta as recordEvolutionAccessOnMeta, parseEvolution, computeDecayScore } from "./memory-evolution.js";
 import {
   isMultiVectorEnabled,
   extractMultiVectorText,
@@ -922,14 +922,15 @@ export class MemoryRetriever {
 
     // A-3: Record evolution access counts (async, non-blocking)
     // Moved after topicTag filter so filtered-out entries are not reinforced.
-    if (results.length > 0 && context.source !== "auto-recall" && this.store.update) {
+    // 2026-09-24：一批行在写锁内读最新元数据再加计数（patchMetadataBatch，一次提交）。原先拿检索时读到的元数据
+    // 整行 update 回去，检索与写回之间别的进程写下的状态（对账下架、dream 合并、GC 归档）会被旧值盖掉。
+    if (results.length > 0 && context.source !== "auto-recall" && typeof this.store.patchMetadataBatch === "function") {
+      const ids = results.map((r) => r.entry.id);
       Promise.resolve().then(async () => {
-        for (const r of results) {
-          try {
-            const updated = recordEvolutionAccess(r.entry.metadata);
-            await this.store.update!(r.entry.id, { metadata: updated });
-          } catch (err) { console.error("[recallnest] Evolution access tracking failed:", err instanceof Error ? err.message : String(err)); }
-        }
+        try {
+          const now = Date.now();
+          await this.store.patchMetadataBatch(ids.map((id) => ({ id, patchFn: (meta) => recordEvolutionAccessOnMeta(meta, now) })));
+        } catch (err) { console.error("[recallnest] Evolution access tracking failed:", err instanceof Error ? err.message : String(err)); }
       });
     }
 
