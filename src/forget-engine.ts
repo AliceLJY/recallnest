@@ -22,6 +22,7 @@ import type { AuditLogger } from "./audit-log.js";
 import { parsePrivacyTier, type PrivacyTier } from "./memory-schema.js";
 import { parseEvolution, patchEvolution } from "./memory-evolution.js";
 import { cascadeForget, type CascadeForgetConfig, DEFAULT_CASCADE_FORGET_CONFIG } from "./cascade-forget.js";
+import { textFingerprint } from "./text-fingerprint.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -173,7 +174,9 @@ export async function forgetMemory(
       scope: entry.scope,
       memoryId: entry.id,
       actor: "system",
-      details: `tier=${privacyTier} reason=${reason || "none"} cascade=${cascadeResult.demotedCount}`,
+      // norm=<归一文本指纹> 放最前（details 超 200 字会被截断）：删的是这一行，要忘的是这段文字。
+      // 记忆文件对账据此不把同文的另一行恢复回来（memory-reconcile.ts），只认 id 的话换个空白就绕过去了。
+      details: `norm=${textFingerprint(entry.text)} tier=${privacyTier} reason=${reason || "none"} cascade=${cascadeResult.demotedCount}`,
     });
     if (cascadeResult.demotedCount > 0) {
       auditLogger?.log({

@@ -1,12 +1,16 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, truncateSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createAuditLogger } from "../audit-log.js";
-import { withLock } from "../distill-lock.js";
+import { lockPathForKey, withLock } from "../distill-lock.js";
+import { forgetMemory } from "../forget-engine.js";
 import { buildIngestedEntry, normalizeDedupText, smartExtractBatch } from "../ingest.js";
+import type { LLMClient } from "../llm-client.js";
+import { textFingerprint } from "../text-fingerprint.js";
 import {
+  altInsertId,
   applyMemoryReconcile,
   collectCurrentChunks,
   decideGuardAlert,
@@ -14,6 +18,7 @@ import {
   ForgetWatcher,
   GUARD_ALERT_INTERVAL_MS,
   guardStatePath,
+  LOCK_STALE_ALERT_MS,
   loadMemoryScopeRows,
   MEMORY_DOC_SCOPE,
   planMemoryReconcile,
@@ -189,6 +194,42 @@ describe("planMemoryReconcile", () => {
     expect(p.reactivate).toHaveLength(0);
   });
 
+  it("现行文字的确定性 id 被另一段正文占着（旧导入合并时原地改写）：那一行按旧文下架，这段文字用备用 id 插入", () => {
+    const primary = deterministicId(MEMORY_DOC_SCOPE, T(1));
+    const p = plan([chunk("a.md", T(1))], [row(primary, `${T(1)}后来被合并进来的另一段内容`)]);
+    expect(p.retire.map((r) => [r.id, r.reason])).toEqual([[primary, "not-in-current-files"]]);
+    expect(p.insert).toEqual([expect.objectContaining({ id: altInsertId(T(1)), occupiedPrimaryId: primary })]);
+    expect(p.insertAltId).toBe(1);
+    expect(altInsertId(T(1))).not.toBe(primary);
+  });
+
+  it("forget 记录里只有归一指纹（删的是同文的另一行）：不补回，也不恢复同文的对账下架行", () => {
+    const text = T(1);
+    const p = planMemoryReconcile({
+      current: [chunk("a.md", text)],
+      currentFileNames: new Set(["a.md"]),
+      existing: [row("sibling", `${text}  `, { status: "archived", note: "memory-reconcile: duplicate-text", reconcileAction: "retired" })],
+      forgottenIds: new Set(["id-of-the-deleted-variant"]),
+      forgottenNorms: new Set([textFingerprint(` ${text}`)]),
+    });
+    expect(p.exceptionForgotten).toBe(1);
+    expect(p.reactivate).toHaveLength(0);
+    expect(p.insert).toHaveLength(0);
+  });
+
+  it("同一段文字出现在几个文件里：插入项记下全部文件", () => {
+    const p = plan([chunk("b.md", T(1)), chunk("a.md", T(1))], []);
+    expect(p.insert).toHaveLength(1);
+    expect(p.insert[0].files).toEqual(["a.md", "b.md"]);
+  });
+
+  it("备用 id 在 forget 记录里：同样不补回", () => {
+    const primary = deterministicId(MEMORY_DOC_SCOPE, T(1));
+    const p = plan([chunk("a.md", T(1))], [row(primary, OLD(1))], { forgotten: [altInsertId(T(1))] });
+    expect(p.exceptionForgotten).toBe(1);
+    expect(p.insert).toHaveLength(0);
+  });
+
   it("统计：活跃文档切片数与涉及文件数只算活跃的文档切片", () => {
     const p = plan([chunk("a.md", T(1))], [
       row("k1", T(1), { file: "a.md" }),
@@ -225,18 +266,23 @@ describe("ForgetWatcher", () => {
     const dir = mkdtempSync(join(tmpdir(), "rn-forget-watch-"));
     try {
       const path = join(dir, "audit.jsonl");
-      const ev = (id: string, scope = MEMORY_DOC_SCOPE) => JSON.stringify({ operation: "forget", scope, memoryId: id, actor: "manual" });
+      const ev = (id: string, scope = MEMORY_DOC_SCOPE, details?: string) => JSON.stringify({ operation: "forget", scope, memoryId: id, actor: "manual", ...(details ? { details } : {}) });
       writeFileSync(path, `${ev("a")}\n${ev("x", "cc:foo")}\n${JSON.stringify({ operation: "store", scope: MEMORY_DOC_SCOPE, memoryId: "s" })}\n`);
       const w = new ForgetWatcher(path);
-      expect([...w.ids]).toEqual(["a"]);
+      expect([...w.set.ids]).toEqual(["a"]);
       const half = ev("b");
       appendFileSync(path, half.slice(0, 20));
-      expect([...w.refresh()]).toEqual(["a"]);
+      expect([...w.refresh().ids]).toEqual(["a"]);
       appendFileSync(path, `${half.slice(20)}\n`);
-      expect([...w.refresh()].sort()).toEqual(["a", "b"]);
+      expect([...w.refresh().ids].sort()).toEqual(["a", "b"]);
       truncateSync(path, 0);
-      writeFileSync(path, `${ev("c")}\n`);
-      expect([...w.refresh()].sort()).toEqual(["a", "b", "c"]);
+      const fp = textFingerprint(T(1));
+      writeFileSync(path, `${ev("c", MEMORY_DOC_SCOPE, `norm=${fp} tier=standard reason=none cascade=0`)}\n`);
+      expect([...w.refresh().ids].sort()).toEqual(["a", "b", "c"]);
+      expect([...w.set.norms]).toEqual([fp]);
+      // 按文字认：换一行 id、原文空白不同也认得出
+      expect(w.isForgotten("some-other-id", normalizeDedupText(`  ${T(1)} `))).toBe(true);
+      expect(w.isForgotten("some-other-id", normalizeDedupText(T(2)))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -443,7 +489,15 @@ describe("memory-reconcile 真实 LanceDB", () => {
     expect((await env.store.getById(s.pivotId))!.metadata).toBe(pivotBefore);
 
     // 日志按「插入 → 恢复 → 下架」的顺序落（互审 N3）
-    const lines = journalLines(out.journalPath!).filter((l) => typeof l.action === "string");
+    // 结果行（意图行 phase=intent 另外核对：每批都先于它的结果行落下）
+    const all = journalLines(out.journalPath!);
+    const lines = all.filter((l) => typeof l.action === "string" && l.phase !== "intent");
+    for (const action of ["insert", "reactivate", "retire"]) {
+      const firstIntent = all.findIndex((l) => l.phase === "intent" && l.action === action);
+      const firstResult = all.findIndex((l) => l.phase !== "intent" && l.action === action);
+      expect(firstIntent).toBeGreaterThanOrEqual(0);
+      expect(firstIntent).toBeLessThan(firstResult);
+    }
     const lastOf = (a: string) => lines.map((l) => l.action).lastIndexOf(a);
     const firstOf = (a: string) => lines.map((l) => l.action).indexOf(a);
     expect(lastOf("insert")).toBeLessThan(firstOf("reactivate"));
@@ -507,7 +561,7 @@ describe("memory-reconcile 真实 LanceDB", () => {
     const s = await buildScenario();
     const watcher = new ForgetWatcher(env.auditPath);
     const { chunks, fileNames } = collectCurrentChunks(env.memDir);
-    const p = planMemoryReconcile({ current: chunks, currentFileNames: fileNames, existing: await loadMemoryScopeRows(env.store), forgottenIds: new Set(watcher.ids) });
+    const p = planMemoryReconcile({ current: chunks, currentFileNames: fileNames, existing: await loadMemoryScopeRows(env.store), forgottenIds: new Set(watcher.set.ids) });
     expect(p.insert.map((i) => i.id)).toEqual([s.freshId]);
     env.auditLogger.log({ operation: "forget", scope: MEMORY_DOC_SCOPE, memoryId: s.freshId, actor: "manual", details: "forgotten after planning" });
     const res = await applyMemoryReconcile({ store: env.store, embedder: env.embedder, llm: null }, p, { runId: "t", journalPath: null, retireAllowed: true, forgetWatcher: watcher });
@@ -612,6 +666,7 @@ describe("memory-reconcile 真实 LanceDB", () => {
     expect(undo.restored).toBe(4); // oldA、target 两条下架 + 两条恢复
     expect(undo.insertsRetired).toBe(1);
     expect(undo.skippedConflict).toEqual([s.orphanId]);
+    expect(undo.skippedDependency).toEqual([]);
     expect(existsSync(undo.undoJournalPath)).toBe(true);
 
     expect(await stateOf(s.oldAId)).toMatchObject({ status: before.oldA.status, evolutionNote: null, reconcileAction: null });
@@ -619,6 +674,206 @@ describe("memory-reconcile 真实 LanceDB", () => {
     expect(await stateOf(s.chainedId)).toMatchObject(before.chained);
     expect(await stateOf(s.freshId)).toMatchObject({ status: "archived", evolutionNote: "memory-reconcile: undo-insert" });
     expect((await stateOf(s.orphanId)).status).toBe("active");
+  });
+
+  it("确定性 id 被改写过的旧行占着：用备用 id 插入、旧行下架，第二轮无事可做（09-24 快照彩排抓到的情形）", async () => {
+    writeMem("a.md", [["Merged", "这一段在库里有一行 id 是它、正文却被旧导入合并时改写成了别的内容。"]]);
+    const [c] = chunksOf("a.md");
+    const primary = deterministicId(MEMORY_DOC_SCOPE, c.text);
+    const rewritten = `${c.text}（合并进来的另一段内容，现行文件里没有）`;
+    const [extraction] = await smartExtractBatch([rewritten], null);
+    const built = buildIngestedEntry({ source: "memory", scope: MEMORY_DOC_SCOPE, text: rewritten, vector: vec(rewritten), extraction, file: "a.md", heading: "Merged" });
+    await env.store.storeBatch([{ ...built, id: primary, category: built.category as MemoryEntry["category"] }]);
+
+    const out = await run();
+    expect(out.guard).toBeNull();
+    expect(out.plan!.insertAltId).toBe(1);
+    expect(out.applied).toMatchObject({ inserted: 1, retired: 1, insertErrors: [] });
+    const alt = await env.store.getById(altInsertId(c.text));
+    expect(alt!.text).toBe(c.text);
+    expect(rowState(JSON.parse(alt!.metadata)).status).toBe("active");
+    expect(await stateOf(primary)).toMatchObject({ status: "archived", reconcileAction: "retired" });
+    const insertLine = journalLines(out.journalPath!).find((l) => l.action === "insert" && l.inserted === true);
+    expect(insertLine?.occupiedPrimaryId).toBe(primary);
+
+    const again = await run();
+    expect(again.applied).toMatchObject({ inserted: 0, retired: 0, reactivatedReconcileRetired: 0 });
+    expect(again.plan!.keep).toBe(1);
+  });
+
+  it("规划之后同一个 id 被另一段正文抢先占住：不算有代表，记为没插进去，该文件的旧切片本轮不下", async () => {
+    writeMem("a.md", [["Fresh", "这一段是新写的，规划时库里还没有，插入前却被别的写方用同一个 id 写了别的正文。"]]);
+    const [c] = chunksOf("a.md");
+    const [oldId] = await seed([{ text: "[Fresh] a.md 这一节的旧版本，现行文件里已经没有了。", file: "a.md" }]);
+    const { chunks, fileNames } = collectCurrentChunks(env.memDir);
+    const p = planMemoryReconcile({ current: chunks, currentFileNames: fileNames, existing: await loadMemoryScopeRows(env.store), forgottenIds: new Set() });
+    const primary = deterministicId(MEMORY_DOC_SCOPE, c.text);
+    expect(p.insert.map((i) => i.id)).toEqual([primary]);
+    await env.store.storeBatch([{ id: primary, text: "别的写方写进来的另一段正文，长度也足够。", vector: vec("x"), category: "facts", scope: MEMORY_DOC_SCOPE, importance: 0.5, metadata: "{}" }]);
+
+    const res = await applyMemoryReconcile({ store: env.store, embedder: env.embedder, llm: null }, p, { runId: "t", journalPath: null, retireAllowed: true });
+    expect(res.inserted).toBe(0);
+    expect(res.insertSkippedExisting).toBe(0);
+    expect(res.insertPending).toBe(1);
+    expect(res.insertErrors.join(" ")).toContain("已被另一段文字占着");
+    expect(res.retireDeferredPendingInsert).toBe(1);
+    expect((await stateOf(oldId)).status).toBe("active");
+  });
+
+  it("切片切断四字节字符：比对前换成 U+FFFD，与库里存下的正文、确定性 id 一致，不重复插入也不误下架", async () => {
+    // 前面一个 ASCII 字符让代理对落在奇数下标上；1,200 个 emoji 共 2,400 个 UTF-16 单元，一定要切成多段
+    writeFileSync(join(env.memDir, "emoji.md"), `## Emoji\n\na${"😀".repeat(1200)}\n`);
+    const { chunks } = collectCurrentChunks(env.memDir);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.every((c) => c.text.isWellFormed())).toBe(true);
+
+    // 模拟旧导入写进去的样子：按未替换的原切片写库（存储会把半截换成 U+FFFD，id 按原切片算）
+    const { parseMarkdown } = await import("../ingest.js");
+    const raw = parseMarkdown(join(env.memDir, "emoji.md")).map((sec) => sec.text);
+    expect(raw.some((t) => !t.isWellFormed())).toBe(true); // 前提：切片器确实切出了半截字符
+    const extractions = await smartExtractBatch(raw, null);
+    await env.store.storeBatch(raw.map((text, i) => {
+      const built = buildIngestedEntry({ source: "memory", scope: MEMORY_DOC_SCOPE, text, vector: vec(text), extraction: extractions[i], file: "emoji.md", heading: "Emoji" });
+      return { ...built, category: built.category as MemoryEntry["category"] };
+    }));
+
+    const out = await run();
+    expect(out.plan!.insert).toHaveLength(0);
+    expect(out.plan!.insertAltId).toBe(0);
+    expect(out.plan!.retire).toHaveLength(0);
+    expect(out.plan!.keep).toBe(chunks.length);
+  });
+
+  it("dream / GC 的锁被活着的进程占着、哪怕很久没更新：不抢，本轮跳过；超过 6 小时报警（上线前代码单审 C2）", async () => {
+    await buildScenario();
+    let out: Awaited<ReturnType<typeof run>> | undefined;
+    await withLock("consolidate-memory", async () => {
+      const old = new Date(Date.now() - 2 * 3_600_000); // 两小时没续期：按旧规则（10 分钟过期）会被抢
+      utimesSync(lockPathForKey("consolidate-memory"), old, old);
+      out = await run();
+      expect(out.ran).toBe(false);
+      expect(out.guard).toBeNull();
+      expect(out.alert).toBe(false);
+      const stale = new Date(Date.now() - LOCK_STALE_ALERT_MS - 60_000);
+      utimesSync(lockPathForKey("consolidate-memory"), stale, stale);
+      out = await run();
+    }, { expireMs: Number.MAX_SAFE_INTEGER });
+    expect(out!.ran).toBe(false);
+    expect(out!.guard?.reason).toBe("lock-stale");
+    expect(out!.alert).toBe(true);
+    expect(out!.skippedReason).toContain("consolidate-memory");
+  });
+
+  it("forget 发生在 LLM 抽取的等待期间：写库前一刻重读审计日志，不补回（上线前代码单审 C3）", async () => {
+    const s = await buildScenario();
+    const watcher = new ForgetWatcher(env.auditPath);
+    const { chunks, fileNames } = collectCurrentChunks(env.memDir);
+    const p = planMemoryReconcile({ current: chunks, currentFileNames: fileNames, existing: await loadMemoryScopeRows(env.store), forgottenIds: new Set(watcher.set.ids) });
+    const llm = {
+      async smartExtractBatch(texts: string[]) {
+        env.auditLogger.log({ operation: "forget", scope: MEMORY_DOC_SCOPE, memoryId: s.freshId, actor: "manual", details: "forgotten while extracting" });
+        return texts.map(() => null);
+      },
+      async generateCoreSummaryBatch(texts: string[]) {
+        return texts.map(() => null);
+      },
+    } as unknown as LLMClient;
+    const res = await applyMemoryReconcile({ store: env.store, embedder: env.embedder, llm }, p, { runId: "t", journalPath: null, retireAllowed: true, forgetWatcher: watcher });
+    expect(res.insertSkippedForgotten).toBe(1);
+    expect(await env.store.getById(s.freshId)).toBeNull();
+  });
+
+  it("合并链成员提交时没恢复成：它指向的旧代表本轮不下架（上线前代码单审 N3）", async () => {
+    const s = await buildScenario();
+    const { chunks, fileNames } = collectCurrentChunks(env.memDir);
+    const p = planMemoryReconcile({ current: chunks, currentFileNames: fileNames, existing: await loadMemoryScopeRows(env.store), forgottenIds: new Set() });
+    expect(p.reactivate).toContainEqual(expect.objectContaining({ id: s.chainedId, kind: "broken-consolidation", targetRetiredThisRun: true }));
+    await patch(s.chainedId, (m) => setEvolution(m, { consolidatedInto: "some-other-row" })); // 规划后被别的写方改指向
+    const res = await applyMemoryReconcile({ store: env.store, embedder: env.embedder, llm: null }, p, { runId: "t", journalPath: null, retireAllowed: true });
+    expect(res.reactivateSkippedStateChanged).toBe(1);
+    expect(res.retireDeferredDependency).toBe(1);
+    expect((await stateOf(s.targetId)).status).toBe("active");
+    expect((await stateOf(s.oldAId)).status).toBe("archived"); // 无关的照常下
+  });
+
+  it("同一段新文字出现在两个文件、插入失败：两个文件的旧切片都不下", async () => {
+    writeMem("a.md", [["Shared", "FAILME 两个文件里都新写了同一段，嵌入失败时两边的旧切片都该等。"]]);
+    writeMem("b.md", [["Shared", "FAILME 两个文件里都新写了同一段，嵌入失败时两边的旧切片都该等。"]]);
+    const [oldA, oldB] = await seed([
+      { text: "[Shared] a.md 这一节的旧版本，现行文件里已经没有了。", file: "a.md" },
+      { text: "[Shared] b.md 这一节的旧版本，现行文件里已经没有了。", file: "b.md" },
+    ]);
+    const failing = { embedBatchPassage: async (texts: string[]) => texts.map((t) => (t.includes("FAILME") ? [] : vec(t))) };
+    const out = await run({ embedder: failing });
+    expect(out.applied).toMatchObject({ inserted: 0, insertPending: 1, retireDeferredPendingInsert: 2, retired: 0 });
+    expect((await stateOf(oldA)).status).toBe("active");
+    expect((await stateOf(oldB)).status).toBe("active");
+  });
+
+  it("forget 引擎删掉保留的那一行后：按文字指纹认出，下一轮不把同文的另一行恢复回来", async () => {
+    writeMem("a.md", [["Keep", "这一段库里有两条规范化后相同的行，用户 forget 了留下的那条。"]]);
+    const [c] = chunksOf("a.md");
+    // 两行都和现行原文差几个空白：谁的 id 都不是这段文字的确定性 id，只有文字指纹认得出
+    const [aId, bId] = await seed([
+      { text: `${c.text}   `, file: "a.md" },
+      { text: `   ${c.text}`, file: "a.md" },
+    ]);
+    const first = await run();
+    expect(first.applied).toMatchObject({ retired: 1 }); // 多余的那条以 duplicate-text 下架
+    const keeperId = (await stateOf(aId)).status === "active" ? aId : bId;
+    const siblingId = keeperId === aId ? bId : aId;
+    expect((await stateOf(siblingId)).status).toBe("archived");
+    expect(keeperId).not.toBe(deterministicId(MEMORY_DOC_SCOPE, c.text));
+    const forgot = await forgetMemory({ store: env.store, auditLogger: env.auditLogger }, { memoryId: keeperId, confirm: true, reason: "test" });
+    expect(forgot.success).toBe(true);
+    const audit = readFileSync(env.auditPath, "utf-8");
+    expect(audit).toContain(`norm=${textFingerprint(c.text)}`);
+    const again = await run();
+    expect(again.plan!.exceptionForgotten).toBe(1);
+    expect(again.applied).toMatchObject({ inserted: 0, reactivatedReconcileRetired: 0 });
+    expect((await stateOf(siblingId)).status).toBe("archived");
+  });
+
+  it("撤销也要拿三把锁：GC 正在跑就不撤（上线前代码单审）", async () => {
+    await buildScenario();
+    const out = await run();
+    await withLock("gc-run", async () => {
+      await expect(undoMemoryReconcile({ store: env.store }, out.journalPath!)).rejects.toThrow("撤销没执行");
+    });
+  });
+
+  it("撤销时合并链成员原来指向的那一行已经没了：不撤成员的恢复，免得造出断链", async () => {
+    const s = await buildScenario();
+    const out = await run();
+    expect(await stateOf(s.chainedId)).toMatchObject({ status: "active" });
+    await env.store.delete(s.targetId); // 旧代表之后被删掉（比如被 forget）
+    const undo = await undoMemoryReconcile({ store: env.store }, out.journalPath!);
+    expect(undo.skippedDependency).toEqual([s.chainedId]);
+    expect(await stateOf(s.chainedId)).toMatchObject({ status: "active", consolidatedInto: null });
+  });
+
+  it("撤销插入：插入之后被改过的行不撤", async () => {
+    const s = await buildScenario();
+    const out = await run();
+    await patch(s.freshId, (m) => setEvolution(m, { status: "pending_review" }));
+    const undo = await undoMemoryReconcile({ store: env.store }, out.journalPath!);
+    expect(undo.skippedConflict).toContain(s.freshId);
+    expect((await stateOf(s.freshId)).status).toBe("pending_review");
+  });
+
+  it("日志只有意图行（崩溃在写库与写结果之间）、尾行被截断：照样按行上的本轮标记撤回", async () => {
+    const s = await buildScenario();
+    const out = await run();
+    const lines = readFileSync(out.journalPath!, "utf-8").split("\n").filter(Boolean);
+    // 只留意图行与插入结果，删掉下架与恢复的结果行，再补一行写到一半的截断尾行
+    const kept = lines.filter((l) => { const j = JSON.parse(l); return j.phase === "intent" || j.action === "insert"; });
+    writeFileSync(out.journalPath!, kept.join("\n") + "\n" + '{"run":"x","action":"retire","id":"trunc');
+    const undo = await undoMemoryReconcile({ store: env.store }, out.journalPath!);
+    expect(undo.unparsedLines).toBe(1);
+    expect(undo.restored).toBe(5); // 三条下架 + 两条恢复，全靠意图行里的前值与行上的标记
+    expect((await stateOf(s.oldAId)).status).toBe("active");
+    expect((await stateOf(s.orphanId)).status).toBe("active");
+    expect(await stateOf(s.chainedId)).toMatchObject({ status: "consolidated", consolidatedInto: s.targetId });
   });
 
   it("不是显式路径 / 目录不存在：拒绝执行", async () => {
