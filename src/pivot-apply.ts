@@ -306,10 +306,9 @@ export async function persistPivotCandidate(
 
   // Post-write verification, synchronous on purpose: a bulk apply needs the
   // verdict inside the ledger row, not on a console later. Deliberately NOT
-  // verifyWrite(): its checkEntry expects scope/importance inside metadata,
-  // which buildStructuredMetadata-shaped rows never carry (a pre-existing
-  // mismatch its async caller silently swallows). This check asserts the claim
-  // that matters instead: the row at entry.id holds THIS candidate's content.
+  // verifyWrite(): that one only checks structural presence (vector, text,
+  // scope, importance, parseable metadata). This check asserts the claim that
+  // matters here: the row at entry.id holds THIS candidate's content.
   let verified = true;
   let verifyIssues: string[] = [];
   if ((disposition === "stored" || disposition === "updated") && deps.store.get) {

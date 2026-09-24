@@ -1,6 +1,6 @@
 /**
  * HP-2: Formation Review Pass — post-write verification.
- * After storing a memory, verify: embedding exists, metadata complete, scope set.
+ * After storing a memory, verify: embedding exists, text non-empty, scope and importance set, metadata parses.
  * Non-blocking: failures are logged but never block the write path.
  */
 
@@ -31,7 +31,8 @@ export type VerificationIssue =
   | "missing_vector"
   | "missing_scope"
   | "missing_importance"
-  | "empty_text";
+  | "empty_text"
+  | "corrupt_metadata";
 
 export interface VerificationResult {
   ok: boolean;
@@ -107,19 +108,23 @@ function checkEntry(entry: MemoryEntry | null, id: string): VerificationIssue[] 
     issues.push("empty_text");
   }
 
-  // Metadata should contain scope
+  // scope / importance 是行上的列，不在 metadata 里——buildStructuredMetadata 从不写这两个字段。
+  // 原先查 metadata，对每一次真实写入都报 missing_scope + missing_importance（agy-sync 日志
+  // 5,052 条告警里 5,051 条是它，2026-09-24 统计），真正有用的 missing_entry 被埋在里面。
+  if (typeof entry.scope !== "string" || entry.scope.trim().length === 0) {
+    issues.push("missing_scope");
+  }
+  if (typeof entry.importance !== "number" || !Number.isFinite(entry.importance)) {
+    issues.push("missing_importance");
+  }
+
+  // Metadata has to parse: every downstream reader JSON.parse()s it.
   if (entry.metadata) {
     try {
-      const meta = JSON.parse(entry.metadata);
-      if (!meta.scope) issues.push("missing_scope");
-      if (typeof meta.importance !== "number") issues.push("missing_importance");
+      JSON.parse(entry.metadata);
     } catch {
-      issues.push("missing_scope");
-      issues.push("missing_importance");
+      issues.push("corrupt_metadata");
     }
-  } else {
-    issues.push("missing_scope");
-    issues.push("missing_importance");
   }
 
   return issues;
