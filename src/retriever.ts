@@ -1,6 +1,6 @@
 /**
  * Hybrid Retrieval System
- * Combines vector search + BM25 full-text search with RRF fusion
+ * Combines vector search + BM25 full-text search with weighted score fusion
  */
 
 import type { MemoryStore, MemorySearchResult, MemoryEntry } from "./store.js";
@@ -864,7 +864,7 @@ export class MemoryRetriever {
     if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
       results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace);
     } else {
-      // Hybrid retrieval with vector + BM25 + RRF fusion (+ optional PPR graph)
+      // Hybrid retrieval with vector + BM25 weighted score fusion (+ optional PPR graph)
       results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, graph);
     }
 
@@ -1281,6 +1281,7 @@ export class MemoryRetriever {
 
     // Fuse results using weighted score fusion (async: validates BM25-only entries exist in store)
     const shortQ = isShortQuery(searchQuery);
+    // Stage name "rrf_fusion" is historical and kept for log compatibility; fuseResults() does weighted score fusion, not RRF.
     trace?.startStage("rrf_fusion", vectorResults.length + bm25Results.length + pprResults.length);
     const fusedResults = await this.fuseResults(vectorResults, bm25Results, pprResults, shortQ);
     trace?.endStage(fusedResults.length, fusedResults.map(r => r.score));

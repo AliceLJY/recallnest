@@ -104,7 +104,7 @@ Goal: make the memory base actually retrievable.
 
 Delivered:
 
-- ✅ hybrid retrieval (vector + BM25 + RRF)
+- ✅ hybrid retrieval (vector + BM25, weighted score fusion)
 - ✅ 6-channel retrieval: vector + BM25 + L0/L1/L2 multi-vector + KG graph (PPR)
 - ✅ temporal validity windows: `validAt`/`includeExpired` retrieval, expired memory demotion
 - ✅ 4 retrieval profiles (default, writing, debug, fact-check)
