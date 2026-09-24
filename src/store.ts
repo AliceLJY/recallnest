@@ -495,6 +495,75 @@ export class MemoryStore implements MemoryStorePort {
   }
 
   /**
+   * 只插入库里还不存在的 id，已存在的行一律不动（storeBatch 的 whenMatchedUpdateAll 会整行覆盖）。
+   *
+   * 给记忆文件对账用（memory-reconcile.ts）：规划时确认过「这段文字库里没有」，但规划到写入之间
+   * 别的写方（MCP / API / dream）可能已写入同一个确定性 id；覆盖会冲掉那一行的 metadata 与 evolution。
+   * 写锁内先查已存在的 id，再以 whenNotMatchedInsertAll 写入——即便查询与写入之间有别的进程绕过
+   * 写锁插入同 id，mergeInsert 也不会覆盖它。
+   */
+  async insertIfAbsent(
+    entries: (Omit<MemoryEntry, "id" | "timestamp"> & { id?: string })[],
+  ): Promise<{ inserted: string[]; skippedExisting: string[] }> {
+    if (entries.length === 0) return { inserted: [], skippedExisting: [] };
+    await this.ensureInitialized();
+
+    const byId = new Map<string, MemoryEntry>();
+    for (const entry of entries) {
+      const full: MemoryEntry = {
+        ...entry,
+        id: entry.id ?? deterministicId(entry.scope, entry.text),
+        timestamp: Date.now(),
+        metadata: entry.metadata || "{}",
+        language: entry.language || "en",
+        fts_text: entry.fts_text || entry.text,
+      };
+      const emotionResult = detectEmotionIfEnabled(full.text);
+      if (emotionResult) {
+        const meta = JSON.parse(full.metadata || "{}");
+        meta.emotion = emotionResult;
+        full.metadata = JSON.stringify(meta);
+      }
+      byId.set(full.id, full); // 同批同 id 只留最后一条
+    }
+    const candidates = [...byId.values()];
+
+    let result: { inserted: string[]; skippedExisting: string[] };
+    try {
+      result = await withWriteLock("store-write", async () => {
+        const conditions = candidates.map((e) => `id = '${escapeSqlLiteral(e.id)}'`).join(" OR ");
+        const existing = await this.table!.query().where(conditions).select(["id"]).limit(candidates.length).toArray();
+        const existingIds = new Set(existing.map((row) => row.id as string));
+        const fresh = candidates.filter((e) => !existingIds.has(e.id));
+        if (fresh.length > 0) {
+          await this.table!.mergeInsert("id").whenNotMatchedInsertAll().execute(fresh);
+        }
+        return {
+          inserted: fresh.map((e) => e.id),
+          skippedExisting: candidates.filter((e) => existingIds.has(e.id)).map((e) => e.id),
+        };
+      }, { expireMs: 30_000 });
+    } catch (err: any) {
+      const code = err.code || "";
+      const message = err.message || String(err);
+      throw new Error(
+        `Failed to insert ${candidates.length} memories in "${this.config.dbPath}": ${code} ${message}` +
+        (this.schemaMigrationError ? `\n  Schema migration failed at init: ${this.schemaMigrationError}` : "")
+      );
+    }
+    try {
+      const statsPath = this.activityStatsPath();
+      const countByScope = new Map<string, number>();
+      for (const e of candidates) {
+        if (!result.inserted.includes(e.id)) continue;
+        countByScope.set(e.scope, (countByScope.get(e.scope) ?? 0) + 1);
+      }
+      for (const [scope, n] of countByScope) await incrementWriteCount(scope, n, { statsPath });
+    } catch { /* activity tracking is best-effort */ }
+    return result;
+  }
+
+  /**
    * P0-1/P0-2/P1: Idempotent, crash-atomic write of a fully-formed entry, serialized
    * across processes.
    *
@@ -805,15 +874,17 @@ export class MemoryStore implements MemoryStorePort {
     limit?: number;
     offset?: number;
     includeVector?: boolean;
+    /** 默认 family：无冒号的 scope 按前缀匹配（"memory" 会带进 "memory:pivot"）；exact 只要全等。 */
+    scopeMatch?: ScopeMatchMode;
   } = {}): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
-    const { scopeFilter, category, limit = 1000, offset = 0, includeVector = false } = opts;
+    const { scopeFilter, category, limit = 1000, offset = 0, includeVector = false, scopeMatch = "family" } = opts;
 
     let query = this.table!.query();
 
     const conditions: string[] = [];
     if (scopeFilter && scopeFilter.length > 0) {
-      conditions.push(`((${scopeWhereClause(scopeFilter)}))`);
+      conditions.push(`((${scopeWhereClause(scopeFilter, scopeMatch)}))`);
     }
     if (category) {
       conditions.push(`category = '${escapeSqlLiteral(category)}'`);

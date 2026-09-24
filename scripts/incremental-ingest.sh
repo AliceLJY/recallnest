@@ -105,6 +105,11 @@ find "$LOG_DIR" -name "ingest-*.log" -mtime +7 -delete 2>/dev/null
 if [ "$EXIT_CODE" -eq 124 ]; then
   echo "⚠️  $(date '+%Y-%m-%d %H:%M:%S') 增量更新超时（${TIMEOUT}s），已自动终止" >> "$LOG_FILE"
   tg "RecallNest ingest 超时 ${TIMEOUT}s 被终止@$(hostname -s),日志 $LOG_SHOW"
+elif [ "$EXIT_CODE" -eq 3 ]; then
+  # 2026-09-24: 退出码 3 = 记忆文件对账要人看(没执行 / 出错 / 护栏拦下,同一原因 24 小时只报一次),
+  # 其他来源照常导入完了。单独一句话,免得和真正的导入失败混在一起(互审 R3 Kimi / Agy:报警语义要能指名)
+  echo "⚠️  $(date '+%Y-%m-%d %H:%M:%S') 增量更新完成,但记忆对账要人看(exit code: 3,见本日志 Memory: 行)" >> "$LOG_FILE"
+  tg "RecallNest 记忆对账要人看@$(hostname -s):没执行完或被护栏拦下,其他来源已照常导入。日志 $LOG_SHOW 里的 Memory: 行"
 elif [ "$EXIT_CODE" -ne 0 ]; then
   echo "❌  $(date '+%Y-%m-%d %H:%M:%S') 增量更新异常退出（exit code: ${EXIT_CODE}）" >> "$LOG_FILE"
   tg "RecallNest ingest 异常退出 exit=${EXIT_CODE}@$(hostname -s),日志 $LOG_SHOW"

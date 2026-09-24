@@ -193,7 +193,7 @@ export function formatDedupReasonSummary(result: IngestResult): string {
  * swallowing "same topic + new information" transcript chunks is worse for
  * recall fidelity than storing an incremental near-duplicate.
  */
-function normalizeDedupText(value: string): string {
+export function normalizeDedupText(value: string): string {
   return value
     .replace(/^\[(用户|助手)\]\s*/gm, "")
     .replace(/\s+/g, " ")
@@ -518,7 +518,7 @@ function fallbackExtraction(text: string): SmartExtraction {
  * Uses LLM 6-category extraction when available, falls back to heuristic.
  * Returns: category + L0 + L1 + importance for each text.
  */
-async function smartExtractBatch(
+export async function smartExtractBatch(
   texts: string[],
   llm?: LLMClient | null,
 ): Promise<SmartExtraction[]> {
@@ -547,7 +547,7 @@ function isCoreSummaryEnabled(): boolean {
  * Only runs when RECALLNEST_CORE_SUMMARY=true and LLM is available.
  * Returns null array when disabled (no overhead).
  */
-async function generateCoreSummaries(
+export async function generateCoreSummaries(
   texts: string[],
   llm?: LLMClient | null,
 ): Promise<(string | null)[]> {
@@ -717,7 +717,7 @@ function initialTier(extraction: Pick<SmartExtraction, "category" | "importance"
   return "peripheral";
 }
 
-function buildIngestedEntry(params: {
+export function buildIngestedEntry(params: {
   source: string;
   scope: string;
   text: string;
@@ -1913,7 +1913,7 @@ export async function ingestGeminiSessions(
  * Split a markdown file by headings (## or #) into chunks.
  * Each chunk includes the heading + content under it.
  */
-function parseMarkdown(filePath: string): Array<{ text: string; heading: string }> {
+export function parseMarkdown(filePath: string): Array<{ text: string; heading: string }> {
   const content = readFileSync(filePath, "utf-8");
   const chunks: Array<{ text: string; heading: string }> = [];
 

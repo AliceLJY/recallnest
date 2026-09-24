@@ -716,7 +716,12 @@ fi
 # INGEST_ALERT_BY_CALLER=1:让 ingest 自己不发 TG(它只记一行日志),由本脚本汇总成一条发——同一次失败只响一次(2026-09-17 owner 定)
 INGEST_ALERT_BY_CALLER=1 bash "$PULL_HOME/recallnest/scripts/incremental-ingest.sh"
 INGEST_RC=$?
-if [ "$INGEST_RC" -ne 0 ]; then
+if [ "$INGEST_RC" -eq 3 ]; then
+  # 2026-09-24: 3 = 记忆文件对账要人看(没执行 / 出错 / 护栏拦下;同一原因 24 小时只报一次,去抖在对账那头做),
+  # 其他来源照常导入完了——正文单独说清,别和导入失败混成一句
+  set_failure "$INGEST_RC" "❌ 记忆对账要人看 exit=3（没执行完或被护栏拦下,其他来源已照常导入;看 ~/recallnest/logs/ingest-$(date +%Y-%m-%d).log 的 Memory: 行）"
+  INGEST_FAILED=1
+elif [ "$INGEST_RC" -ne 0 ]; then
   # 2026-09-17: incremental-ingest.sh 同日起以真实退出码退出(此前尾句 find 永远给 0),这里第一次能看见它失败;
   # 真正的报错在 ingest 自己的日志里,TG 正文指过去
   set_failure "$INGEST_RC" "❌ ingest 失败 exit=${INGEST_RC}（124=超时 2h,详见 ~/recallnest/logs/ingest-$(date +%Y-%m-%d).log）"

@@ -205,6 +205,18 @@ export const embeddingTimeoutMs = (): number | undefined => {
   return Number.isFinite(n) && n > 0 ? n : undefined;
 };
 
+/**
+ * 记忆文件对账（memory-reconcile.ts）单轮下架上限，覆盖默认的 max(300, 活跃文档切片数的 25%)。
+ * 首轮存量清理用 `reconcile-memory --max-retire` 放行更合适；这个变量留给「某台部署想长期调严 / 调松」。
+ * 未设 / 空 / 非有限数 / 负数 → undefined，走默认公式；0 是合法值（本部署只插入不下架）。
+ */
+export const memoryReconcileMaxRetire = (): number | undefined => {
+  const raw = process.env.RECALLNEST_MEMORY_RECONCILE_MAX_RETIRE;
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : undefined;
+};
+
 // --- Raw env values (caller validates / clamps / falls back to config) ---
 
 export const recallModeRaw = (): string | undefined => process.env.RECALLNEST_RECALL_MODE;
