@@ -127,20 +127,22 @@ export const layerAdmissionMin = (): number => {
 
 /**
  * 流行度信号怎么进排序：
- *   legacy  — 默认，现行为逐字节不变：访问计数加成、热度混合（hotnessWeight）、频次加成三环，各自截在 1.0
- *   bounded — 三环都不跑；链尾一步 score × (1 + popularityBonusMax · h)，h = min(1, log2(1+evolution.accessCount)/5)，
+ *   bounded — 默认（2026-09-25 起，Alice 看过正式 shadow 后拍板切）：三环都不跑；链尾一步
+ *             score × (1 + popularityBonusMax · h)，h = min(1, log2(1+evolution.accessCount)/5)，
  *             只加不减、这一环不截平（检索器内部按原值排序，retrieve() 出口才截到 1）；下游「给全文」档用 0.80
- * 切默认是生产行为变更，要 Alice 拍板。
+ *   legacy  — 只在显式设 `legacy` 时走：切默认之前的行为逐字节不变（访问计数加成、热度混合、频次加成三环，各自截在 1.0）。
+ *             切回旧行为只要在 mcp.env 里加这一行。
  */
 export const popularityRanking = (): "legacy" | "bounded" =>
-  process.env.RECALLNEST_POPULARITY_RANKING === "bounded" ? "bounded" : "legacy";
+  process.env.RECALLNEST_POPULARITY_RANKING === "legacy" ? "legacy" : "bounded";
 
 /**
  * trigger 那一路不做长度归一：以 trigger 分为底走一遍与正文相同的前置环节，长度归一后取两路较大。
- * trigger 独自带入或主导的宿主两路相同，等于免长度归一。默认关。
+ * trigger 独自带入或主导的宿主两路相同，等于免长度归一。默认开（2026-09-25 起），只有显式设 `false` 才关，
+ * 同 RECALLNEST_TRIGGER_RECALL 的写法。
  */
 export const triggerLengthExempt = (): boolean =>
-  process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT === "true";
+  process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT !== "false";
 
 /**
  * 下游「给全文」那一档的分数线（adaptive 全文、resume_context 折叠视图 L2）。
