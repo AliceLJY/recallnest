@@ -1,7 +1,7 @@
 /**
  * 排序上把相关度与流行度拆开（第二步 plan v2.1，open-loops「RecallNest 检索评分链」症状 C）。
  *
- * 两个默认关的开关：
+ * 两个开关（2026-09-25 起默认都开，Alice 看过正式 shadow 后拍板；显式设 legacy / false 回到切默认之前的行为）：
  *   RECALLNEST_POPULARITY_RANKING=bounded —— 三个流行度加成合成链尾一步 ×(1+γh)、只加不减、不截平，
  *                                           retrieve() 出口才截到 1；下游「给全文」档 0.80
  *   RECALLNEST_TRIGGER_LENGTH_EXEMPT=true —— trigger 那一路走完前置环节、不做长度归一，与正文那一路取大
@@ -50,7 +50,8 @@ afterEach(() => {
 });
 
 const bounded = () => { process.env.RECALLNEST_POPULARITY_RANKING = "bounded"; };
-const legacy = () => { delete process.env.RECALLNEST_POPULARITY_RANKING; };
+const legacy = () => { process.env.RECALLNEST_POPULARITY_RANKING = "legacy"; };
+const lenExemptOff = () => { process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT = "false"; };
 
 const NOW = Date.parse("2026-09-25T00:00:00.000Z");
 const DAY = 86_400_000;
@@ -156,21 +157,28 @@ function captureRaw(retriever: ReturnType<typeof createRetriever>): Map<string, 
 // ---------------------------------------------------------------------------
 
 describe("1 · 开关默认值", () => {
-  it("环境变量不设：legacy / false / 0.85；设了才生效；乱写回落默认", () => {
-    expect(envConfig.popularityRanking()).toBe("legacy");
-    expect(envConfig.triggerLengthExempt()).toBe(false);
-    expect(envConfig.fullTextScoreThreshold()).toBe(0.85);
-
-    process.env.RECALLNEST_POPULARITY_RANKING = "bounded";
-    process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT = "true";
+  it("环境变量不设：bounded / 开 / 0.80（2026-09-25 切默认）；显式 legacy / false 才回旧行为；乱写回落默认", () => {
     expect(envConfig.popularityRanking()).toBe("bounded");
     expect(envConfig.triggerLengthExempt()).toBe(true);
     expect(envConfig.fullTextScoreThreshold()).toBe(0.8);
 
-    process.env.RECALLNEST_POPULARITY_RANKING = "Bounded";
-    process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT = "1";
+    process.env.RECALLNEST_POPULARITY_RANKING = "legacy";
+    process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT = "false";
     expect(envConfig.popularityRanking()).toBe("legacy");
     expect(envConfig.triggerLengthExempt()).toBe(false);
+    expect(envConfig.fullTextScoreThreshold()).toBe(0.85);
+
+    // 切默认之前就显式写成开启值的配置，切了之后照样是开
+    process.env.RECALLNEST_POPULARITY_RANKING = "bounded";
+    process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT = "true";
+    expect(envConfig.popularityRanking()).toBe("bounded");
+    expect(envConfig.triggerLengthExempt()).toBe(true);
+
+    // 只认精确的关闭值（同 RECALLNEST_TRIGGER_RECALL 的写法）：大小写不对、写成 0 都回落默认
+    process.env.RECALLNEST_POPULARITY_RANKING = "Legacy";
+    process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT = "0";
+    expect(envConfig.popularityRanking()).toBe("bounded");
+    expect(envConfig.triggerLengthExempt()).toBe(true);
   });
 });
 
@@ -357,6 +365,8 @@ describe("5c · 返回条目的 sources 键集合与改前一致", () => {
       out.map((r) => ({ id: r.entry.id, top: Object.keys(r.sources).sort(), trigger: r.sources.trigger ? Object.keys(r.sources.trigger).sort() : null }))
         .sort((a, b) => a.id.localeCompare(b.id));
 
+    legacy();
+    lenExemptOff();
     const base = keysOf(await search(retriever));
     // 钉死改前（origin/main）的形状，不只做三种模式之间互比——互比抓不到「所有模式都多了同一个字段」（实现互审 Codex）
     expect(base).toEqual([
@@ -395,12 +405,13 @@ describe("开关 2 · RECALLNEST_TRIGGER_LENGTH_EXEMPT", () => {
 
   it("7 · 开：trigger 独自带入的长宿主不打折（与同底分的短条目一样），没有 trigger 的长条目照常打折；关：两者都打折", async () => {
     const { host, control, longVec, retriever } = scene();
+    legacy(); // 只看开关 2
     process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT = "true";
     const on = byId(await search(retriever));
     expect(on.get(host.id)!.score).toBe(on.get(control.id)!.score);
     expect(on.get(longVec.id)!.score).toBeLessThan(on.get(control.id)!.score);
 
-    delete process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT;
+    lenExemptOff();
     const off = byId(await search(retriever));
     expect(off.get(host.id)!.score).toBeLessThan(off.get(control.id)!.score);
     expect(off.get(host.id)!.score).toBe(off.get(longVec.id)!.score);
@@ -408,6 +419,7 @@ describe("开关 2 · RECALLNEST_TRIGGER_LENGTH_EXEMPT", () => {
 
   it("7b · 单调：当日新存（新近度不为 0）的 1600 字宿主、trigger 0.80，向量分 0.70→0.99 终分不下降；trigger 0.99 的 durable 宿主在高分区也不下降", async () => {
     setSystemTime(new Date(NOW));
+    legacy(); // 只看开关 2
     process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT = "true";
     const durableMeta = JSON.parse(
       buildStructuredMetadata({ source: "manual", tags: [], capture: "test", category: "events", canonicalKey: "key-7b" }),
@@ -448,6 +460,7 @@ describe("开关 2 · RECALLNEST_TRIGGER_LENGTH_EXEMPT", () => {
   });
 
   it("7c · hybrid 路径：trigger 那一路以 0.9×trigger 分为底（与 applyTriggerFloor 同口径）", async () => {
+    legacy(); // 只看开关 2
     process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT = "true";
     const host = mem("hhhhhhhh-0000-4000-8000-00000000007c", [0, 0, 1], { text: LONG_1600 });
     const control = mem("cccccccc-0000-4000-8000-00000000007c", [1, 0, 0]); // 短正文、向量分 = 0.9 × 0.8
@@ -460,7 +473,7 @@ describe("开关 2 · RECALLNEST_TRIGGER_LENGTH_EXEMPT", () => {
     } as never);
     const on = byId(await search(retriever));
     expect(on.get(host.id)!.score).toBeCloseTo(on.get(control.id)!.score, 12);
-    delete process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT;
+    lenExemptOff();
     const off = byId(await search(retriever));
     expect(off.get(host.id)!.score).toBeLessThan(off.get(control.id)!.score);
   });
@@ -526,6 +539,10 @@ describe("8 · 真实临时 LanceDB", () => {
     const out = await run();
     expect(ids(out)[0]).toBe(host.id);
     expect(ids(out)).toContain(old.id);
+    // 生产默认路径：两个变量都不设（2026-09-25 切默认之后就是这样跑的）
+    delete process.env.RECALLNEST_POPULARITY_RANKING;
+    delete process.env.RECALLNEST_TRIGGER_LENGTH_EXEMPT;
+    expect(ids(await run())[0]).toBe(host.id);
   });
 });
 
@@ -553,6 +570,7 @@ describe("9 · 全文档跟着流行度模式走", () => {
     }) as unknown as RetrievalResult;
 
   it("adaptive：0.82 在 legacy 下给片段、bounded 下给全文；Mode 行印出的阈值跟着变", () => {
+    legacy();
     const l = formatCollapsedResults([result(0.82)], { query: "分数", profile: "default" } as never);
     expect(l).toContain("[SNIP]");
     expect(l).toContain("full text for score ≥ 0.85,");
@@ -567,6 +585,7 @@ describe("9 · 全文档跟着流行度模式走", () => {
   it("折叠视图：默认配置下 0.82 legacy 是 L1、bounded 是 L2；调用方显式传 thresholds 的不受模式影响；导出的默认常量不变", () => {
     const item = { entryId: "e", text: "正文", score: 0.82, timestamp: NOW };
     const explicit = { thresholds: { l2: 0.9, l1: 0.6, l0: 0.5 } };
+    legacy();
     expect(collapseResults([item])[0].renderLevel).toBe("L1");
     expect(collapseResults([item], explicit)[0].renderLevel).toBe("L1");
     bounded();
