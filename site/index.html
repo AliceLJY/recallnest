@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>RecallNest — one memory for every AI client</title>
-<meta name="description" content="RecallNest is a local-first memory layer that Claude Code, Codex, Kimi and Antigravity all read and write. Context saved in one window can be recalled in another, even on another machine.">
+<title>RecallNest — shared memory layer for AI clients</title>
+<meta name="description" content="RecallNest is a local-first memory layer backed by LanceDB. Claude Code, Codex, Kimi and Antigravity read and write one store over MCP and an HTTP API; sessions checkpoint on exit and restore context on start.">
 <meta name="theme-color" content="#0b0907">
 <meta property="og:type" content="website">
-<meta property="og:title" content="RecallNest — one memory for every AI client">
-<meta property="og:description" content="A local-first memory layer that Claude Code, Codex, Kimi and Antigravity all read and write. MIT, MCP + HTTP.">
+<meta property="og:title" content="RecallNest — shared memory layer for AI clients">
+<meta property="og:description" content="A local-first memory layer shared by Claude Code, Codex, Kimi and Antigravity over MCP and an HTTP API. MIT-licensed.">
 <meta property="og:url" content="https://aliceljy.github.io/recallnest/">
 <meta property="og:image" content="https://aliceljy.github.io/recallnest/og.jpg">
 <meta property="og:image:width" content="1200">
@@ -34,9 +34,9 @@
   <span class="client">Codex</span>
   <span class="client">Kimi</span>
   <span class="client">Antigravity</span>
-  <span class="client"><span class="zh">豆包桌面版</span><span class="en">Doubao desktop</span></span>
+  <span class="client"><span class="zh">豆包桌面端</span><span class="en">Doubao desktop</span></span>
   <span class="client"><span class="zh">脚本 · 定时任务</span><span class="en">scripts · cron</span></span>
-  <span class="client"><span class="zh">手机</span><span class="en">phone</span></span>
+  <span class="client"><span class="zh">移动端</span><span class="en">mobile</span></span>
 </div>
 
 <header class="bar">
@@ -51,58 +51,58 @@
 </header>
 
 <nav class="dots" aria-label="Sections">
-  <a href="#hero" title="RecallNest" aria-label="RecallNest"></a><a href="#scattered" title="01 · 散落 Scattered" aria-label="01 Scattered"></a><a href="#store" title="02 · 汇成一份 One store" aria-label="02 One store"></a><a href="#woven" title="03 · 编进巢里 Woven in" aria-label="03 Woven in"></a><a href="#recall" title="04 · 唤回 Recall" aria-label="04 Recall"></a><a href="#decay" title="05 · 该淡的会淡 Fading on purpose" aria-label="05 Fading on purpose"></a><a href="#home" title="06 · 回到同一个巢 Back to one nest" aria-label="06 Back to one nest"></a><a href="#install" title="07 · 装上试试 Try it" aria-label="07 Try it"></a>
+  <a href="#hero" title="RecallNest" aria-label="RecallNest"></a><a href="#scattered" title="01 · 问题 Problem" aria-label="01 Problem"></a><a href="#store" title="02 · 架构 Architecture" aria-label="02 Architecture"></a><a href="#woven" title="03 · 记忆模型 Memory model" aria-label="03 Memory model"></a><a href="#recall" title="04 · 检索 Retrieval" aria-label="04 Retrieval"></a><a href="#decay" title="05 · 生命周期 Lifecycle" aria-label="05 Lifecycle"></a><a href="#home" title="06 · 会话连续性 Session continuity" aria-label="06 Session continuity"></a><a href="#releases" title="07 · 版本演进 Release history" aria-label="07 Release history"></a><a href="#failures" title="08 · 失败记录 Failure log" aria-label="08 Failure log"></a><a href="#install" title="09 · 安装 Installation" aria-label="09 Installation"></a>
 </nav>
 
 <main>
   <section id="hero">
     <div class="copy">
-      <p class="kicker"><span class="zh">RecallNest · 给 AI 客户端用的共享记忆层 · MIT 开源</span><span class="en">RecallNest · shared memory for AI clients · MIT-licensed</span></p>
-      <h1><span class="zh">每个 AI 窗口，<br>都记得上一个窗口。</span><span class="en">Every AI window remembers the last one.</span></h1>
-      <p class="lede"><span class="zh">RecallNest 是一层本地优先的共享记忆：Claude Code、Codex、Kimi、Antigravity 读写同一个记忆库。新开一个窗口，上个会话里定下的事还在。记忆库放在你自己的机器上，别的机器走 ssh 连过来。</span><span class="en">RecallNest is a local-first memory layer that Claude Code, Codex, Kimi and Antigravity all read and write. Open a new window and what you settled in the last session is still there. The store lives on your own machine; other machines reach it over ssh.</span></p>
+      <p class="kicker"><span class="zh">RecallNest · AI 客户端共享记忆层 · MIT 许可</span><span class="en">RecallNest · shared memory layer for AI clients · MIT-licensed</span></p>
+      <h1><span class="zh">跨 AI 客户端<br>共享的长期记忆层</span><span class="en">A persistent memory layer shared across AI clients</span></h1>
+      <p class="lede"><span class="zh">RecallNest 以 LanceDB 为存储，通过 MCP（stdio）与 HTTP API 向 Claude Code、Codex、Kimi、Antigravity 等客户端提供统一的读写接口。会话结束时写入检查点，新会话启动时恢复上下文；存储位于本机，其他主机通过 ssh 接入同一存储。</span><span class="en">RecallNest stores memory in LanceDB and exposes one read/write interface over MCP (stdio) and an HTTP API to Claude Code, Codex, Kimi, Antigravity and other clients. Sessions checkpoint on exit and restore context on start; the store stays on your machine, and other machines reach it over ssh.</span></p>
       <p class="actions">
-        <a class="btn primary" href="https://github.com/AliceLJY/recallnest"><span class="zh">在 GitHub 上看</span><span class="en">View on GitHub</span></a>
-        <a class="btn" href="#install"><span class="zh">怎么装</span><span class="en">Install</span></a>
+        <a class="btn primary" href="https://github.com/AliceLJY/recallnest"><span class="zh">查看 GitHub 仓库</span><span class="en">View on GitHub</span></a>
+        <a class="btn" href="#install"><span class="zh">安装说明</span><span class="en">Installation</span></a>
       </p>
-      <p class="hint" aria-hidden="true"><span class="zh">往下滚</span><span class="en">Scroll</span></p>
+      <p class="hint" aria-hidden="true"><span class="zh">向下滚动</span><span class="en">Scroll</span></p>
     </div>
   </section>
 
   <section id="scattered">
     <div class="copy">
-      <p class="step">01 · <span class="zh">散落</span><span class="en">Scattered</span></p>
-      <h2><span class="zh">每开一个新窗口，它就失忆一次。</span><span class="en">Every new window forgets everything.</span></h2>
-      <p><span class="zh">项目配置、调试时拍板的决定、谁是谁——散落在各个客户端各自的会话里，彼此看不见。</span><span class="en">Project configs, decisions made while debugging, who is who — scattered across each client's own sessions, invisible to one another.</span></p>
+      <p class="step">01 · <span class="zh">问题</span><span class="en">Problem</span></p>
+      <h2><span class="zh">会话之间没有共享上下文</span><span class="en">No shared context between sessions</span></h2>
+      <p><span class="zh">项目配置、调试过程中的决策、实体映射分散在各客户端各自的会话记录里：新会话读不到，其他工具也看不到。</span><span class="en">Project configuration, debugging decisions and entity mappings live in each client's own session history: a new session cannot read them, and other tools cannot see them.</span></p>
     </div>
   </section>
 
   <section id="store">
     <div class="copy">
-      <p class="step">02 · <span class="zh">汇成一份</span><span class="en">One store</span></p>
-      <h2><span class="zh">一个记忆库，所有客户端共读共写。</span><span class="en">One store. Every client reads and writes it.</span></h2>
-      <p><span class="zh">命令行 agent 和支持 MCP 的桌面 app 走 MCP（stdio）；只会发 HTTP 的脚本走 HTTP API；手机走只读网关。换到另一台机器，把启动命令换成 ssh，就和家里那台共用同一份。</span><span class="en">CLI agents and MCP-capable desktop apps connect over MCP (stdio); scripts that only speak HTTP use the HTTP API; a phone goes through a read-only gateway. On another machine, swap the launch command for ssh and it shares the same store.</span></p>
+      <p class="step">02 · <span class="zh">架构</span><span class="en">Architecture</span></p>
+      <h2><span class="zh">单一存储，多协议接入</span><span class="en">One store, several ways in</span></h2>
+      <p><span class="zh">命令行 agent 与支持 MCP 的桌面应用通过 MCP（stdio）接入；仅支持 HTTP 的脚本与定时任务调用 HTTP API；移动端经只读网关访问；远程主机将启动命令替换为 ssh，即可共享同一存储。</span><span class="en">CLI agents and MCP-capable desktop apps connect over MCP (stdio); scripts and cron jobs that only speak HTTP call the HTTP API; mobile clients go through a read-only gateway; a remote host replaces the launch command with ssh and shares the same store.</span></p>
       <ul class="chips">
         <li><span class="zh">44 个 MCP 工具</span><span class="en">44 MCP tools</span></li>
         <li><span class="zh">21 个 HTTP 端点</span><span class="en">21 HTTP endpoints</span></li>
         <li><span class="zh">LanceDB 本地存储</span><span class="en">LanceDB, on your machine</span></li>
-        <li><span class="zh">Jina v5 向量 · 1024 维</span><span class="en">Jina v5 embeddings · 1024-dim</span></li>
+        <li><span class="zh">Jina v5 嵌入 · 1024 维</span><span class="en">Jina v5 embeddings · 1024-dim</span></li>
       </ul>
     </div>
   </section>
 
   <section id="woven">
     <div class="copy">
-      <p class="step">03 · <span class="zh">编进巢里</span><span class="en">Woven in</span></p>
-      <h2><span class="zh">不是一堆日志，是分好类的记忆。</span><span class="en">Not a pile of logs. Memory, sorted.</span></h2>
-      <p><span class="zh">每条记忆归进 6 类：身份、偏好、实体、事件、案例、模式。每条都存三种粒度——一句话、要点、全文，召回时按相关度和 token 预算挑一层给你。同一个判断被修订时，新版接替旧版，旧版留作历史。</span><span class="en">Every memory lands in one of six categories — profile, preferences, entities, events, cases, patterns — and is kept at three granularities: one line, key points, full text. Recall picks the layer that fits the relevance and the token budget. When a judgment is revised, the new version supersedes the old one, which stays as history.</span></p>
+      <p class="step">03 · <span class="zh">记忆模型</span><span class="en">Memory model</span></p>
+      <h2><span class="zh">六类记忆、三级粒度、版本链</span><span class="en">Six categories, three granularities, version chains</span></h2>
+      <p><span class="zh">每条记忆归入六个类别之一：profile、preferences、entities、events、cases、patterns，并存储三级粒度（单句摘要、要点、全文）；检索时按相关度与 token 预算选择返回层级。同一结论的修订以 supersede 链记录，旧版本作为历史保留。</span><span class="en">Each memory belongs to one of six categories — profile, preferences, entities, events, cases, patterns — and is stored at three granularities: one-line summary, key points, full text. Retrieval picks the layer by relevance and token budget. Revisions of the same conclusion form a supersede chain, with earlier versions kept as history.</span></p>
     </div>
   </section>
 
   <section id="recall">
     <div class="copy">
-      <p class="step">04 · <span class="zh">唤回</span><span class="en">Recall</span></p>
-      <h2><span class="zh">问一句，相关的自己浮上来。</span><span class="en">Ask once. What matters rises.</span></h2>
-      <p><span class="zh">默认走向量检索，需要时再打开 BM25 全文、多粒度向量和知识图谱。每条记忆写入时还能附 2–6 句「以后会怎么问起它」，单独嵌入、只管召回，不当证据。</span><span class="en">Vector search by default; turn on BM25, multi-granularity vectors and a knowledge graph when you need them. A memory can carry 2–6 "how will I ask about this later" phrasings — embedded separately, used only for recall, never shown as evidence.</span></p>
+      <p class="step">04 · <span class="zh">检索</span><span class="en">Retrieval</span></p>
+      <h2><span class="zh">默认向量检索，可选混合检索</span><span class="en">Vector search by default, hybrid on demand</span></h2>
+      <p><span class="zh">默认使用向量检索；可启用 BM25 全文检索、L0/L1/L2 多粒度向量与知识图谱（PPR）。写入时可为每条记忆附加 2–6 条触发语句（triggers），独立嵌入、仅用于召回，不作为证据返回。</span><span class="en">Vector search by default; BM25 full-text, L0/L1/L2 multi-granularity vectors and a knowledge graph (PPR) can be enabled. At write time a memory can carry 2–6 trigger phrasings, embedded separately and used only for recall, never returned as evidence.</span></p>
       <figure class="sample">
         <pre><span class="q">Query   : deploy rollback</span>
 Hits    : 5
@@ -112,48 +112,91 @@ Hits    : 5
    [assistant] Rolled back to the previous image and pinned the digest so the next…
    prov : evidence/transcript-ingest
    imgs : 52 agent-made in this session · read sess=dca70d4a</pre>
-        <figcaption><span class="zh">README 里的召回示例</span><span class="en">Recall output, from the README</span></figcaption>
+        <figcaption><span class="zh">召回输出示例（摘自 README）</span><span class="en">Sample recall output (from the README)</span></figcaption>
       </figure>
     </div>
   </section>
 
   <section id="decay">
     <div class="copy">
-      <p class="step">05 · <span class="zh">该淡的会淡</span><span class="en">Fading on purpose</span></p>
-      <h2><span class="zh">会遗忘，也知道什么不能忘。</span><span class="en">It forgets — and knows what not to.</span></h2>
-      <p><span class="zh">记忆沿 Weibull 曲线衰减，重要度调节半衰期。模式类不按时间衰减；钉住的、7 天内用过的、核心且重要度 ≥ 0.95 的也不衰减。从会话记录里抓来的片段只算证据，要升格成你做过的决定，得另过一道要证据的关。</span><span class="en">Memories decay along a Weibull curve, with importance shaping the half-life. Patterns are exempt from time decay, and so are pinned memories, anything used in the last 7 days, and core memories with importance ≥ 0.95. Fragments pulled from transcripts stay evidence; becoming a decision you actually made is a separate, gated step.</span></p>
+      <p class="step">05 · <span class="zh">生命周期</span><span class="en">Lifecycle</span></p>
+      <h2><span class="zh">Weibull 衰减与豁免规则</span><span class="en">Weibull decay with explicit exemptions</span></h2>
+      <p><span class="zh">记忆按 Weibull 曲线随时间衰减，半衰期由重要度调节。patterns 类别不做时间衰减；置顶（pinned）、7 天内被访问过、核心层且重要度 ≥ 0.95 的记忆同样豁免。从会话记录中提取的片段停留在证据层，升级为持久记忆需经过单独的、附带证据要求的晋升步骤。</span><span class="en">Memories decay along a Weibull curve, with importance shaping the half-life. The patterns category is exempt from time decay, as are pinned memories, memories accessed in the last 7 days, and core memories with importance ≥ 0.95. Fragments extracted from transcripts stay in the evidence layer; promotion to durable memory is a separate, gated step with its own evidence requirement.</span></p>
     </div>
   </section>
 
   <section id="home">
     <div class="copy">
-      <p class="step">06 · <span class="zh">回到同一个巢</span><span class="en">Back to one nest</span></p>
-      <h2><span class="zh">下个窗口打开时，交接已经在等你。</span><span class="en">The next window opens to a handoff.</span></h2>
-      <p><span class="zh">退出时 <code>checkpoint_session</code> 记下这一段的决定和待办，新窗口里调一次 <code>resume_context</code> 就接上。召回的状态只当交接参考，不会冒充仓库此刻的样子。</span><span class="en">On exit, <code>checkpoint_session</code> records the decisions and open loops; in the next window, one <code>resume_context</code> call picks them up. Recalled state is a handoff, never a claim about what the repo looks like right now.</span></p>
+      <p class="step">06 · <span class="zh">会话连续性</span><span class="en">Session continuity</span></p>
+      <h2><span class="zh">检查点与上下文恢复</span><span class="en">Checkpoints and context restore</span></h2>
+      <p><span class="zh">会话结束时，<code>checkpoint_session</code> 记录本次的决策与待办；新会话中调用 <code>resume_context</code> 即可恢复。恢复的状态仅作为交接参考，不代表仓库的当前状态。</span><span class="en">On exit, <code>checkpoint_session</code> records the session's decisions and open loops; in a new session, <code>resume_context</code> restores them. Restored state is a handoff reference, not a statement about the repository's current state.</span></p>
+    </div>
+  </section>
+
+  <section id="releases" class="reading">
+    <div class="copy">
+      <p class="step">07 · <span class="zh">版本演进</span><span class="en">Release history</span></p>
+      <h2><span class="zh">13 个标签版本，<br>514 次提交</span><span class="en">13 tagged releases, 514 commits</span></h2>
+      <p><span class="zh">按时间列出 CHANGELOG 记录的主要版本与关键改动，日期取自 git 提交记录。</span><span class="en">Major versions recorded in the CHANGELOG, oldest first, with their key changes. Dates come from the git history.</span></p>
+      <ol class="log">
+        <li class="major"><p class="when">v1.0 · 2026-03-03</p><p><span class="zh"><b>初始版本。</b>对 Claude Code 会话记录做向量检索；LanceDB 存储，Jina 生成嵌入，命令行使用。</span><span class="en"><b>Initial release.</b> Vector search over Claude Code transcripts; LanceDB storage, Jina embeddings, a command-line interface.</span></p></li>
+        <li><p class="when">v1.1 · 2026-03-06</p><p><span class="zh"><b>混合检索、MCP 与工作台。</b>向量与 BM25 关键词混合检索，权重可配置；MCP server 首批提供 9 个工具；本地 Web 工作台。</span><span class="en"><b>Hybrid retrieval, MCP and a workbench.</b> Vector plus BM25 keyword retrieval with configurable weights; an MCP server with 9 tools; a local web workbench.</span></p></li>
+        <li><p class="when">v1.2 · 2026-03-08</p><p><span class="zh"><b>首个可分发版本。</b>目标：新用户从 git clone 到第一条检索结果不超过 15 分钟。新增 <code>lm doctor</code> 预检、<code>lm demo</code> 与 CI；Jina key 无效时在导入开始前报错。</span><span class="en"><b>First distributable release.</b> Target: from git clone to a first search result in 15 minutes. Adds the <code>lm doctor</code> pre-flight check, <code>lm demo</code> and CI; an invalid Jina key now fails before ingest begins.</span></p></li>
+        <li class="major"><p class="when">v2.1 – v2.2 · 2026-04-11</p><p><span class="zh"><b>引入记忆研究中的机制。</b>依据记忆哲学的 9 个研究维度完成五项改造，包括情绪感知衰减、四级隐私与级联遗忘、建构式检索；随后补齐研究扫描指出的三处引擎缺口：置信度加权、干扰检测与主动遗忘、时间有效期。</span><span class="en"><b>Mechanisms from memory research.</b> Five changes derived from nine research dimensions in the philosophy of memory, among them emotion-aware decay, four privacy tiers with cascade forgetting, and constructive retrieval; then three engine gaps found by a research scan: confidence weighting, interference detection with active forgetting, and validity windows.</span></p></li>
+        <li><p class="when">v2.3 · 2026-04-14</p><p><span class="zh"><b>接入外部数据源。</b>Connector-v1 JSON 标准与 Obsidian 库导入；每个数据源导入时写入心跳，超过 7 天告警、超过 30 天报错。</span><span class="en"><b>External data sources.</b> The Connector-v1 JSON standard and Obsidian vault ingestion; every source writes a heartbeat on ingest, with a warning after 7 days and an error after 30.</span></p></li>
+        <li><p class="when">v2.5.0 – v2.5.2 · 2026-05-27</p><p><span class="zh"><b>技能记录接入使用反馈。</b>首次实际调用 <code>store_skill → workflow_observe → retrieve_skill</code> 即返回 skill_not_found：查询只接受完整 UUID，返回给 agent 的却是 8 位前缀。统一 ID 后成功计数开始累加；技能类型收窄为说明文档，schema 不再暗示 RecallNest 会执行技能。</span><span class="en"><b>Skill records receive real outcomes.</b> The first real <code>store_skill → workflow_observe → retrieve_skill</code> run returned skill_not_found: lookup accepted only full UUIDs, while agents were shown 8-character prefixes. With ids reconciled, the success count began to move; skill types were narrowed to runbooks, so the schema no longer implies that RecallNest executes them.</span></p></li>
+        <li><p class="when">v2.5.3 · 2026-05-29</p><p><span class="zh"><b>诊断工具与失效功能。</b>一轮多 agent 审查发现：诊断工具在生产库上给出虚假的健康结论，三个功能完全失效，检索分数的显示失去区分度。修复后，真实库上检出的矛盾 0 → 174、重复 0 → 1,473。</span><span class="en"><b>Diagnostics and dead features.</b> A multi-agent review found diagnostics reporting false health on the production store, three features that never worked, and score displays that no longer discriminated. After the fix, the real store showed contradictions 0 → 174 and duplicates 0 → 1,473.</span></p></li>
+        <li><p class="when">v2.5.4 · 2026-07-17</p><p><span class="zh"><b>发布边界。</b>npm 包改为严格白名单；发布前与 CI 中检查实际打包内容，环境文件、日志、会话、数据库或密钥材料一旦进包即失败；凭证扫描只报告路径与行号。</span><span class="en"><b>Package boundary.</b> A strict file whitelist for the npm package; the actual tarball is checked before publishing and in CI, failing on env files, logs, sessions, databases or key material; the credential scan reports only path and line.</span></p></li>
+        <li><p class="when">v2.6.0 · 2026-08-13</p><p><span class="zh"><b>跨进程一致性与分发。</b>默认启用强读一致性，长驻进程无需重启即可读到其他进程的写入；脚本不再悄悄打开第二个数据库；从 Claude Code 插件市场安装即注册 MCP server。</span><span class="en"><b>Cross-process consistency and distribution.</b> Strong read consistency by default, so long-lived processes see other processes&#8217; writes without a restart; scripts no longer silently open a second database; installing from the Claude Code marketplace registers the MCP server.</span></p></li>
+        <li class="major"><p class="when">v3.0.0 · 2026-08-24</p><p><span class="zh"><b>Node 22；合成结论可进入稳定记忆。</b>诊断发现合成记忆的结论密度低于其输入（人工整理的记录 40.4%，合成洞察 14.4%）。合成改为可弃权的契约，写库前校验；新增 <code>promote_synthesis</code>，证据充分的结论可晋升为稳定记忆。MCP 工具 43 → 44。</span><span class="en"><b>Node 22; synthesized conclusions reach stable memory.</b> A diagnostic found synthesized memories less conclusive than their input (40.4% for hand-written records, 14.4% for synthesized insights). Synthesis now follows a contract that may abstain and is validated before writing; <code>promote_synthesis</code> lets a well-evidenced conclusion become stable memory. MCP tools 43 → 44.</span></p></li>
+        <li><p class="when">v3.0.1 · 2026-09-06</p><p><span class="zh"><b>发布卫生。</b>源码中移除本机路径与用户名，测试不再随 npm 包发布：357 个文件 / 965.8 kB → 189 个文件 / 620.0 kB；新增可选的嵌入请求超时。</span><span class="en"><b>Publication hygiene.</b> Machine-local paths and usernames removed from the tree, and tests no longer ship in the npm package: 357 files / 965.8 kB → 189 files / 620.0 kB; an opt-in timeout for embedding requests.</span></p></li>
+        <li><p class="when">main · 2026-09-25</p><p><span class="zh"><b>相关度优先于流行度（未发版）。</b>三层叠加的流行度加成改为链尾一次加分，上限 +20%：501 个已知答案的查询中，目标排第一的从 190 个增至 474 个。记忆文件改为与当前文件对账：在生产库快照上回放 625 条真实查询，返回过期片段的查询 133 → 0。</span><span class="en"><b>Relevance before popularity (unreleased).</b> Three stacked popularity stages became one bonus at the end of the chain, capped at +20%: of 501 queries with a known answer, the target now ranks first in 474, up from 190. Memory files are reconciled against the current files: replaying 625 real queries on a production snapshot, those returning a stale slice went from 133 to 0.</span></p></li>
+      </ol>
+      <p class="note"><span class="zh">完整记录见 <a href="https://github.com/AliceLJY/recallnest/blob/main/CHANGELOG.md">CHANGELOG.md</a>。</span><span class="en">The full record is in <a href="https://github.com/AliceLJY/recallnest/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</span></p>
+    </div>
+  </section>
+
+  <section id="failures" class="reading">
+    <div class="copy">
+      <p class="step">08 · <span class="zh">失败记录</span><span class="en">Failure log</span></p>
+      <h2><span class="zh">九次故障：<br>现象、根因与修复</span><span class="en">Nine failures: symptom, cause, fix</span></h2>
+      <p><span class="zh">以下九次故障摘自 CHANGELOG，按时间排列；数字均为维护者本机生产库上的实测。</span><span class="en">Nine failures from the CHANGELOG, oldest first; every figure was measured on the maintainer&#8217;s own production store.</span></p>
+      <ol class="log">
+        <li><p class="when">v2.5.3 · 2026-05-29</p><p><span class="zh"><b>三个功能静默失效。</b><code>distill_session</code> 每次调用都抛出 ReferenceError；<code>ingest --no-llm</code> 仍全程调用 LLM；工具输出压缩在字母 z 处误截断。<span class="k">根因</span>引用了未声明的变量；commander 把 <code>--no-llm</code> 解析为 <code>options.llm=false</code>，代码读的却是 <code>options.noLlm</code>；<code>\z</code> 在 JavaScript 正则中不是锚点。<span class="k">修复</span>三处分别更正。</span><span class="en"><b>Three features silently dead.</b> <code>distill_session</code> threw a ReferenceError on every call; <code>ingest --no-llm</code> still called the LLM throughout; the tool-output compressor cut at a literal letter z. <span class="k">Cause</span>an undeclared variable; commander parses <code>--no-llm</code> as <code>options.llm=false</code>, while the code read <code>options.noLlm</code>; <code>\z</code> is not an anchor in JavaScript regular expressions. <span class="k">Fix</span>each corrected at the source.</span></p></li>
+        <li><p class="when">v2.5.3 · 2026-05-29</p><p><span class="zh"><b>诊断工具在空向量上报告健康。</b><code>memory_lint</code> 与 <code>data_checkup</code> 报告 0 条矛盾、0 条重复。<span class="k">根因</span><code>store.list()</code> 出于性能返回空向量，相似度恒为 0；测试 mock 返回了向量，与生产行为不一致，问题因此没有被测出。<span class="k">修复</span>检查前补回真实向量，mock 改为复现生产行为；真实库上检出矛盾 0 → 174、重复 0 → 1,473。</span><span class="en"><b>Diagnostics reported health on empty vectors.</b> <code>memory_lint</code> and <code>data_checkup</code> reported 0 contradictions and 0 duplicates. <span class="k">Cause</span><code>store.list()</code> returns empty vectors for performance, so every similarity was 0; the test mocks returned vectors, unlike production, which is why the tests passed. <span class="k">Fix</span>real vectors are loaded before checking, and the mocks now mirror production; on the real store, contradictions 0 → 174 and duplicates 0 → 1,473.</span></p></li>
+        <li><p class="when">v3.0.0 · 2026-08-24</p><p><span class="zh"><b>合成记忆的结论少于输入。</b>dream 生成的洞察结论密度为 14.4%，低于原始会话记录的 25.1%；2,427 条洞察全部是事件摘要；28 条记忆的正文是它自己的系统提示词。<span class="k">根因</span>洞察使用分块摘要提示词，从不要求结论，也无法弃权；写库前只检查回复长度是否小于 5。<span class="k">修复</span>改用可弃权的合成契约，写库前逐项校验。</span><span class="en"><b>Synthesis produced fewer conclusions than its input.</b> Insights from dream scored 14.4% conclusion density against 25.1% for raw transcripts; all 2,427 insight rows were episode summaries; 28 memories held their own system prompt as their body. <span class="k">Cause</span>insights used a chunk-summarizer prompt that never asked for a conclusion and could not abstain; the only pre-write check was a response length under 5. <span class="k">Fix</span>a synthesis contract that may abstain, validated field by field before writing.</span></p></li>
+        <li><p class="when">v3.0.0 · 2026-08-24</p><p><span class="zh"><b>限流响应触发请求风暴。</b>面对要求降速的端点，5 秒内发出 61,724 次请求。<span class="k">根因</span>超长重试会分块并递归；短文本分块后原样返回，同一错误反复出现；判断超长的正则同时匹配了限流提示中的 exceeded。<span class="k">修复</span>无法缩短输入时直接报错，分块后的请求不再进入同一分支：4 毫秒、1 次请求。该问题由新增的 HTTP 契约测试发现，此前的测试都替换了 SDK，从未经过网络层。</span><span class="en"><b>A rate-limit reply triggered a request storm.</b> Against an endpoint asking the client to slow down, 61,724 requests went out in five seconds. <span class="k">Cause</span>the context-length retry chunked and recursed; short text came back from chunking unchanged and reproduced the same error; and the length check&#8217;s regex also matched the word &#8220;exceeded&#8221; in rate-limit replies. <span class="k">Fix</span>chunking that cannot shrink its input now throws, and a chunk&#8217;s request cannot re-enter the branch: 4 ms, one request. The new HTTP contract tests found it; every earlier test had stubbed the SDK and never touched a socket.</span></p></li>
+        <li><p class="when">v3.0.0 · 2026-08-24</p><p><span class="zh"><b>一次从未生效的调参。</b>2026-07-16 将 <code>candidatePoolSize</code> 调到 30，没有产生任何效果。<span class="k">根因</span>两路候选都会经过 <code>store.ts</code> 中的上限 20，这一限制自首个提交起就存在，而那次调参只改了检索器。<span class="k">处理</span>写入文档，参数保持不动：扩大候选池已于 2026-08-22 实测并否决。</span><span class="en"><b>A tuning that never took effect.</b> <code>candidatePoolSize</code> was raised to 30 on 2026-07-16 and had no effect. <span class="k">Cause</span>both candidate legs pass through a limit of 20 in <code>store.ts</code>, present since the first commit, while the tuning touched only the retriever. <span class="k">Handling</span>documented and deliberately left alone: widening the candidate pool was measured and rejected on 2026-08-22.</span></p></li>
+        <li><p class="when">v3.0.1 · 2026-09-06</p><p><span class="zh"><b>嵌入重试叠加成 90 分钟停顿。</b>端点无响应时，一次 <code>embedPassage</code> 调用会发出 9 次请求，最坏约 90 分钟。<span class="k">根因</span>SDK 自身重试两次，<code>Embedder</code> 再重试两次，叠加 SDK 默认的 600 秒超时。<span class="k">修复</span>新增可选超时，默认行为不变。统一调低默认值的方案被否决：长文档的批量嵌入本来就慢，会让正常的导入失败。</span><span class="en"><b>Embedding retries stacked into a 90-minute stall.</b> Against an endpoint that never answers, one <code>embedPassage</code> call issued 9 requests, about 90 minutes in the worst case. <span class="k">Cause</span>the SDK retries twice and <code>Embedder</code> twice more, on top of the SDK&#8217;s 600-second default timeout. <span class="k">Fix</span>an opt-in timeout, with the default unchanged. Lowering the default for everyone was rejected: bulk embedding of long documents is legitimately slow, and working ingests would fail.</span></p></li>
+        <li><p class="when">main · 2026-09-08</p><p><span class="zh"><b>子 agent 的任务说明被当作用户发言。</b>Codex 子 agent 的会话按用户对话导入：它们占 Codex 会话文件的 45.6%，在所有标为 user 的轮次中占 46.7%。<span class="k">根因</span>按 <code>role</code> 字段判断发言者，而子 agent 会话里的 user 轮次是父 agent 写的任务说明。<span class="k">修复</span>首行带 <code>parent_thread_id</code> 的会话整体跳过；发言者改由结构字段判断，不看 <code>role</code>。</span><span class="en"><b>Subagent briefs ingested as the user speaking.</b> Codex subagent sessions were ingested as user conversation: 45.6% of Codex rollout files, holding 46.7% of all turns marked as user. <span class="k">Cause</span>the speaker was decided from <code>role</code>, while a subagent&#8217;s user turns are its parent agent&#8217;s task briefs. <span class="k">Fix</span>sessions whose first line carries <code>parent_thread_id</code> are skipped whole; the speaker is decided from structural fields, not from <code>role</code>.</span></p></li>
+        <li><p class="when">main · 2026-09-24</p><p><span class="zh"><b>记忆文件导入只追加、不对账。</b>68% 的活跃文档片段与任何现行文本都对不上；回放 625 条真实查询，21% 返回了过期片段，其中 35 条排在第一。<span class="k">根因</span>导入只追加，新版本又被去重闸挡在库外；分块在 UTF-16 代理对中间切开，有一段文字始终匹配不上自己那一行。<span class="k">修复</span>全局对账，软下架、写日志、可撤销；生产库上插入 673 段、恢复 16 条断链、下架 5,455 段。</span><span class="en"><b>Memory-file ingest only appended.</b> 68% of active document slices matched no current text; replaying 625 real queries, 21% returned a stale slice, 35 of them at rank 1. <span class="k">Cause</span>ingest only appended, and the dedup gate kept new versions out; the chunker split a UTF-16 surrogate pair, so one paragraph never matched its own row. <span class="k">Fix</span>a global reconcile with soft retirement, a journal and undo; in production, 673 slices inserted, 16 broken chains restored, 5,455 retired.</span></p></li>
+        <li><p class="when">main · 2026-09-25</p><p><span class="zh"><b>流行度压过相关度。</b>几分钟前存入的记忆，用它自己的触发语句检索只排第 9；501 个案例中，目标在触发召回之后 99% 排第一，经过评分链后只剩 38%。<span class="k">根因</span>访问次数、热度、频次三层流行度加成叠加，每层都截到 1.0，主要来自频次加成。<span class="k">修复</span>合并为链尾一次加分，上限 +20%，排第一的案例 190 → 474；设为 <code>legacy</code> 可逐字节恢复旧输出。</span><span class="en"><b>Popularity outranked relevance.</b> A memory stored minutes earlier ranked 9th when searched with its own trigger; across 501 cases the target was first in 99% right after trigger recall and in 38% after the scoring chain. <span class="k">Cause</span>three stacked popularity stages (access count, hotness, frequency), each clamped at 1.0, mostly the frequency boost. <span class="k">Fix</span>one bonus at the end of the chain, capped at +20%: first place 190 → 474; <code>legacy</code> restores the old output byte for byte.</span></p></li>
+      </ol>
+      <p class="note"><span class="zh">检索失败案例另按固定模板（查询、预期、实际、假设）记录在 <a href="https://github.com/AliceLJY/recallnest/blob/main/FAILURES.md">FAILURES.md</a>。</span><span class="en">Retrieval misses are logged separately in <a href="https://github.com/AliceLJY/recallnest/blob/main/FAILURES.md">FAILURES.md</a>, each with query, expected, actual and hypothesis.</span></p>
     </div>
   </section>
 
   <section id="install">
     <div class="copy">
-      <p class="step">07 · <span class="zh">装上试试</span><span class="en">Try it</span></p>
-      <h2><span class="zh">在 Claude Code 里两行装好。</span><span class="en">Two lines in Claude Code.</span></h2>
+      <p class="step">09 · <span class="zh">安装</span><span class="en">Installation</span></p>
+      <h2><span class="zh">以 Claude Code 插件安装</span><span class="en">Install as a Claude Code plugin</span></h2>
       <pre class="cmd">/plugin marketplace add AliceLJY/recallnest
 /plugin install recallnest@AliceLJY</pre>
-      <p><span class="zh">或者用 npm：</span><span class="en">Or with npm:</span></p>
+      <p><span class="zh">或通过 npm：</span><span class="en">Or via npm:</span></p>
       <pre class="cmd">npx recallnest --help</pre>
-      <p class="note"><span class="zh">需要 Bun 或 Node.js 22+，以及一个 Jina API key（用来生成向量）。</span><span class="en">Needs Bun or Node.js 22+, plus a Jina API key for embeddings.</span></p>
+      <p class="note"><span class="zh">运行环境：Bun 或 Node.js 22+；需要 Jina API key（用于生成嵌入向量）。</span><span class="en">Requires Bun or Node.js 22+ and a Jina API key for embeddings.</span></p>
       <ul class="facts">
         <li>v3.0.1</li>
         <li>MIT</li>
-        <li><span class="zh">2,600 条测试全部通过</span><span class="en">2,600 tests passing</span></li>
+        <li><span class="zh">2,600 项测试通过</span><span class="en">2,600 tests passing</span></li>
         <li><span class="zh">44 个 MCP 工具</span><span class="en">44 MCP tools</span></li>
       </ul>
       <p class="actions">
-        <a class="btn primary" href="https://github.com/AliceLJY/recallnest"><span class="zh">在 GitHub 上看</span><span class="en">View on GitHub</span></a>
+        <a class="btn primary" href="https://github.com/AliceLJY/recallnest"><span class="zh">查看 GitHub 仓库</span><span class="en">View on GitHub</span></a>
         <a class="btn" href="https://github.com/AliceLJY/recallnest/blob/main/README_CN.md"><span class="zh">中文 README</span><span class="en">README in Chinese</span></a>
       </p>
       <footer>
-        <p><span class="zh">RecallNest 由小试AI（<a href="https://aliceljy.github.io/">AliceLJY</a>）与 Claude Code、Codex 协作完成，起点是 CortexReach 的 <a href="https://github.com/CortexReach/memory-lancedb-pro">memory-lancedb-pro</a>（@win4r）。本页是滚动驱动的粒子，没有用生成的图片或视频。</span><span class="en">Built by 小试AI (<a href="https://aliceljy.github.io/">AliceLJY</a>) together with Claude Code and Codex; it started as a fork of CortexReach's <a href="https://github.com/CortexReach/memory-lancedb-pro">memory-lancedb-pro</a> (@win4r). This page is scroll-driven particles — no generated images or video.</span></p>
+        <p><span class="zh">RecallNest 由小试AI（<a href="https://aliceljy.github.io/">AliceLJY</a>）与 Claude Code、Codex 协作开发，源自 CortexReach 的 <a href="https://github.com/CortexReach/memory-lancedb-pro">memory-lancedb-pro</a>（@win4r）。本页为滚动驱动的 WebGL 粒子动画，未使用生成图像或视频。</span><span class="en">Developed by 小试AI (<a href="https://aliceljy.github.io/">AliceLJY</a>) in collaboration with Claude Code and Codex; forked from CortexReach's <a href="https://github.com/CortexReach/memory-lancedb-pro">memory-lancedb-pro</a> (@win4r). This page is a scroll-driven WebGL particle animation; no generated images or video were used.</span></p>
       </footer>
     </div>
   </section>

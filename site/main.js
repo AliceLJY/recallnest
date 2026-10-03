@@ -9,6 +9,7 @@
   var still = params.has('still') || reduceQuery.matches;
   var canvas = document.getElementById('field');
   var labelEls = Array.prototype.slice.call(document.querySelectorAll('#labels .client'));
+  var releaseEls = [];
   var sections = Array.prototype.slice.call(document.querySelectorAll('main > section'));
   var dots = Array.prototype.slice.call(document.querySelectorAll('.dots a'));
   var BEATS = sections.map(function (s) { return s.id; });
@@ -31,7 +32,9 @@
   });
 
   // ---------- layout and scroll mapping ----------
-  function isPortrait() { return window.innerWidth < 760 || window.innerWidth / window.innerHeight < 0.9; }
+  // the promo video sets window.__RN_VIDEO__ before loading this file and drives frames itself
+  var VIDEO = window.__RN_VIDEO__ || null;
+  function isPortrait() { return VIDEO ? true : window.innerWidth < 760 || window.innerWidth / window.innerHeight < 0.9; }
 
   var anchors = [], textTops = [], headerBottom = 64;
   function measure() {
@@ -40,6 +43,8 @@
     // where each section's copy starts while it is stuck (portrait layout puts the scene above it)
     textTops = sections.map(function (s) {
       var copy = s.querySelector('.copy');
+      // a reading section scrolls its list over the whole screen, so the shade covers all of it
+      if (s.classList.contains('reading')) return 0;
       if (!copy || getComputedStyle(copy).position !== 'sticky' || !copy.firstElementChild) return null;
       return copy.firstElementChild.offsetTop;
     });
@@ -96,7 +101,13 @@
   var strandParams = [];
   var TAU = Math.PI * 2;
   var CAT_PATTERNS = 5;
-  var F_PINNED = 1, F_HIT = 2, F_BEAM = 4, F_RECENT = 8;
+  var F_PINNED = 1, F_HIT = 2, F_BEAM = 4, F_RECENT = 8, F_KNOT = 16;
+  // tagged releases in order (git tag --sort=creatordate); spaced by sequence, not by date
+  var RELEASES = ['v1.1.0', 'v1.2.0', 'v1.3.0', 'v1.4.0', 'v2.0.0', 'v2.2.1', 'v2.3.0', 'v2.4.0', 'v2.5.3', 'v2.5.4', 'v2.6.0', 'v3.0.0', 'v3.0.1'];
+  var MILESTONES = { 'v1.1.0': 1, 'v2.0.0': 1, 'v2.6.0': 1, 'v3.0.0': 1, 'v3.0.1': 1 };
+  var PORTRAIT_LABELS = { 'v1.1.0': 1, 'v2.0.0': 1, 'v3.0.1': 1 };
+  // one ring per failure listed in #failures (the video page has no list, and shows the same nine)
+  var FAILURE_COUNT = document.querySelectorAll('#failures .log li').length || 9;
 
   function initParticles(count) {
     N = count;
@@ -137,6 +148,7 @@
         if (rand() < 0.06) f |= F_PINNED;
         if (rand() < 0.08) f |= F_RECENT;
       }
+      if (rnd[i * 8 + 5] < 0.3 && !(f & (F_HIT | F_BEAM))) f |= F_KNOT;
       flags[i] = f;
       meta[i * 4] = rnd[i * 8];
       // integer part: category; fractional part: brightness of the strand this particle sits on
@@ -195,7 +207,7 @@
     out[0] = center[0] + x2; out[1] = center[1] + y2; out[2] = center[2] + z1;
   }
 
-  var SHAPES = 8, shapes = [], layout = '';
+  var SHAPES = 10, shapes = [], layout = '', releasePoints = [];
 
   function buildShapes() {
     layout = isPortrait() ? 'portrait' : 'landscape';
@@ -265,17 +277,45 @@
         shapes[6][j + 2] = sz0 + (hc[2] - sz0) * su + gauss(jr) * 0.02;
       }
 
-      // 7 install: the nest again, a little smaller
-      shapes[7][j] = shapes[0][j]; shapes[7][j + 1] = shapes[0][j + 1]; shapes[7][j + 2] = shapes[0][j + 2];
+      // 7 releases: a double helix along the release sequence; knot particles gather at each tagged release
+      var RN = RELEASES.length, axisL = port ? 1.55 : 1.9;
+      if (f & F_KNOT) {
+        var kr = Math.min(RN - 1, Math.floor(rnd[r + 6] * RN)), big = MILESTONES[RELEASES[kr]] ? 0.1 : 0.065;
+        var kp = -axisL + 2 * axisL * kr / (RN - 1);
+        var g0 = gauss(jr) * big, g1 = gauss(jr) * big, g2 = gauss(jr) * big;
+        if (port) { shapes[7][j] = kp + g0; shapes[7][j + 1] = g1; } else { shapes[7][j] = g0; shapes[7][j + 1] = kp + g1; }
+        shapes[7][j + 2] = g2;
+      } else {
+        var hu = rnd[r + 1], ha = hu * TAU * 5 + (rnd[r + 2] < 0.5 ? 0 : Math.PI), hr = 0.16 + gauss(jr) * 0.012;
+        var hp = -axisL * 1.04 + 2 * axisL * 1.04 * hu;
+        if (port) { shapes[7][j] = hp; shapes[7][j + 1] = hr * Math.cos(ha); } else { shapes[7][j] = hr * Math.cos(ha); shapes[7][j + 1] = hp; }
+        shapes[7][j + 2] = hr * Math.sin(ha);
+      }
+
+      // 8 failures: one ring per documented failure, with the fix as a bright centre
+      var cols = port ? 3 : 3, rows = Math.ceil(FAILURE_COUNT / cols), fi = Math.min(FAILURE_COUNT - 1, Math.floor(rnd[r + 7] * FAILURE_COUNT));
+      var gx = (fi % cols) - (cols - 1) / 2, gy = (rows - 1) / 2 - Math.floor(fi / cols), cell = port ? 0.95 : 0.9;
+      var fcx = gx * cell, fcy = gy * cell * (port ? 0.8 : 1);
+      if (f & F_KNOT) {
+        shapes[8][j] = fcx + gauss(jr) * 0.045; shapes[8][j + 1] = fcy + gauss(jr) * 0.045; shapes[8][j + 2] = gauss(jr) * 0.045;
+      } else {
+        var fa = TAU * rnd[r + 3], frr = 0.27 + gauss(jr) * 0.018;
+        shapes[8][j] = fcx + frr * Math.cos(fa); shapes[8][j + 1] = fcy + frr * Math.sin(fa); shapes[8][j + 2] = gauss(jr) * 0.03;
+      }
+
+      // 9 install: the nest again
+      shapes[9][j] = shapes[0][j]; shapes[9][j + 1] = shapes[0][j + 1]; shapes[9][j + 2] = shapes[0][j + 2];
     }
+    var axisL2 = port ? 1.55 : 1.9;
+    releasePoints = RELEASES.map(function (v, k) { var t = -axisL2 + 2 * axisL2 * k / (RELEASES.length - 1); return port ? [t, -0.32, 0] : [0.42, t, 0]; });
     api.layout = layout;
   }
 
   // ---------- camera ----------
   var CAM = {
-    rx: [0.36, 0.12, 0.30, 0.52, 0.30, 0.55, 1.05, 0.36],
-    ry: [0.00, 0.00, 0.25, 0.55, 0.15, 0.60, 0.00, 0.35],
-    dist: [6.0, 7.6, 6.9, 6.0, 6.6, 6.0, 7.4, 7.0]
+    rx: [0.36, 0.12, 0.30, 0.52, 0.30, 0.55, 1.05, 0.10, 0.18, 0.36],
+    ry: [0.00, 0.00, 0.25, 0.55, 0.15, 0.60, 0.00, 0.00, 0.00, 0.35],
+    dist: [6.0, 7.6, 6.9, 6.0, 6.6, 6.0, 7.4, 7.2, 6.4, 7.0]
   };
 
   function perspective(fovy, aspect, near, far) {
@@ -305,7 +345,7 @@
   var gl, prog, loc = {}, shapeBufs = [], metaBuf, boundA = -1, boundB = -1;
   var VS = [
     'attribute vec3 aA; attribute vec3 aB; attribute vec4 aM;',
-    'uniform mat4 uMVP; uniform float uMix, uTime, uWobble, uSize, uDPR, uPointerOn, uHit, uBeam, uDecay, uTint, uDim, uFade;',
+    'uniform mat4 uMVP; uniform float uMix, uTime, uWobble, uSize, uDPR, uPointerOn, uHit, uBeam, uDecay, uTint, uDim, uFade, uKnot, uFail;',
     'uniform vec2 uOffset, uPointer;',
     'varying vec3 vColor; varying float vAlpha;',
     'float flag(float f, float b) { return mod(floor(f / b), 2.0); }',
@@ -320,7 +360,7 @@
     '  float near = uPointerOn * smoothstep(0.16, 0.0, distance(ndc, uPointer));',
     '  clip.xy += normalize(ndc - uPointer + 1e-4) * near * 0.03 * clip.w;',
     '  gl_Position = clip;',
-    '  float pinned = flag(aM.w, 1.0), hit = flag(aM.w, 2.0), beam = flag(aM.w, 4.0), recent = flag(aM.w, 8.0);',
+    '  float pinned = flag(aM.w, 1.0), hit = flag(aM.w, 2.0), beam = flag(aM.w, 4.0), recent = flag(aM.w, 8.0), knot = flag(aM.w, 16.0);',
     '  float cat = floor(aM.y), sb = fract(aM.y);',
     '  vec3 ivory = vec3(0.945, 0.91, 0.855);',
     '  vec3 amber = vec3(1.0, 0.678, 0.353);',
@@ -336,9 +376,12 @@
     '  float keep = mix(0.1 + 0.9 * exp(-pow(aM.z / 0.55, 1.6)), 1.0, ex);',
     '  alpha *= mix(1.0, keep, uDecay);',
     '  col = mix(col, amber, pinned * uDecay * 0.7);',
+    '  col = mix(col, amber * 1.05, knot * uKnot);',
+    '  alpha = mix(alpha, min(1.0, alpha * 1.7), knot * uKnot);',
+    '  col = mix(col, vec3(0.56, 0.83, 0.91), (1.0 - knot) * uFail * 0.8);',
     '  alpha *= uFade * (1.0 - 0.5 * uDim);',
     '  alpha = min(1.0, alpha + near * 0.3);',
-    '  float size = uSize * (0.75 + 0.6 * fract(seed * 13.7)) * (1.0 + hit * uHit * 0.9 + pinned * uDecay * 0.7);',
+    '  float size = uSize * (0.75 + 0.6 * fract(seed * 13.7)) * (1.0 + hit * uHit * 0.9 + pinned * uDecay * 0.7 + knot * uKnot * 0.5);',
     '  gl_PointSize = max(1.0, size * uDPR * (6.0 / clip.w));',
     '  vColor = col; vAlpha = alpha;',
     '}'
@@ -371,7 +414,7 @@
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
     gl.useProgram(prog);
     ['aA', 'aB', 'aM'].forEach(function (n) { loc[n] = gl.getAttribLocation(prog, n); gl.enableVertexAttribArray(loc[n]); });
-    ['uMVP', 'uMix', 'uTime', 'uWobble', 'uSize', 'uDPR', 'uOffset', 'uPointer', 'uPointerOn', 'uHit', 'uBeam', 'uDecay', 'uTint', 'uDim', 'uFade']
+    ['uMVP', 'uMix', 'uTime', 'uWobble', 'uSize', 'uDPR', 'uOffset', 'uPointer', 'uPointerOn', 'uHit', 'uBeam', 'uDecay', 'uTint', 'uDim', 'uFade', 'uKnot', 'uFail']
       .forEach(function (n) { loc[n] = gl.getUniformLocation(prog, n); });
     metaBuf = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, metaBuf);
@@ -420,17 +463,17 @@
   function weight(b) { return Math.max(0, 1 - Math.abs(state.g - b)); }
 
   function draw(now) {
-    var p = progressAt(window.scrollY || window.pageYOffset || 0);
-    state.g = p.g; state.raw = p.raw;
+    if (VIDEO) { state.g = api.videoG || 0; state.raw = state.g; }
+    else { var p = progressAt(window.scrollY || window.pageYOffset || 0); state.g = p.g; state.raw = p.raw; }
     var a = Math.min(SHAPES - 1, Math.floor(state.g)), b = Math.min(SHAPES - 1, a + 1), mix = state.g - a;
     var e = smooth(0, 1, mix);
     var port = layout === 'portrait';
-    var t = (now - start) / 1000;
+    var t = VIDEO ? (api.videoT || 0) : (now - start) / 1000;
     var moving = !still;
     pointer.sx += (pointer.x - pointer.sx) * 0.08; pointer.sy += (pointer.y - pointer.sy) * 0.08;
     var rx = CAM.rx[a] + (CAM.rx[b] - CAM.rx[a]) * e;
     var ry = CAM.ry[a] + (CAM.ry[b] - CAM.ry[a]) * e;
-    var dist = (CAM.dist[a] + (CAM.dist[b] - CAM.dist[a]) * e) * (port ? 1.85 : 1);
+    var dist = (CAM.dist[a] + (CAM.dist[b] - CAM.dist[a]) * e) * (port ? (VIDEO && VIDEO.distScale ? VIDEO.distScale : 1.85) : 1);
     if (moving) {
       ry += 0.06 * Math.sin(t * 0.13) + (port ? 0 : pointer.sx * 0.08);
       rx += 0.02 * Math.sin(t * 0.11) - (port ? 0 : pointer.sy * 0.05);
@@ -438,8 +481,8 @@
     var off = [0.34, 0.02];
     if (port) {
       var ta = textTops[a], tb = textTops[b];
-      var ya = ta == null ? 0.27 : Math.min(0.42, Math.max(0.2, 1 - (headerBottom + ta) / H));
-      var yb = tb == null ? 0.27 : Math.min(0.42, Math.max(0.2, 1 - (headerBottom + tb) / H));
+      var ya = ta == null ? (VIDEO ? VIDEO.lift : 0.27) : Math.min(0.42, Math.max(0.2, 1 - (headerBottom + ta) / H));
+      var yb = tb == null ? (VIDEO ? VIDEO.lift : 0.27) : Math.min(0.42, Math.max(0.2, 1 - (headerBottom + tb) / H));
       off = [0, ya + (yb - ya) * e];
       var fa = ta == null ? H * 0.5 : ta, fb = tb == null ? H * 0.5 : tb;
       var fade = Math.round(fa + (fb - fa) * e);
@@ -455,7 +498,7 @@
       gl.uniform1f(loc.uMix, mix);
       gl.uniform1f(loc.uTime, moving ? t : 0);
       gl.uniform1f(loc.uWobble, moving ? 1 : 0);
-      gl.uniform1f(loc.uSize, port ? 3.3 : 2.8);
+      gl.uniform1f(loc.uSize, VIDEO ? VIDEO.size : (port ? 3.3 : 2.8));
       gl.uniform1f(loc.uDPR, dpr);
       gl.uniform2f(loc.uOffset, off[0], off[1]);
       gl.uniform2f(loc.uPointer, pointer.sx, pointer.sy);
@@ -464,25 +507,46 @@
       gl.uniform1f(loc.uBeam, weight(4));
       gl.uniform1f(loc.uDecay, weight(5));
       gl.uniform1f(loc.uTint, Math.max(weight(3), weight(4), weight(5)));
-      gl.uniform1f(loc.uDim, weight(7));
+      // phones scroll the reading sections' lists over the scene, so it steps back there
+      var dimRead = 0;
+      if (port && !VIDEO) for (var ri = 0; ri < sections.length; ri++) if (sections[ri].classList.contains('reading')) dimRead = Math.max(dimRead, weight(ri));
+      gl.uniform1f(loc.uDim, Math.max(weight(9), dimRead));
+      gl.uniform1f(loc.uKnot, Math.max(weight(7), weight(8)));
+      gl.uniform1f(loc.uFail, weight(8));
       gl.uniform1f(loc.uFade, still ? 1 : smooth(0, 0.9, t));
       gl.drawArrays(gl.POINTS, 0, N);
     }
 
     // client labels: in "scattered" and "home"
-    var w1 = weight(1), w6 = weight(6), lw = Math.max(w1, w6);
+    // labels appear only once their beat dominates, so two label sets never share a transition
+    var w1 = weight(1), w6 = weight(6), lw = smooth(0.5, 1, Math.max(w1, w6));
     var clients = port ? CLIENTS_PORT : CLIENTS_LAND;
+    // widths are read once per frame, before any label is moved, so the clamp below costs one style pass
+    var halfW = lw > 0.01 ? labelEls.map(function (e) { return e.offsetWidth / 2; }) : null;
     for (var c = 0; c < labelEls.length; c++) {
       var el = labelEls[c];
       if (lw <= 0.01 || !api.gl) { if (el.style.opacity !== '0') el.style.opacity = '0'; continue; }
       var anchor = w1 >= w6
         ? [clients[c][0], clients[c][1] - (port ? 0.5 : 0.62), clients[c][2]]
-        : [homeCenters[c][0] * (port ? 1.28 : 1), 0, homeCenters[c][2] + (port ? 0.3 : 0.36)];
+        : [homeCenters[c][0] * (port ? (VIDEO && VIDEO.labelSpread ? VIDEO.labelSpread : 1.28) : 1), 0, homeCenters[c][2] + (port ? 0.3 : 0.36)];
       var q = project(mvp, anchor, off);
       var x = (q[0] + 1) / 2 * W, y = (1 - q[1]) / 2 * H;
-      var edge = Math.min(1, Math.max(0, Math.min(x - 8, W - x - 8, y - 70, H - y - 8) / 40));
+      // keep the whole label inside the frame horizontally; vertically it still fades at the edges
+      x = Math.max(halfW[c] + 12, Math.min(W - halfW[c] - 12, x));
+      var edge = Math.min(1, Math.max(0, Math.min(y - 70, H - y - 8) / 40));
       el.style.opacity = String(Math.round(lw * edge * 100) / 100);
       el.style.transform = 'translate(' + Math.round(x) + 'px,' + Math.round(y) + 'px) translate(-50%, -50%)';
+    }
+
+    // release labels in the "releases" beat; on phones the list itself names the versions, so only the video shows milestones
+    var w7 = smooth(0.5, 1, weight(7));
+    for (var k = 0; k < releaseEls.length; k++) {
+      var re = releaseEls[k], show = w7 > 0.01 && api.gl && (!port || (VIDEO && PORTRAIT_LABELS[RELEASES[k]]));
+      if (!show) { if (re.style.opacity !== '0') re.style.opacity = '0'; continue; }
+      var rq = project(mvp, releasePoints[k], off);
+      var lx = (rq[0] + 1) / 2 * W, ly = (1 - rq[1]) / 2 * H;
+      re.style.opacity = String(Math.round(w7 * 100) / 100);
+      re.style.transform = 'translate(' + Math.round(lx) + 'px,' + Math.round(ly) + 'px) translate(' + (port ? '-50%, 0' : '0, -50%') + ')';
     }
 
     var on = Math.round(state.raw);
@@ -518,7 +582,9 @@
   canvas.addEventListener('webglcontextrestored', function () { api.gl = initGL(); requestDraw(); });
 
   // ---------- start ----------
-  initParticles(isPortrait() ? 11000 : 24000);
+  var labelBox = document.getElementById('labels');
+  RELEASES.forEach(function (v) { var el = document.createElement('span'); el.className = 'client ver' + (MILESTONES[v] ? ' major' : ''); el.textContent = v; labelBox.appendChild(el); releaseEls.push(el); });
+  initParticles(VIDEO ? VIDEO.count : (isPortrait() ? 11000 : 24000));
   api.count = N;
   buildShapes();
   try { api.gl = initGL(); } catch (err) { api.gl = false; if (window.console) console.warn(err); }
@@ -526,5 +592,10 @@
   resize();
   var v = params.get('view');
   if (v) { if ('scrollRestoration' in history) history.scrollRestoration = 'manual'; jumpTo(v); }
-  requestAnimationFrame(loop);
+  if (VIDEO) {
+    api.renderAt = function (g, t) { api.videoG = g; api.videoT = t; draw(0); };
+    api.ready = true;
+  } else {
+    requestAnimationFrame(loop);
+  }
 })();
