@@ -83,25 +83,26 @@ Do not rely on memory when retrieval quality changes. Add an entry, then update 
 
 <!--
 2026-05-13 batch — 下面 11 条由 session-jsonl grep 抽样得到，覆盖最近 30 天 CC sessions
-Gap 分布: capture×5, retrieval×3, composition×2, checkpoint×1
+Gap 分布: capture×6, retrieval×2, composition×2, checkpoint×1（2026-10-04 按各条 Hypothesis 订正；原记 capture×5、retrieval×3）
 印证 Codex ROI 第一步先盯 capture gap：用户从未明说"记一下"的隐性事实根本没进库才是核心痛点，而非 retrieval 算法问题
 全部 Eval Case Added = no，下一轮决定哪些升 cases.json 做永久回归
+2026-10-04 核对：11 条均已在 eval/cases.json，其中 rn_ingest_telemetry_blackbox、mini_migration_scope_miss 的用例名为 rn_ingest_telemetry、mini_migration_scope_drift；各条 Eval Case Added 已改为 yes
 -->
 
 ## 2026-05-12 - chatgpt_subscription_history
 
 | Field | Value |
 |------|------|
-| Query | `我买的是群友在加拿大帮我顶的，我堂姐在澳洲也帮我订过，你忘了啊` |
+| Query | 用户提起自己 ChatGPT 订阅的来源，提醒 CC 之前讲过（原话含个人信息，此处转述） |
 | Profile | `default` |
 | Scope | `cc` |
 | Surface | `MCP` |
-| Expected | RN 应回忆出 ChatGPT 订阅来源链（堂姐 / 加拿大群友 / 被封号邮箱 `aliceljyalice@gmail.com`），CC 不应让用户复述 |
+| Expected | RN 应回忆出用户此前讲过的订阅来源（个人生活事实），CC 不应让用户复述 |
 | Actual | CC 当场承认"没主动查 RecallNest"，用户被迫复述 |
 | Failure Type | `miss` |
 | Hypothesis | capture gap — 生活实事（订阅来源 / 朋友关系 / 历史邮箱）从未被显式 store_memory，没进库自然搜不到 |
 | Fix | TBD — 候选 (a) 加 entity-level life-fact 自动捕获器；(b) resume_context 浅注入 user_profile 段 |
-| Eval Case Added | `no` |
+| Eval Case Added | `yes` |
 
 ## 2026-05-12 - email_archive_lookup
 
@@ -116,7 +117,7 @@ Gap 分布: capture×5, retrieval×3, composition×2, checkpoint×1
 | Failure Type | `miss` |
 | Hypothesis | retrieval gap — 用户用"翻一下记录"这种隐式信号未触发 auto-recall；同时 ingest 可能漏了相关 session |
 | Fix | TBD — ingest 加"用户提到的实体 + 时间窗"语义索引，让模糊请求能命中 |
-| Eval Case Added | `no` |
+| Eval Case Added | `yes` |
 
 ## 2026-05-10 - cross_window_realtime_sync
 
@@ -131,7 +132,7 @@ Gap 分布: capture×5, retrieval×3, composition×2, checkpoint×1
 | Failure Type | `miss` |
 | Hypothesis | capture gap — checkpoint 必须主动调，没有"窗口切换前自动写"机制；ingest 异步有延迟 |
 | Fix | TBD — 候选 (a) hook 在 SessionEnd 前 auto-checkpoint；(b) 拉低 ingest 延迟阈值 |
-| Eval Case Added | `no` |
+| Eval Case Added | `yes` |
 
 ## 2026-05-01 - taobao_mcp_provenance
 
@@ -146,7 +147,7 @@ Gap 分布: capture×5, retrieval×3, composition×2, checkpoint×1
 | Failure Type | `miss` |
 | Hypothesis | capture gap — MCP 工具的来源/官方标记从未沉淀，缺 "tool provenance" 元数据类型 |
 | Fix | TBD — MCP install 时加 metadata capture hook，把 source URL / 官方与否写入 entities |
-| Eval Case Added | `no` |
+| Eval Case Added | `yes` |
 
 ## 2026-04-25 - recallnest_alias_resolution
 
@@ -161,7 +162,7 @@ Gap 分布: capture×5, retrieval×3, composition×2, checkpoint×1
 | Failure Type | `weak hit` |
 | Hypothesis | composition gap — entity alias 表缺 "我的记忆项目" / "记忆项目" → recallnest 的映射 |
 | Fix | TBD — entities/recallnest 加 aliases 字段，resume_context 用 alias 匹配 |
-| Eval Case Added | `no` |
+| Eval Case Added | `yes` |
 
 ## 2026-04-24 - store_memory_promise_drift
 
@@ -176,7 +177,7 @@ Gap 分布: capture×5, retrieval×3, composition×2, checkpoint×1
 | Failure Type | `miss` |
 | Hypothesis | checkpoint gap — store_memory 承诺-执行差距，无 audit trail 让用户/CC 自查"答应过但没写" |
 | Fix | TBD — 候选 (a) CC 侧 promise-tracking；(b) RN 出 `verify_promise(query)` MCP tool 让 CC 复盘 |
-| Eval Case Added | `no` |
+| Eval Case Added | `yes` |
 
 ## 2026-04-21 - skill_lifecycle_amnesia
 
@@ -191,7 +192,7 @@ Gap 分布: capture×5, retrieval×3, composition×2, checkpoint×1
 | Failure Type | `miss` |
 | Hypothesis | capture gap — skill 生命周期事件（创建/废弃/合并）没自动入库 |
 | Fix | TBD — scan_skill_promotions 已存在但只看 promotion，扩展捕获 replace / deprecate 信号 |
-| Eval Case Added | `no` |
+| Eval Case Added | `yes` |
 
 ## 2026-04-20 - rn_self_introspection
 
@@ -206,7 +207,7 @@ Gap 分布: capture×5, retrieval×3, composition×2, checkpoint×1
 | Failure Type | `weak hit` |
 | Hypothesis | composition gap — RN 缺 self-introspection 接口，能力清单只在源码不在记忆里 |
 | Fix | TBD — list_tools 输出做基础 self-knowledge entity，或 resume_context 注入 capability digest |
-| Eval Case Added | `no` |
+| Eval Case Added | `yes` |
 
 ## 2026-04-20 - rn_ingest_telemetry_blackbox
 
@@ -221,7 +222,7 @@ Gap 分布: capture×5, retrieval×3, composition×2, checkpoint×1
 | Failure Type | `miss` |
 | Hypothesis | capture gap — RN 自身 telemetry 没回流为可查事实条目；ingest 完成后没 store_memory(type=event) |
 | Fix | TBD — ingest pipeline 收尾自动写 event memory（importance 低但可查可统计） |
-| Eval Case Added | `no` |
+| Eval Case Added | `yes`（用例名 `rn_ingest_telemetry`） |
 
 ## 2026-04-17 - mini_migration_scope_miss
 
@@ -236,7 +237,7 @@ Gap 分布: capture×5, retrieval×3, composition×2, checkpoint×1
 | Failure Type | `miss` |
 | Hypothesis | retrieval gap — scope 命名拼写漂移（mini-migration vs migration:mini）；scope miss 时未触发兜底跨 scope 搜索 |
 | Fix | TBD — 候选 (a) scope normalize；(b) 0 hit 时自动 allScopes=true 重试并提示用户 |
-| Eval Case Added | `no` |
+| Eval Case Added | `yes`（用例名 `mini_migration_scope_drift`） |
 
 ## 2026-04-14 - infra_endpoint_capture
 
@@ -251,4 +252,4 @@ Gap 分布: capture×5, retrieval×3, composition×2, checkpoint×1
 | Failure Type | `miss` |
 | Hypothesis | capture gap — 基础设施 endpoint（域名 / 端口 / 服务名）从未触发 store_memory，缺 infra entity 类型 |
 | Fix | TBD — 增 infra-endpoint entity；或扫描 `~/.ssh/config` + `tailscale status` 定期 ingest |
-| Eval Case Added | `no` |
+| Eval Case Added | `yes` |
