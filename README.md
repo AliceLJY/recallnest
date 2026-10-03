@@ -16,7 +16,7 @@ A local-first memory system backed by LanceDB that turns scattered conversation 
 [![CI](https://github.com/AliceLJY/recallnest/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLJY/recallnest/actions/workflows/ci.yml)
 [![CC Plugin](https://img.shields.io/badge/Claude_Code-Plugin-blueviolet)](https://github.com/AliceLJY/recallnest)
 
-**English** | [简体中文](README_CN.md) | [Roadmap](ROADMAP.md)
+**English** | [简体中文](README_CN.md) | [Roadmap](ROADMAP.md) | [Website](https://aliceljy.github.io/recallnest/)
 
 </div>
 
