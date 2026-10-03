@@ -33,8 +33,16 @@
   // ---------- layout and scroll mapping ----------
   function isPortrait() { return window.innerWidth < 760 || window.innerWidth / window.innerHeight < 0.9; }
 
-  var anchors = [];
+  var anchors = [], textTops = [], headerBottom = 64;
   function measure() {
+    var bar = document.querySelector('.bar');
+    headerBottom = bar ? bar.getBoundingClientRect().bottom : 64;
+    // where each section's copy starts while it is stuck (portrait layout puts the scene above it)
+    textTops = sections.map(function (s) {
+      var copy = s.querySelector('.copy');
+      if (!copy || getComputedStyle(copy).position !== 'sticky' || !copy.firstElementChild) return null;
+      return copy.firstElementChild.offsetTop;
+    });
     var max = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
     anchors = sections.map(function (s, i) {
       if (i === 0) return 0;
@@ -396,7 +404,7 @@
   }
 
   // ---------- frame ----------
-  var state = { g: 0, raw: 0 }, dpr = 1, W = 0, H = 0, start = 0, last = 0, dirty = true, readyFrames = 0;
+  var state = { g: 0, raw: 0 }, dpr = 1, W = 0, H = 0, start = 0, last = 0, dirty = true, readyFrames = 0, lastFade = -1;
   var pointer = { x: 0, y: 0, sx: 0, sy: 0, on: 0 };
 
   function resize() {
@@ -427,7 +435,16 @@
       ry += 0.06 * Math.sin(t * 0.13) + (port ? 0 : pointer.sx * 0.08);
       rx += 0.02 * Math.sin(t * 0.11) - (port ? 0 : pointer.sy * 0.05);
     }
-    var off = port ? [0, 0.27] : [0.34, 0.02];
+    var off = [0.34, 0.02];
+    if (port) {
+      var ta = textTops[a], tb = textTops[b];
+      var ya = ta == null ? 0.27 : Math.min(0.42, Math.max(0.2, 1 - (headerBottom + ta) / H));
+      var yb = tb == null ? 0.27 : Math.min(0.42, Math.max(0.2, 1 - (headerBottom + tb) / H));
+      off = [0, ya + (yb - ya) * e];
+      var fa = ta == null ? H * 0.5 : ta, fb = tb == null ? H * 0.5 : tb;
+      var fade = Math.round(fa + (fb - fa) * e);
+      if (fade !== lastFade) { root.style.setProperty('--fade', fade + 'px'); lastFade = fade; }
+    }
     var mvp = mul(perspective(40 * Math.PI / 180, W / H, 0.1, 60), viewMatrix(rx, ry, dist));
 
     if (api.gl) {
@@ -460,7 +477,7 @@
       if (lw <= 0.01 || !api.gl) { if (el.style.opacity !== '0') el.style.opacity = '0'; continue; }
       var anchor = w1 >= w6
         ? [clients[c][0], clients[c][1] - (port ? 0.5 : 0.62), clients[c][2]]
-        : [homeCenters[c][0], 0, homeCenters[c][2] + (port ? 0.3 : 0.36)];
+        : [homeCenters[c][0] * (port ? 1.28 : 1), 0, homeCenters[c][2] + (port ? 0.3 : 0.36)];
       var q = project(mvp, anchor, off);
       var x = (q[0] + 1) / 2 * W, y = (1 - q[1]) / 2 * H;
       var edge = Math.min(1, Math.max(0, Math.min(x - 8, W - x - 8, y - 70, H - y - 8) / 40));

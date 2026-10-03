@@ -179,7 +179,7 @@ p { margin: 0 0 16px; }
   margin-top: 40px;
   font: 12px/1 var(--mono);
   letter-spacing: 0.12em;
-  color: var(--muted);
+  color: rgba(241, 232, 218, 0.66);
 }
 
 .chips, .facts {
@@ -223,9 +223,10 @@ footer a { color: var(--ink); }
 @media (max-width: 759px), (max-aspect-ratio: 9/10) {
   body { font-size: 16px; }
   .shade {
-    background: linear-gradient(180deg, rgba(11, 9, 7, 0) 34%, rgba(11, 9, 7, 0.78) 50%, rgba(11, 9, 7, 0.94) 66%);
+    background: linear-gradient(180deg, rgba(11, 9, 7, 0) calc(var(--fade, 50vh) - 90px), rgba(11, 9, 7, 0.82) calc(var(--fade, 50vh) - 12px), rgba(11, 9, 7, 0.94) calc(var(--fade, 50vh) + 60px));
   }
   .dots { display: none; }
+  .client { font-size: 11px; letter-spacing: 0.02em; }
   section { padding: 0 22px; }
   .copy {
     justify-content: flex-end;
@@ -234,6 +235,9 @@ footer a { color: var(--ink); }
     min-height: 100vh;
   }
   #hero .copy { padding-bottom: calc(28px + env(safe-area-inset-bottom)); }
+  .copy { padding-top: 76px; }
+  #install { min-height: 100vh; }
+  #install .copy { position: static; min-height: 0; padding-top: 88px; }
   h1 { font-size: clamp(2.1rem, 9vw, 2.8rem); }
   h2 { font-size: clamp(1.55rem, 6.6vw, 2rem); }
   .lede { font-size: 1.02rem; }
