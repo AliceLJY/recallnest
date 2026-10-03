@@ -16,7 +16,7 @@
 [![CI](https://github.com/AliceLJY/recallnest/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLJY/recallnest/actions/workflows/ci.yml)
 [![CC Plugin](https://img.shields.io/badge/Claude_Code-Plugin-blueviolet)](https://github.com/AliceLJY/recallnest)
 
-[English](README.md) | **简体中文** | [Roadmap](ROADMAP.md)
+[English](README.md) | **简体中文** | [Roadmap](ROADMAP.md) | [项目主页](https://aliceljy.github.io/recallnest/)
 
 </div>
 
