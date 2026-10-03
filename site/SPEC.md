@@ -58,8 +58,11 @@ headings, system sans for body, `ui-monospace` for labels and code.
 
 - Landscape (width ≥ 760 px and wider than tall): copy column on the left (max 30 rem), scene shifted
   right by 0.30 in clip space, a left-side shade behind the copy.
-- Portrait: scene shifted up by 0.30, copy pinned to the lower half with a bottom shade, recall hits
-  laid out as a row instead of a column.
+- Portrait: the scene sits in the space between the header and the current beat's text (lifted by
+  0.2–0.42 in clip space, measured from where that section's copy starts); a shade starts just above
+  the text; recall hits are laid out as a row; client labels on the ring are pushed outward so they
+  do not collide. The last section scrolls normally instead of sticking, because on a 375 × 667
+  phone it is taller than the screen.
 - Copy blocks are `position: sticky` inside 140 vh sections, so text stays put while a shape holds.
 
 ## Budget
@@ -103,8 +106,10 @@ headings, system sans for body, `ui-monospace` for labels and code.
 1. **First screen**: a fresh agent that has not seen this spec gets only the first-screen screenshots
    (desktop and phone) and is asked what this is and who it is for. Pass if it says, in substance,
    "a shared / persistent memory layer for AI coding agents or MCP clients".
-2. **Per-beat screenshots** at 1440 × 900 and 390 × 844, both languages: no text box overflows the
-   viewport and no two text boxes overlap (checked from DOM rectangles), read by eye for legibility.
+2. **Per-beat screenshots** at 1440 × 900, 390 × 844 and 375 × 667, both languages: no text box
+   overflows the viewport, no two text boxes overlap, no client label sits on text or on another
+   label, sticky text never hides under the header, and the first screen's buttons are fully visible
+   (all checked from DOM rectangles); read by eye for legibility.
 3. **Round trip**: with `?still`, the screenshot at each beat taken on the way down equals the one
    taken on the way back up (pixel difference under 0.5 %).
 4. **Weight**: total bytes of the first load under 60 KB (excluding `og.jpg`, which the page never
