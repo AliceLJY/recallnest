@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en" data-lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>RecallNest — one memory for every AI client</title>
+<meta name="description" content="RecallNest is a local-first memory layer that Claude Code, Codex, Kimi and Antigravity all read and write. Context saved in one window can be recalled in another, even on another machine.">
+<meta name="theme-color" content="#0b0907">
+<meta property="og:type" content="website">
+<meta property="og:title" content="RecallNest — one memory for every AI client">
+<meta property="og:description" content="A local-first memory layer that Claude Code, Codex, Kimi and Antigravity all read and write. MIT, MCP + HTTP.">
+<meta property="og:url" content="https://aliceljy.github.io/recallnest/">
+<meta property="og:image" content="https://aliceljy.github.io/recallnest/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0907'/%3E%3Cellipse cx='16' cy='17' rx='10' ry='5.5' fill='none' stroke='%23ffad5a' stroke-width='2.4'/%3E%3Cpath d='M7 16c3 6 15 6 18 0' fill='none' stroke='%23f1e8da' stroke-width='1.6'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<script>
+(function () {
+  var q = new URLSearchParams(location.search).get('lang'), s = null;
+  try { s = localStorage.getItem('rn-lang'); } catch (e) {}
+  var l = q === 'zh' || q === 'en' ? q : (s === 'zh' || s === 'en' ? s : ((navigator.language || '').toLowerCase().indexOf('zh') === 0 ? 'zh' : 'en'));
+  document.documentElement.dataset.lang = l;
+  document.documentElement.lang = l === 'zh' ? 'zh-CN' : 'en';
+})();
+</script>
+</head>
+<body>
+<canvas id="field" aria-hidden="true"></canvas>
+<div class="shade" aria-hidden="true"></div>
+<div id="labels" aria-hidden="true">
+  <span class="client">Claude Code</span>
+  <span class="client">Codex</span>
+  <span class="client">Kimi</span>
+  <span class="client">Antigravity</span>
+  <span class="client"><span class="zh">豆包桌面版</span><span class="en">Doubao desktop</span></span>
+  <span class="client"><span class="zh">脚本 · 定时任务</span><span class="en">scripts · cron</span></span>
+  <span class="client"><span class="zh">手机</span><span class="en">phone</span></span>
+</div>
+
+<header class="bar">
+  <a class="mark" href="#hero" aria-label="RecallNest">
+    <svg viewBox="0 0 32 32" aria-hidden="true"><ellipse cx="16" cy="17" rx="10" ry="5.5" fill="none" stroke="#ffad5a" stroke-width="2.4"/><path d="M7 16c3 6 15 6 18 0" fill="none" stroke="#f1e8da" stroke-width="1.6"/></svg>
+    RecallNest
+  </a>
+  <nav>
+    <a href="https://github.com/AliceLJY/recallnest">GitHub</a>
+    <button type="button" class="lang" data-lang-toggle><span class="zh">EN</span><span class="en">中文</span></button>
+  </nav>
+</header>
+
+<nav class="dots" aria-label="Sections">
+  <a href="#hero" aria-label="Top"></a><a href="#scattered" aria-label="01"></a><a href="#store" aria-label="02"></a><a href="#woven" aria-label="03"></a><a href="#recall" aria-label="04"></a><a href="#decay" aria-label="05"></a><a href="#home" aria-label="06"></a><a href="#install" aria-label="07"></a>
+</nav>
+
+<main>
+  <section id="hero">
+    <div class="copy">
+      <p class="kicker"><span class="zh">RecallNest · 给 AI 客户端用的共享记忆层 · MIT 开源</span><span class="en">RecallNest · a shared memory layer for AI clients · MIT</span></p>
+      <h1><span class="zh">每个 AI 窗口，<br>都记得上一个窗口。</span><span class="en">Every AI window remembers the last one.</span></h1>
+      <p class="lede"><span class="zh">RecallNest 是一层本地优先的共享记忆：Claude Code、Codex、Kimi、Antigravity 读写同一个记忆库。一个窗口里存下的上下文，换个窗口、换台机器也能召回。</span><span class="en">RecallNest is a local-first memory layer that Claude Code, Codex, Kimi and Antigravity all read and write. Context saved in one window can be recalled in another — even on another machine.</span></p>
+      <p class="actions">
+        <a class="btn primary" href="https://github.com/AliceLJY/recallnest"><span class="zh">在 GitHub 上看</span><span class="en">View on GitHub</span></a>
+        <a class="btn" href="#install"><span class="zh">怎么装</span><span class="en">Install</span></a>
+      </p>
+      <p class="hint" aria-hidden="true"><span class="zh">往下滚</span><span class="en">Scroll</span></p>
+    </div>
+  </section>
+
+  <section id="scattered">
+    <div class="copy">
+      <p class="step">01 · <span class="zh">散落</span><span class="en">Scattered</span></p>
+      <h2><span class="zh">每开一个新窗口，它就失忆一次。</span><span class="en">Every new window forgets everything.</span></h2>
+      <p><span class="zh">项目配置、调试时拍板的决定、谁是谁——散落在各个客户端各自的会话里，彼此看不见。</span><span class="en">Project configs, decisions made while debugging, who is who — scattered across each client's own sessions, invisible to one another.</span></p>
+    </div>
+  </section>
+
+  <section id="store">
+    <div class="copy">
+      <p class="step">02 · <span class="zh">汇成一份</span><span class="en">One store</span></p>
+      <h2><span class="zh">一个记忆库，所有客户端共读共写。</span><span class="en">One store. Every client reads and writes it.</span></h2>
+      <p><span class="zh">命令行 agent 和支持 MCP 的桌面 app 走 MCP（stdio）；只会发 HTTP 的脚本走 HTTP API；手机走只读网关。换到另一台机器，把启动命令换成 ssh，就和家里那台共用同一份。</span><span class="en">CLI agents and MCP-capable desktop apps connect over MCP (stdio); scripts that only speak HTTP use the HTTP API; a phone goes through a read-only gateway. On another machine, swap the launch command for ssh and it shares the same store.</span></p>
+      <ul class="chips">
+        <li><span class="zh">44 个 MCP 工具</span><span class="en">44 MCP tools</span></li>
+        <li><span class="zh">21 个 HTTP 端点</span><span class="en">21 HTTP endpoints</span></li>
+        <li><span class="zh">LanceDB 本地存储</span><span class="en">LanceDB, on your machine</span></li>
+        <li><span class="zh">Jina v5 向量 · 1024 维</span><span class="en">Jina v5 embeddings · 1024-dim</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="woven">
+    <div class="copy">
+      <p class="step">03 · <span class="zh">编进巢里</span><span class="en">Woven in</span></p>
+      <h2><span class="zh">不是一堆日志，是分好类的记忆。</span><span class="en">Not a pile of logs. Memory, sorted.</span></h2>
+      <p><span class="zh">每条记忆归进 6 类：身份、偏好、实体、事件、案例、模式。每条都存三种粒度——一句话、要点、全文，召回时按相关度和 token 预算挑一层给你。同一个判断被修订时，新版接替旧版，旧版留作历史。</span><span class="en">Every memory lands in one of six categories — profile, preferences, entities, events, cases, patterns — and is kept at three granularities: one line, key points, full text. Recall picks the layer that fits the relevance and the token budget. When a judgment is revised, the new version supersedes the old one, which stays as history.</span></p>
+    </div>
+  </section>
+
+  <section id="recall">
+    <div class="copy">
+      <p class="step">04 · <span class="zh">唤回</span><span class="en">Recall</span></p>
+      <h2><span class="zh">问一句，相关的自己浮上来。</span><span class="en">Ask once. What matters rises.</span></h2>
+      <p><span class="zh">默认走向量检索，需要时再打开 BM25 全文、多粒度向量和知识图谱。每条记忆写入时还能附 2–6 句「以后会怎么问起它」，单独嵌入、只管召回，不当证据。</span><span class="en">Vector search by default; turn on BM25, multi-granularity vectors and a knowledge graph when you need them. A memory can carry 2–6 "how will I ask about this later" phrasings — embedded separately, used only for recall, never shown as evidence.</span></p>
+      <figure class="sample">
+        <pre><span class="q">Query   : deploy rollback</span>
+Hits    : 5
+
+#  ID       Score Category  Tier        Source  Date        Age  Retrieval Path
+1  ee79037a 46.1% cases     peripheral  cc      2026-08-25  2d   vector
+   [assistant] Rolled back to the previous image and pinned the digest so the next…
+   prov : evidence/transcript-ingest
+   imgs : 52 agent-made in this session · read sess=dca70d4a</pre>
+        <figcaption><span class="zh">README 里的召回示例</span><span class="en">Recall output, from the README</span></figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section id="decay">
+    <div class="copy">
+      <p class="step">05 · <span class="zh">该淡的会淡</span><span class="en">Fading on purpose</span></p>
+      <h2><span class="zh">会遗忘，也知道什么不能忘。</span><span class="en">It forgets — and knows what not to.</span></h2>
+      <p><span class="zh">记忆沿 Weibull 曲线衰减，重要度调节半衰期。模式类不按时间衰减；钉住的、7 天内用过的、核心且重要度 ≥ 0.95 的也不衰减。从会话记录里抓来的片段只算证据，要升格成你做过的决定，得另过一道要证据的关。</span><span class="en">Memories decay along a Weibull curve, with importance shaping the half-life. Patterns are exempt from time decay, and so are pinned memories, anything used in the last 7 days, and core memories with importance ≥ 0.95. Fragments pulled from transcripts stay evidence; becoming a decision you actually made is a separate, gated step.</span></p>
+    </div>
+  </section>
+
+  <section id="home">
+    <div class="copy">
+      <p class="step">06 · <span class="zh">回到同一个巢</span><span class="en">Back to one nest</span></p>
+      <h2><span class="zh">下个窗口打开时，交接已经在等你。</span><span class="en">The next window opens to a handoff.</span></h2>
+      <p><span class="zh">退出时 <code>checkpoint_session</code> 记下这一段的决定和待办，新窗口里调一次 <code>resume_context</code> 就接上。召回的状态只当交接参考，不会冒充仓库此刻的样子。</span><span class="en">On exit, <code>checkpoint_session</code> records the decisions and open loops; in the next window, one <code>resume_context</code> call picks them up. Recalled state is a handoff, never a claim about what the repo looks like right now.</span></p>
+    </div>
+  </section>
+
+  <section id="install">
+    <div class="copy">
+      <p class="step">07 · <span class="zh">装上试试</span><span class="en">Try it</span></p>
+      <h2><span class="zh">在 Claude Code 里两行装好。</span><span class="en">Two lines in Claude Code.</span></h2>
+      <pre class="cmd">/plugin marketplace add AliceLJY/recallnest
+/plugin install recallnest@AliceLJY</pre>
+      <p><span class="zh">或者用 npm：</span><span class="en">Or with npm:</span></p>
+      <pre class="cmd">npx recallnest --help</pre>
+      <p class="note"><span class="zh">需要 Bun 或 Node.js 22+，以及一个 Jina API key（用来生成向量）。</span><span class="en">Needs Bun or Node.js 22+, plus a Jina API key for embeddings.</span></p>
+      <ul class="facts">
+        <li>v3.0.1</li>
+        <li>MIT</li>
+        <li><span class="zh">2,600 条测试全部通过</span><span class="en">2,600 tests passing</span></li>
+        <li><span class="zh">44 个 MCP 工具</span><span class="en">44 MCP tools</span></li>
+      </ul>
+      <p class="actions">
+        <a class="btn primary" href="https://github.com/AliceLJY/recallnest"><span class="zh">在 GitHub 上看</span><span class="en">View on GitHub</span></a>
+        <a class="btn" href="https://github.com/AliceLJY/recallnest/blob/main/README_CN.md"><span class="zh">中文 README</span><span class="en">README in Chinese</span></a>
+      </p>
+      <footer>
+        <p><span class="zh">RecallNest 由小试AI（<a href="https://aliceljy.github.io/">AliceLJY</a>）与 Claude Code、Codex 协作完成，起点是 CortexReach 的 <a href="https://github.com/CortexReach/memory-lancedb-pro">memory-lancedb-pro</a>（@win4r）。本页是滚动驱动的粒子，没有用生成的图片或视频。</span><span class="en">Built by 小试AI (<a href="https://aliceljy.github.io/">AliceLJY</a>) together with Claude Code and Codex; it started as a fork of CortexReach's <a href="https://github.com/CortexReach/memory-lancedb-pro">memory-lancedb-pro</a> (@win4r). This page is scroll-driven particles — no generated images or video.</span></p>
+      </footer>
+    </div>
+  </section>
+</main>
+
+<script src="main.js" defer></script>
+</body>
+</html>
