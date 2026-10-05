@@ -147,14 +147,22 @@ export interface ForgetResult {
 
 /** The slice of TriggerStore the forget engine needs. */
 export interface ForgetTriggerStore {
-  /** Delete every trigger row of this memory; resolves to the number of rows removed. */
+  /**
+   * Delete every trigger row of this memory; resolves to the number of rows it counted just
+   * before deleting. A row that another process adds in between is not in that number, and
+   * when the number is 0 no delete is issued at all — the read-back (step 10) counts again.
+   */
   deleteForMemory(memoryId: string): Promise<number>;
   countForMemory(memoryId: string): Promise<number>;
 }
 
 /** Pin files made from a memory (memory-assets.ts: archivePinAssetsForMemory / findPinAssetsForMemory). */
 export interface ForgetPinArchive {
-  /** Move this memory's pin files out of the pins directory; returns how many were moved. */
+  /**
+   * Move this memory's pin files out of the pins directory; returns how many were moved.
+   * If it fails after some files were already moved, the error it throws carries that number
+   * as `archivedCount` — otherwise the engine would report that nothing had been changed.
+   */
   archiveForMemory(memoryId: string): number;
   /** How many pin files made from this memory are still in the pins directory. */
   countForMemory(memoryId: string): number;
@@ -183,6 +191,18 @@ interface ForgetProgress {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** How many pin files a failed pin archive had already moved, when its error says so (see ForgetPinArchive). */
+function archivedCountOf(err: unknown): number | null {
+  if (typeof err !== "object" || err === null || !("archivedCount" in err)) return null;
+  const n = (err as { archivedCount: unknown }).archivedCount;
+  return typeof n === "number" && Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/** Quote a value so that it pastes into a POSIX shell command line as one argument. */
+function shellQuote(value: string): string {
+  return /^[A-Za-z0-9_.:\/@%+=,-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 function countOrNa(n: number | null): string {
@@ -351,13 +371,17 @@ export async function forgetMemory(
     const indexRows = await findPinIndexRows(store, entry.id);
     progress.pinIndexRowsRemoved = 0;
     for (const row of indexRows) {
-      await store.delete(row.id);
-      progress.pinIndexRowsRemoved += 1;
+      // false: the row was already gone (removed between the listing above and this call), so it is not counted
+      if (await store.delete(row.id)) progress.pinIndexRowsRemoved += 1;
     }
     if (pins) progress.pinsArchived = pins.archiveForMemory(entry.id);
   } catch (err) {
+    // The archive may have moved some files before it failed. Without this, the error below
+    // and the audit entry would both say that nothing had been changed.
+    const movedBeforeFailing = archivedCountOf(err);
+    if (movedBeforeFailing !== null) progress.pinsArchived = movedBeforeFailing;
     const restoreTriggers = progress.triggerRowsRemoved
-      ? ` To keep the memory instead, restore its trigger rows with \`triggers-backfill --rebuild --apply --scope ${entry.scope}\`.`
+      ? ` To keep the memory instead, restore its trigger rows with \`triggers-backfill --rebuild --apply --scope ${shellQuote(entry.scope)}\`.`
       : "";
     return stopIncomplete(
       "pin-archive",
@@ -505,9 +529,12 @@ export async function forgetByScope(
     }
   }
 
-  // Bulk KG scope cleanup
+  // Bulk KG scope cleanup — only when every entry was forgotten. An entry whose forget stopped
+  // (its trigger or pin cleanup failed) is still an active memory, and wiping the whole scope
+  // would strip its triples anyway. The entries that were forgotten have already lost theirs
+  // in step 6 of forgetMemory (deleteBySource).
   let kgScopeCleared = false;
-  if (kgStore) {
+  if (kgStore && failedCount === 0) {
     try {
       await kgStore.deleteByScope(scope);
       kgScopeCleared = true;

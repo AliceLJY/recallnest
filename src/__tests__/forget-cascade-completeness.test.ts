@@ -8,9 +8,9 @@ import { indexPinnedAsset } from "../asset-sync.js";
 import { createAuditLogger } from "../audit-log.js";
 import { buildStructuredMetadata } from "../capture-engine.js";
 import { runToolSafely } from "../error-taxonomy.js";
-import { forgetMemory, summarizeVerification, type ForgetPinArchive, type ForgetTriggerStore } from "../forget-engine.js";
+import { forgetByScope, forgetMemory, summarizeVerification, type ForgetPinArchive, type ForgetTriggerStore } from "../forget-engine.js";
 import { registerAdvancedTools } from "../mcp-tools-advanced.js";
-import { archivePinAssetsForMemory, findPinAssetsForMemory, type PinAsset } from "../memory-assets.js";
+import { archivePinAssetsForMemory, findPinAssetsForMemory, PinArchiveIncompleteError, type PinAsset } from "../memory-assets.js";
 import { createRetriever } from "../retriever.js";
 import { MemoryStore, type MemoryEntry } from "../store.js";
 import { TriggerStore } from "../trigger-store.js";
@@ -73,6 +73,9 @@ const MINT = entry(
   [1, 0, 0],
   "薄荷喜欢半阴，放在北边窗台长得最好，太晒叶子会发黄，隔两周掐一次顶才会分枝，不掐就只往上窜。",
 );
+// 全文索引按空格分词，中文要先切好才搜得到（入库路径会写这一列；这里手工给）
+const TOMATO_FTS = "阳台 番茄 每周 浇 两次 水 根 会 烂";
+const MINT_FTS = "薄荷 喜欢 半阴 北边 窗台 叶子 发黄";
 const ASK_TOMATO = "番茄多久浇一次水";
 const ASK_MINT = "薄荷放哪里长得好";
 const QUERY_VECTORS: Record<string, number[]> = { [ASK_TOMATO]: [0, 1, 0], [ASK_MINT]: [0, 0, 1] };
@@ -183,10 +186,15 @@ describe("forget 清掉 trigger 行，不留搜不到的后遗症（真实临时
     const dbPath = tempDir("rn-forget-complete-");
     const store = new MemoryStore({ dbPath, vectorDim: 3 });
     const triggers = new TriggerStore({ dbPath, vectorDim: 3 });
-    await store.importEntry(TOMATO);
-    await store.importEntry(MINT);
+    await store.importEntry({ ...TOMATO, fts_text: TOMATO_FTS });
+    await store.importEntry({ ...MINT, fts_text: MINT_FTS });
     await triggers.upsertForMemory(TOMATO.id, TOMATO.scope, [ASK_TOMATO, "番茄浇水"], embedMany);
     await triggers.upsertForMemory(MINT.id, MINT.scope, [ASK_MINT], embedMany);
+    // 另一条入口：拿原文里的词做全文检索（BM25）。生产默认只走向量，这条路在 hybrid 模式下才用得到
+    const fullText = async (word: string) => (await store.bm25Search(word, 5, ["memory:pivot"])).map((r) => r.entry.id);
+    expect(store.hasFtsSupport).toBe(true);
+    expect(await fullText("番茄")).toEqual([TOMATO.id]);
+    expect(await fullText("薄荷")).toEqual([MINT.id]);
 
     const retriever = createRetriever(store, embedder, {
       mode: "vector",
@@ -221,6 +229,9 @@ describe("forget 清掉 trigger 行，不留搜不到的后遗症（真实临时
     expect(await search(ASK_TOMATO)).not.toContain(TOMATO.id);
     expect((await search(ASK_MINT))[0]).toBe(MINT.id);
     expect((await store.getById(MINT.id))?.text).toBe(MINT.text);
+    // 原文里的词也搜不到它了；另一条不受影响
+    expect(await fullText("番茄")).toEqual([]);
+    expect(await fullText("薄荷")).toEqual([MINT.id]);
   });
 });
 
@@ -416,6 +427,145 @@ describe("pin 归档", () => {
   });
 });
 
+describe("pin 归档到一半出错：已经挪走的要记账", () => {
+  function twoPins() {
+    const root = tempDir("rn-forget-pins-partial-");
+    const pinsDir = join(root, "pins");
+    const archiveDir = join(root, "archive", "forgotten-pins");
+    mkdirSync(pinsDir, { recursive: true });
+    const first = writePin(pinsDir, pin("11111111-0000-4000-8000-000000000001", TOMATO.id));
+    const second = writePin(pinsDir, pin("22222222-0000-4000-8000-000000000002", TOMATO.id));
+    return { pinsDir, archiveDir, first, second };
+  }
+
+  /** 让第 failAt 次 renameSync 抛 EACCES，其余照常。返回还原函数。 */
+  function failRenameAt(failAt: number) {
+    const realRenameSync = fs.renameSync;
+    let n = 0;
+    const spy = spyOn(fs, "renameSync").mockImplementation(((...args: Parameters<typeof fs.renameSync>) => {
+      n += 1;
+      if (n === failAt) throw Object.assign(new Error("EACCES: permission denied, rename"), { code: "EACCES" });
+      return realRenameSync(...args);
+    }) as typeof fs.renameSync);
+    return () => spy.mockRestore();
+  }
+
+  it("第二个文件挪不动 → 抛 PinArchiveIncompleteError，带上已挪走的 1 个；第一个就挪不动 → 原样抛、什么都没变", () => {
+    const { pinsDir, archiveDir } = twoPins();
+
+    let restore = failRenameAt(2);
+    let thrown: unknown;
+    try {
+      archivePinAssetsForMemory(TOMATO.id, { pinsDir, archiveDir });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      restore();
+    }
+    expect(thrown).toBeInstanceOf(PinArchiveIncompleteError);
+    const partial = thrown as PinArchiveIncompleteError;
+    expect(partial.archivedCount).toBe(1);
+    expect(partial.archived).toHaveLength(1);
+    expect(partial.message).toContain("EACCES");
+    expect(partial.message).toContain("(1 of 2 pin file(s) had already been moved to the archive)");
+    expect(readdirSync(archiveDir)).toHaveLength(1);
+    expect(findPinAssetsForMemory(TOMATO.id, pinsDir)).toHaveLength(1);
+
+    // 剩下那一个：第一次挪就失败 → 普通错误，不带数量，文件原地不动
+    restore = failRenameAt(1);
+    thrown = undefined;
+    try {
+      archivePinAssetsForMemory(TOMATO.id, { pinsDir, archiveDir });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      restore();
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBeInstanceOf(PinArchiveIncompleteError);
+    expect(readdirSync(archiveDir)).toHaveLength(1);
+    expect(findPinAssetsForMemory(TOMATO.id, pinsDir)).toHaveLength(1);
+  });
+
+  it("经 forget：没删到 trigger 行、也没有索引副本，只挪走 1 个文件就出错 → 报错与审计都记下这 1 个", async () => {
+    const { pinsDir, archiveDir } = twoPins();
+    const logPath = join(tempDir("rn-forget-pins-partial-audit-"), "audit.jsonl");
+    const store = memoryStore([TOMATO]);
+    const pins: ForgetPinArchive = {
+      archiveForMemory: (id) => archivePinAssetsForMemory(id, { pinsDir, archiveDir }).length,
+      countForMemory: (id) => findPinAssetsForMemory(id, pinsDir).length,
+    };
+
+    const restore = failRenameAt(2);
+    let result;
+    try {
+      result = await forgetMemory(
+        { store: store as never, auditLogger: createAuditLogger(logPath), triggerStore: triggerStub({ deleteForMemory: async () => 0 }), pins },
+        { memoryId: TOMATO.id, confirm: true },
+      );
+    } finally {
+      restore();
+    }
+
+    expect(result.success).toBe(false);
+    expect(result.pinsArchived).toBe(1);
+    expect(result.error).toContain("Pin archive failed: EACCES");
+    expect(result.error).toContain("(1 of 2 pin file(s) had already been moved to the archive)");
+    expect(result.error).toContain("Already done and not rolled back: 1 pin file(s) archived.");
+    expect(result.error).toContain("still active");
+    expect(result.error).not.toContain("triggers-backfill");
+    // 主行没动
+    expect(store.data.get(TOMATO.id)?.metadata).toBe(TOMATO.metadata);
+    expect(store.calls).toEqual([]);
+    // 审计：这是唯一动过的东西，也要留痕
+    const logged = readFileSync(logPath, "utf-8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    expect(logged).toHaveLength(1);
+    expect(logged[0].operation).toBe("forget_incomplete");
+    expect(logged[0].details).toContain("stage=pin-archive triggers=0 pins=1 pinIndex=0 ");
+  });
+
+  it("别的归档实现只要在错误上带 archivedCount 也算数；不带、或带的不是正整数，就当没挪过", async () => {
+    const run = async (err: unknown) =>
+      forgetMemory(
+        { store: memoryStore([TOMATO]) as never, pins: pinStub({ archiveForMemory() { throw err; } }) },
+        { memoryId: TOMATO.id, confirm: true },
+      );
+
+    const counted = await run(Object.assign(new Error("disk full"), { archivedCount: 2 }));
+    expect(counted.pinsArchived).toBe(2);
+    expect(counted.error).toContain("Already done and not rolled back: 2 pin file(s) archived.");
+
+    for (const bogus of [new Error("disk full"), Object.assign(new Error("disk full"), { archivedCount: 0 }), Object.assign(new Error("disk full"), { archivedCount: "2" }), "disk full"]) {
+      const plain = await run(bogus);
+      expect(plain.pinsArchived).toBeNull();
+      expect(plain.error).not.toContain("Already done");
+    }
+  });
+});
+
+describe("pin 索引副本：删没删成要看返回值", () => {
+  it("别的进程先一步删掉了那一行（delete 返回 false）→ 不计入已删数", async () => {
+    const indexRow = pinIndexRow("cccccccc-0000-4000-8000-00000000000c", "11111111-0000-4000-8000-000000000001", TOMATO.id);
+    const store = memoryStore([TOMATO, indexRow]);
+    const realDelete = store.delete.bind(store);
+    store.delete = async (id: string) => {
+      if (id === indexRow.id) {
+        store.calls.push(`delete:${id}`);
+        store.data.delete(id); // 行确实没了，但不是这次调用删的
+        return false;
+      }
+      return realDelete(id);
+    };
+
+    const result = await forgetMemory({ store: store as never }, { memoryId: TOMATO.id, confirm: true });
+
+    expect(result.success).toBe(true);
+    expect(store.calls).toContain(`delete:${indexRow.id}`);
+    expect(result.pinIndexRowsRemoved).toBe(0);
+    expect(result.verification?.pinIndexRowsLeft).toBe(0);
+  });
+});
+
 describe("失败时不留半截：清理没做成就不删主行", () => {
   it("trigger 清理抛错 → forget 失败，主行还在，pin、KG、级联都没被碰", async () => {
     const store = memoryStore([TOMATO, MINT]);
@@ -491,6 +641,20 @@ describe("失败时不留半截：清理没做成就不删主行", () => {
     );
     expect(noTriggers.error).not.toContain("triggers-backfill");
     expect(noTriggers.error).not.toContain("Already done");
+
+    // scope 是自由文本，可以带空格和引号；贴进 shell 得是一个参数
+    for (const [scope, quoted] of [
+      ["project:herb garden", "'project:herb garden'"],
+      ["project:it's", "'project:it'\\''s'"],
+      ["project:a$b", "'project:a$b'"],
+    ]) {
+      const odd = { ...TOMATO, scope };
+      const result = await forgetMemory(
+        { store: memoryStore([odd]) as never, triggerStore: triggerStub(), pins: failingPins() },
+        { memoryId: odd.id, confirm: true },
+      );
+      expect(result.error).toContain(`\`triggers-backfill --rebuild --apply --scope ${quoted}\``);
+    }
   });
 
   it("半途停下而且已经动过东西：留一条 forget_incomplete 审计，不是 forget、不带 norm=；什么都没动就不留", async () => {
@@ -526,6 +690,55 @@ describe("失败时不留半截：清理没做成就不删主行", () => {
     expect(logged[0].details).not.toContain("norm=");
     // 记忆文件对账只认 operation 为 forget 的行，这一条不会被它读成「已遗忘」
     expect(logged.some((l) => l.operation === "forget")).toBe(false);
+  });
+});
+
+describe("按范围遗忘：有一条没忘成，就不清整个 scope 的图谱", () => {
+  function kgStub() {
+    const calls: string[] = [];
+    return {
+      calls,
+      async deleteBySource(id: string) {
+        calls.push(`source:${id}`);
+      },
+      async deleteByScope(scope: string) {
+        calls.push(`scope:${scope}`);
+      },
+    };
+  }
+
+  it("一条的 trigger 清理失败 → 它还活着，整 scope 的图谱清理跳过；都忘成了才清", async () => {
+    const failing = memoryStore([TOMATO, MINT]);
+    const kgA = kgStub();
+    const partial = await forgetByScope(
+      {
+        store: failing as never,
+        kgStore: kgA as never,
+        triggerStore: triggerStub({
+          async deleteForMemory(id: string) {
+            if (id === MINT.id) throw new Error("commit conflict");
+            return 1;
+          },
+        }),
+      },
+      "memory:pivot",
+      true,
+    );
+    expect(partial.forgottenCount).toBe(1);
+    expect(partial.failedCount).toBe(1);
+    expect(partial.kgScopeCleared).toBe(false);
+    expect(failing.data.has(MINT.id)).toBe(true);
+    expect(failing.data.has(TOMATO.id)).toBe(false);
+    // 忘成的那条按来源清过自己的三元组；没有整 scope 的清理
+    expect(kgA.calls).toEqual([`source:${TOMATO.id}`]);
+
+    const clean = memoryStore([TOMATO, MINT]);
+    const kgB = kgStub();
+    const all = await forgetByScope({ store: clean as never, kgStore: kgB as never, triggerStore: triggerStub() }, "memory:pivot", true);
+    expect(all.forgottenCount).toBe(2);
+    expect(all.failedCount).toBe(0);
+    expect(all.kgScopeCleared).toBe(true);
+    expect(kgB.calls).toContain("scope:memory:pivot");
   });
 });
 
@@ -746,9 +959,23 @@ describe("forget_memory 工具的输出", () => {
     expect(text).toContain("Trigger rows removed: 3");
     expect(text).toContain("Pins archived: 1 (index rows removed: 0)");
     expect(text).toContain("Read-back: gone (left: trigger rows 0, pin files 0, pin index rows 0, KG triples n/a)");
+    // 归档是挪走不是删：输出里写明文件在哪、里面还有那段正文
+    expect(text).toContain("Archived pin files were moved, not erased: they are in data/archive/forgotten-pins and still hold the snippet.");
     expect(triggerStore.deleted).toEqual([TOMATO.id]);
     expect(pins.archived).toEqual([TOMATO.id]);
     expect(store.data.has(TOMATO.id)).toBe(false);
+  });
+
+  it("这条记忆没有 pin：输出里不提归档目录", async () => {
+    const store = memoryStore([TOMATO]);
+    const forget = captureForget(() => ({ store, triggerStore: triggerStub() }), pinStub({ archiveForMemory: () => 0 }));
+
+    const r = await forget({ memoryId: TOMATO.id, confirm: true });
+
+    const text = r.content[0].text;
+    expect(text.split("\n")[0].startsWith("✅")).toBe(true);
+    expect(text).toContain("Pins archived: 0 (index rows removed: 0)");
+    expect(text).not.toContain("forgotten-pins");
   });
 
   it("回读数出残留：第一行不打勾，写明剩了什么", async () => {

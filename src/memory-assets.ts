@@ -263,12 +263,32 @@ export function findPinAssetsForMemory(
 }
 
 /**
+ * archivePinAssetsForMemory 挪到一半出错时抛这个。已经挪走的不挪回去：数量与新路径带在错误上，
+ * 调用方（forget 引擎）据此如实报「已经动过什么」，而不是当作什么都没发生。
+ */
+export class PinArchiveIncompleteError extends Error {
+  /** 出错之前已经挪到归档目录的文件（新路径）。 */
+  readonly archived: string[];
+  /** 同上，条数。forget 引擎按这个字段名读（ForgetPinArchive 的约定）。 */
+  readonly archivedCount: number;
+
+  constructor(cause: unknown, archived: string[], total: number) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    super(`${reason} (${archived.length} of ${total} pin file(s) had already been moved to the archive)`, { cause });
+    this.name = "PinArchiveIncompleteError";
+    this.archived = [...archived];
+    this.archivedCount = archived.length;
+  }
+}
+
+/**
  * 把来源是这条记忆的 pin 挪出 pins 目录（forget 用）。
  *
  * pin 文件是记忆正文的一份拷贝（标题、摘要、320 字片段），会被 list_pins 列出、被 resume_context
  * 拼进上下文；记忆被 forget 之后它不该继续出现。这里挪到 data/archive/forgotten-pins/ 而不是删：
  * 文件离开了会被读到的目录，误删时还能挪回。同名不覆盖。
- * 返回挪到的新路径。读不了或挪不动就抛错，由调用方决定要不要继续。
+ * 返回挪到的新路径。读不了或挪不动就抛错，由调用方决定要不要继续；已经挪走几个之后才出错的，
+ * 抛 PinArchiveIncompleteError，已挪走的数量与新路径带在错误上（不挪回去）。
  *
  * 只管文件这一半。pin 在主表里还有一行可检索的索引副本（asset-sync.ts），那一半由
  * forget 引擎在同一步里删。
@@ -287,7 +307,13 @@ export function archivePinAssetsForMemory(
     for (let n = 2; existsSync(target); n++) {
       target = join(archiveDir, `${stem}-${n}.json`);
     }
-    renameSync(asset.path, target);
+    try {
+      renameSync(asset.path, target);
+    } catch (err) {
+      // 第一个就挪不动：什么都没变，原样抛。后面的才挪不动：前面的已经离开 pins 目录了，得让调用方知道。
+      if (moved.length === 0) throw err;
+      throw new PinArchiveIncompleteError(err, moved, matches.length);
+    }
     moved.push(target);
   }
   return moved;
