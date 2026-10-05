@@ -116,19 +116,21 @@ export type DedupReason = "hard" | "exact" | "llm-skip" | "llm-merge" | "unique"
 
 export type DedupReasonCounts = Record<DedupReason, number>;
 
-/** Secondary action on an existing memory during dedup (e.g., delete outdated entries). */
-export interface DedupAction {
-  id: string;
-  action: "delete";
-  reason: string;
-}
-
+/**
+ * 去重结论只回答「这条进来的切片存不存」，不带任何指向已有记忆的动作。
+ *
+ * 2026-10-05 之前这里还有一个 `secondaryDeletes`：模型可以顺手标记「过时」的已有记忆，
+ * 导入调用点原样 `store.delete`——候选不分 scope，不写审计、不记日志、错误吞掉。
+ * 2026-09-22T16:38:03Z 记忆文件导入就这样删掉了当天手写进 memory:pivot 的一条偏好
+ * （f5b67b51），11 秒后同一轮导入写入了内容相近的文档切片；到 10-05 核对时，显式存过、
+ * 不在主表、又没有 forget 记录的手写 pivot 记忆有 17 条。导入只新增和跳过，删除一律走
+ * forget_memory（有隐私级别检查与审计）。证据与脚本：sync-bridge
+ * `AI产出/2026-10-05-recallnest-forget-三处缺口/`；回归用例 `ingest-dedup-no-deletes.test.ts`。
+ */
 export interface DedupCheckResult {
   action: "store" | "skip";
   reason: DedupReason;
   existingText?: string;
-  /** Secondary actions on other existing memories (only populated with LLM dedup). */
-  secondaryDeletes?: DedupAction[];
 }
 
 function createDedupReasonCounts(): DedupReasonCounts {
@@ -146,26 +148,6 @@ function recordDedupDecision(result: IngestResult, decision: DedupCheckResult): 
   if (decision.reason !== "unique") {
     result.chunksDeduped += 1;
   }
-}
-
-/**
- * Execute secondary delete actions from a dedup decision.
- * Errors are isolated per-action to avoid cascading failures.
- */
-async function executeSecondaryDeletes(
-  store: MemoryStore,
-  deletes: DedupAction[],
-): Promise<number> {
-  let executed = 0;
-  for (const del of deletes) {
-    try {
-      await store.delete(del.id);
-      executed++;
-    } catch {
-      // Per-action error isolation: log and continue
-    }
-  }
-  return executed;
 }
 
 export function getDedupSkippedCount(result: IngestResult): number {
@@ -414,8 +396,6 @@ export async function dedupCheck(
         const hasMulti = typeof (llm as any).dedupDecisionMulti === "function";
 
         let primaryAction: "CREATE" | "MERGE" | "SKIP" = "CREATE";
-        let primaryReason = "";
-        const secondaryDeletes: DedupAction[] = [];
 
         if (hasMulti) {
           const candidates = results
@@ -423,48 +403,20 @@ export async function dedupCheck(
             .slice(0, DEDUP_CANDIDATE_LIMIT)
             .map(r => ({ id: r.entry.id, text: r.entry.text }));
 
+          // 只取「存 / 并 / 跳」这一个结论。候选来自全库（不分 scope），模型对它们没有处置权，
+          // 见 DedupCheckResult 上方的说明。
           const decision = await llm.dedupDecisionMulti(text, candidates);
           primaryAction = decision.action;
-          primaryReason = decision.reason;
-
-          // Build secondary deletes from validated actions (resolve IDs at parse time)
-          if (decision.actions) {
-            for (const act of decision.actions) {
-              const target = candidates[act.match_index - 1];
-              if (target) {
-                secondaryDeletes.push({
-                  id: target.id,
-                  action: "delete",
-                  reason: typeof act.reason === "string" ? act.reason : "",
-                });
-              }
-            }
-          }
         } else {
           const decision = await llm.dedupDecision(text, existingText);
           primaryAction = decision.action;
-          primaryReason = decision.reason;
         }
 
         if (primaryAction === "SKIP") {
-          return {
-            action: "skip",
-            reason: "llm-skip",
-            existingText,
-            ...(secondaryDeletes.length > 0 ? { secondaryDeletes } : {}),
-          };
+          return { action: "skip", reason: "llm-skip", existingText };
         }
         if (primaryAction === "MERGE") {
-          return {
-            action: "store",
-            reason: "llm-merge",
-            existingText,
-            ...(secondaryDeletes.length > 0 ? { secondaryDeletes } : {}),
-          };
-        }
-        // CREATE — still execute secondary deletes if any
-        if (secondaryDeletes.length > 0) {
-          return { action: "store", reason: "unique", secondaryDeletes };
+          return { action: "store", reason: "llm-merge", existingText };
         }
       } catch {
         // LLM failed, fall through to store
@@ -1334,9 +1286,6 @@ export async function ingestCodexSessions(
             if (!options.noDedup) {
               const decision = await dedupCheck(store, vector, batch[j], options.llm);
               recordDedupDecision(result, decision);
-              if (decision.secondaryDeletes?.length) {
-                await executeSecondaryDeletes(store, decision.secondaryDeletes);
-              }
               if (decision.action === "skip") continue;
             }
             dedupedTexts.push(batch[j]);
@@ -1635,9 +1584,6 @@ export async function ingestKimiSessions(
             if (!options.noDedup) {
               const decision = await dedupCheck(store, vector, batch[j], options.llm);
               recordDedupDecision(result, decision);
-              if (decision.secondaryDeletes?.length) {
-                await executeSecondaryDeletes(store, decision.secondaryDeletes);
-              }
               if (decision.action === "skip") continue;
             }
             dedupedTexts.push(batch[j]);
@@ -1840,9 +1786,6 @@ export async function ingestGeminiSessions(
             if (!options.noDedup) {
               const decision = await dedupCheck(store, vector, batch[j], options.llm);
               recordDedupDecision(result, decision);
-              if (decision.secondaryDeletes?.length) {
-                await executeSecondaryDeletes(store, decision.secondaryDeletes);
-              }
               if (decision.action === "skip") continue;
             }
             dedupedTexts.push(batch[j]);
@@ -2076,9 +2019,6 @@ export async function ingestCCTranscripts(
             if (!options.noDedup) {
               const decision = await dedupCheck(store, vector, batch[j], options.llm);
               recordDedupDecision(result, decision);
-              if (decision.secondaryDeletes?.length) {
-                await executeSecondaryDeletes(store, decision.secondaryDeletes);
-              }
               if (decision.action === "skip") continue;
             }
 
@@ -2230,9 +2170,6 @@ export async function ingestMarkdownFiles(
             if (!options.noDedup) {
               const decision = await dedupCheck(store, vector, batch[j], options.llm);
               recordDedupDecision(result, decision);
-              if (decision.secondaryDeletes?.length) {
-                await executeSecondaryDeletes(store, decision.secondaryDeletes);
-              }
               if (decision.action === "skip") continue;
             }
             dedupedTexts.push(batch[j]);
@@ -2364,9 +2301,6 @@ export async function ingestGenericText(
             if (!options.noDedup) {
               const decision = await dedupCheck(store, vector, batch[j], options.llm);
               recordDedupDecision(result, decision);
-              if (decision.secondaryDeletes?.length) {
-                await executeSecondaryDeletes(store, decision.secondaryDeletes);
-              }
               if (decision.action === "skip") continue;
             }
             dedupedTexts.push(batch[j]);
@@ -2483,9 +2417,6 @@ export async function ingestConnectorFile(
         if (!options.noDedup) {
           const decision = await dedupCheck(store, vector, texts[j], options.llm);
           recordDedupDecision(result, decision);
-          if (decision.secondaryDeletes?.length) {
-            await executeSecondaryDeletes(store, decision.secondaryDeletes);
-          }
           if (decision.action === "skip") continue;
         }
         dedupedTexts.push(texts[j]);
