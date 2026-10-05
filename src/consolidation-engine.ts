@@ -2,7 +2,9 @@
  * Semantic Consolidation Engine
  *
  * Borrowed from UltraMemory's consolidation-engine.ts, adapted for RecallNest:
- * - Uses RecallNest's store.vectorSearch() + store.update() (no patchMetadata)
+ * - Uses RecallNest's store.vectorSearch(); metadata writes go through store.patchMetadataBatch()
+ *   (read inside the store-write lock, rows that no longer exist are skipped — never re-inserted).
+ *   This line used to say "store.update() (no patchMetadata)"; that stopped being true on 2026-08-14.
  * - Integrates with RecallNest's existing conflict-engine for conflict creation
  * - Uses RecallNest's metadata structure (boundary.layer, canonicalKey, etc.)
  *
