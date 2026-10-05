@@ -413,7 +413,7 @@ RecallNest 提供两种接口：
 | `data_checkup` | 运行数据质量健康检查 |
 | `dream` | 离线记忆整合（聚类、合并、修剪） |
 | `memory_lint` | 记忆质量检查：矛盾、重复、过期、孤儿 |
-| `forget_memory` | 级联删除记忆 + KG 清理 + Pin 归档 + 审计 |
+| `forget_memory` | 删除记忆，连同它的 KG 三元组与 trigger 行，由它生成的 pin 归档，删后回读核对，写审计 |
 | `export_graph` | 导出交互式 HTML 知识图谱 |
 
 </details>

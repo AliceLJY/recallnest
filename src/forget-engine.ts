@@ -1,19 +1,41 @@
 /**
- * Forget Engine — Ethics-aware memory deletion with full cascade.
+ * Forget Engine — ethics-aware memory deletion, with a read-back.
  *
- * Philosophy: "The right to forget" — memories can be explicitly removed,
- * but the process must be auditable, reversible (via evidence export),
- * and propagated to all derived artifacts (KG triples, pins, evolution chains).
+ * Philosophy: "The right to forget" — a memory can be explicitly removed, the
+ * removal is auditable, and it reaches the places this engine knows the memory
+ * left a copy or a pointer in.
  *
- * Sequence:
- * 1. Fetch target memory
+ * Sequence (the step comments in forgetMemory() carry the same numbers and names;
+ * forget-cascade-completeness.test.ts fails if the two lists drift apart):
+ * 1. Fetch target
  * 2. Privacy tier check (durable requires explicit confirm)
- * 3. Evidence export (snapshot before deletion for audit trail)
- * 4. KG triple cleanup (via KGStore.deleteBySource)
- * 5. Pin archive (mark related pins as forgotten)
- * 6. Cascade demote (related memories via cascade-forget.ts)
- * 7. Primary delete (remove from LanceDB)
- * 8. Audit log (record the forget operation)
+ * 3. Evidence snapshot (returned to the caller, not persisted)
+ * 4. Trigger rows (delete its rows in memory_triggers; a failure aborts before anything else is touched)
+ * 5. Pin archive (move pins made from it out of data/pins; a failure aborts, the primary row stays)
+ * 6. KG triples (KGStore.deleteBySource; a failure is logged and the forget continues)
+ * 7. Cascade demote (related memories lose importance, via cascade-forget.ts)
+ * 8. Evolution breadcrumb (mark the row archived just before deleting it)
+ * 9. Primary delete (remove the row from LanceDB)
+ * 10. Read-back (fetch the id again; count what is left in triggers, pins and KG)
+ * 11. Audit log (record the operation and what the read-back found)
+ *
+ * Steps 4 and 5 fail closed, and run before anything irreversible: once the primary
+ * row is gone, forget() can no longer find the id, so whatever those steps left
+ * behind would have no tool to remove it.
+ *
+ * Not covered — forgetting a memory does NOT touch:
+ * - memories derived from it by dream / consolidation (insights, patterns), or
+ *   evolution references held by other rows (supersedes, sourceMemories, consolidatedInto);
+ * - brief assets and exports that quoted it;
+ * - document slices or transcript chunks in other scopes that say the same thing;
+ * - older LanceDB table versions, backups, and the session transcripts it came from.
+ * The audit entry carries the normalized text fingerprint so that the memory-file
+ * reconciler does not put the same text back (memory-reconcile.ts).
+ *
+ * Until 2026-10-05 this header promised propagation to "all derived artifacts
+ * (KG triples, pins, evolution chains)" while the body had no pin code at all, the
+ * memory_triggers side table (added 2026-09-22) was never cleaned, and nothing
+ * read back after the delete.
  */
 
 import type { MemoryStore, MemoryEntry } from "./store.js";
@@ -52,6 +74,15 @@ export interface ForgetEvidence {
   reason?: string;
 }
 
+/** What the read-back after the delete found. `null` = that layer is not wired in, or counting it failed. */
+export interface ForgetVerification {
+  /** gone = the id no longer resolves; present = it still does; unverified = the read itself failed */
+  primary: "gone" | "present" | "unverified";
+  triggerRowsLeft: number | null;
+  pinsLeft: number | null;
+  kgTriplesLeft: number | null;
+}
+
 export interface ForgetResult {
   /** Whether the memory was successfully forgotten */
   success: boolean;
@@ -59,12 +90,33 @@ export interface ForgetResult {
   memoryId: string;
   /** Evidence snapshot (for audit/undo) */
   evidence?: ForgetEvidence;
-  /** Number of KG triples removed */
+  /** Whether the KG cleanup ran without error */
   kgTriplesRemoved: boolean;
+  /** Rows removed from memory_triggers (null when no trigger store is wired in) */
+  triggerRowsRemoved: number | null;
+  /** Pins moved to the archive (null when no pin archive is wired in) */
+  pinsArchived: number | null;
   /** Cascade demote results */
   cascadeResult: { demotedCount: number; demotedIds: string[] };
+  /** Read-back after the primary delete (absent when the forget stopped before deleting) */
+  verification?: ForgetVerification;
   /** Error message if failed */
   error?: string;
+}
+
+/** The slice of TriggerStore the forget engine needs. */
+export interface ForgetTriggerStore {
+  /** Delete every trigger row of this memory; resolves to the number of rows removed. */
+  deleteForMemory(memoryId: string): Promise<number>;
+  countForMemory(memoryId: string): Promise<number>;
+}
+
+/** Pins made from a memory (memory-assets.ts: archivePinAssetsForMemory / findPinAssetsForMemory). */
+export interface ForgetPinArchive {
+  /** Move this memory's pins out of the pins directory; returns how many were moved. */
+  archiveForMemory(memoryId: string): number;
+  /** How many pins made from this memory are still in the pins directory. */
+  countForMemory(memoryId: string): number;
 }
 
 export interface ForgetByIdDeps {
@@ -72,6 +124,68 @@ export interface ForgetByIdDeps {
   kgStore?: KGStore | null;
   auditLogger?: AuditLogger | null;
   cascadeConfig?: CascadeForgetConfig;
+  /** Omit to skip step 4 (callers that have no trigger side table). */
+  triggerStore?: ForgetTriggerStore | null;
+  /** Omit to skip step 5. */
+  pins?: ForgetPinArchive | null;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function failed(memoryId: string, error: string, partial: Partial<ForgetResult> = {}): ForgetResult {
+  return {
+    success: false,
+    memoryId,
+    kgTriplesRemoved: false,
+    triggerRowsRemoved: null,
+    pinsArchived: null,
+    cascadeResult: { demotedCount: 0, demotedIds: [] },
+    error,
+    ...partial,
+  };
+}
+
+/** Step 10. Checks by id only: every retrieval path can return a row only if it is still in the table. */
+async function readBack(deps: ForgetByIdDeps, id: string, scopeFilter?: string[]): Promise<ForgetVerification> {
+  const { store, kgStore, triggerStore, pins } = deps;
+
+  let primary: ForgetVerification["primary"] = "unverified";
+  try {
+    primary = (await store.get(id, scopeFilter)) ? "present" : "gone";
+  } catch (err) {
+    console.error("[recallnest] Read-back of the primary row failed after forget:", errorMessage(err));
+  }
+
+  let triggerRowsLeft: number | null = null;
+  if (triggerStore) {
+    try {
+      triggerRowsLeft = await triggerStore.countForMemory(id);
+    } catch (err) {
+      console.error("[recallnest] Read-back of trigger rows failed after forget:", errorMessage(err));
+    }
+  }
+
+  let pinsLeft: number | null = null;
+  if (pins) {
+    try {
+      pinsLeft = pins.countForMemory(id);
+    } catch (err) {
+      console.error("[recallnest] Read-back of pins failed after forget:", errorMessage(err));
+    }
+  }
+
+  let kgTriplesLeft: number | null = null;
+  if (kgStore && typeof kgStore.getTriplesBySourceMemories === "function") {
+    try {
+      kgTriplesLeft = (await kgStore.getTriplesBySourceMemories([id])).get(id)?.length ?? 0;
+    } catch (err) {
+      console.error("[recallnest] Read-back of KG triples failed after forget:", errorMessage(err));
+    }
+  }
+
+  return { primary, triggerRowsLeft, pinsLeft, kgTriplesLeft };
 }
 
 // ---------------------------------------------------------------------------
@@ -82,34 +196,22 @@ export async function forgetMemory(
   deps: ForgetByIdDeps,
   request: ForgetRequest,
 ): Promise<ForgetResult> {
-  const { store, kgStore, auditLogger, cascadeConfig } = deps;
+  const { store, kgStore, auditLogger, cascadeConfig, triggerStore, pins } = deps;
   const { memoryId, confirm, reason, scopeFilter } = request;
 
   // 1. Fetch target
   const entry = await store.get(memoryId, scopeFilter);
   if (!entry) {
-    return {
-      success: false,
-      memoryId,
-      kgTriplesRemoved: false,
-      cascadeResult: { demotedCount: 0, demotedIds: [] },
-      error: `Memory ${memoryId} not found`,
-    };
+    return failed(memoryId, `Memory ${memoryId} not found`);
   }
 
   // 2. Privacy tier check
   const privacyTier = parsePrivacyTier(entry.metadata);
   if (privacyTier === "durable" && !confirm) {
-    return {
-      success: false,
-      memoryId: entry.id,
-      kgTriplesRemoved: false,
-      cascadeResult: { demotedCount: 0, demotedIds: [] },
-      error: `Memory ${entry.id} has privacy tier "durable" — set confirm=true to proceed`,
-    };
+    return failed(entry.id, `Memory ${entry.id} has privacy tier "durable" — set confirm=true to proceed`);
   }
 
-  // 3. Evidence export (snapshot before deletion)
+  // 3. Evidence snapshot
   const evolution = parseEvolution(entry.metadata, entry.timestamp);
   const evidence: ForgetEvidence = {
     entry: { ...entry },
@@ -119,18 +221,45 @@ export async function forgetMemory(
     reason,
   };
 
-  // 4. KG triple cleanup
+  // 4. Trigger rows — fail closed (see the file header)
+  let triggerRowsRemoved: number | null = null;
+  if (triggerStore) {
+    try {
+      triggerRowsRemoved = await triggerStore.deleteForMemory(entry.id);
+    } catch (err) {
+      return failed(entry.id, `Trigger cleanup failed: ${errorMessage(err)}. Nothing was deleted; retry the forget.`, { evidence });
+    }
+  }
+
+  // 5. Pin archive — fail closed
+  let pinsArchived: number | null = null;
+  if (pins) {
+    try {
+      pinsArchived = pins.archiveForMemory(entry.id);
+    } catch (err) {
+      const triggerNote = triggerRowsRemoved
+        ? ` Its ${triggerRowsRemoved} trigger row(s) were already removed; restore them with \`triggers-backfill --rebuild --apply\`, or retry the forget.`
+        : " Retry the forget.";
+      return failed(
+        entry.id,
+        `Pin archive failed: ${errorMessage(err)}. The memory itself was not deleted.${triggerNote}`,
+        { evidence, triggerRowsRemoved },
+      );
+    }
+  }
+
+  // 6. KG triples
   let kgTriplesRemoved = false;
   if (kgStore) {
     try {
       await kgStore.deleteBySource(entry.id);
       kgTriplesRemoved = true;
     } catch (err) {
-      console.error("[recallnest] KG cleanup failed during forget:", err instanceof Error ? err.message : String(err));
+      console.error("[recallnest] KG cleanup failed during forget:", errorMessage(err));
     }
   }
 
-  // 5. Cascade demote (related memories get importance reduction)
+  // 7. Cascade demote
   let cascadeResult = { demotedCount: 0, demotedIds: [] as string[] };
   try {
     cascadeResult = await cascadeForget(
@@ -139,10 +268,10 @@ export async function forgetMemory(
       cascadeConfig ?? DEFAULT_CASCADE_FORGET_CONFIG,
     );
   } catch (err) {
-    console.error("[recallnest] Cascade demote failed during forget:", err instanceof Error ? err.message : String(err));
+    console.error("[recallnest] Cascade demote failed during forget:", errorMessage(err));
   }
 
-  // 6. Mark evolution status as "forgotten" before delete (audit breadcrumb)
+  // 8. Evolution breadcrumb
   try {
     const patchedMetadata = patchEvolution(entry.metadata, {
       status: "archived" as any,
@@ -150,33 +279,40 @@ export async function forgetMemory(
     });
     await store.update(entry.id, { metadata: patchedMetadata }, scopeFilter);
   } catch (err) {
-    console.error("[recallnest] Evolution patch failed during forget:", err instanceof Error ? err.message : String(err));
+    console.error("[recallnest] Evolution patch failed during forget:", errorMessage(err));
   }
 
-  // 7. Primary delete
+  const progress = { evidence, kgTriplesRemoved, triggerRowsRemoved, pinsArchived, cascadeResult };
+
+  // 9. Primary delete
   try {
     await store.delete(entry.id, scopeFilter);
   } catch (err) {
-    return {
-      success: false,
-      memoryId: entry.id,
-      evidence,
-      kgTriplesRemoved,
-      cascadeResult,
-      error: `Delete failed: ${err instanceof Error ? err.message : String(err)}`,
-    };
+    return failed(entry.id, `Delete failed: ${errorMessage(err)}`, progress);
   }
 
-  // 8. Audit log
+  // 10. Read-back
+  const verification = await readBack(deps, entry.id, scopeFilter);
+  if (verification.primary === "present") {
+    return failed(
+      entry.id,
+      `Delete reported success but memory ${entry.id} is still readable`,
+      { ...progress, verification },
+    );
+  }
+
+  // 11. Audit log
   try {
+    const count = (n: number | null) => (n === null ? "n/a" : String(n));
     auditLogger?.log({
       operation: "forget",
       scope: entry.scope,
       memoryId: entry.id,
       actor: "system",
-      // norm=<归一文本指纹> 放最前（details 超 200 字会被截断）：删的是这一行，要忘的是这段文字。
-      // 记忆文件对账据此不把同文的另一行恢复回来（memory-reconcile.ts），只认 id 的话换个空白就绕过去了。
-      details: `norm=${textFingerprint(entry.text)} tier=${privacyTier} reason=${reason || "none"} cascade=${cascadeResult.demotedCount}`,
+      // norm=<归一文本指纹> 放最前：删的是这一行，要忘的是这段文字。记忆文件对账据此不把同文的另一行
+      // 恢复回来（memory-reconcile.ts），只认 id 的话换个空白就绕过去了。
+      // reason 是自由文本，放最后：details 超 200 字会被截断，前面的字段不能被它挤掉。
+      details: `norm=${textFingerprint(entry.text)} tier=${privacyTier} triggers=${count(triggerRowsRemoved)} pins=${count(pinsArchived)} verify=${verification.primary} cascade=${cascadeResult.demotedCount} reason=${reason || "none"}`,
     });
     if (cascadeResult.demotedCount > 0) {
       auditLogger?.log({
@@ -188,15 +324,14 @@ export async function forgetMemory(
       });
     }
   } catch (err) {
-    console.error("[recallnest] Audit log failed during forget:", err instanceof Error ? err.message : String(err));
+    console.error("[recallnest] Audit log failed during forget:", errorMessage(err));
   }
 
   return {
     success: true,
     memoryId: entry.id,
-    evidence,
-    kgTriplesRemoved,
-    cascadeResult,
+    ...progress,
+    verification,
   };
 }
 
