@@ -74,7 +74,7 @@ places where the obvious implementation was wrong — is in
 
 | Capability | Description |
 |---|---|
-| **Hybrid Retrieval** | 6-channel: vector + BM25 + L0/L1/L2 multi-vector + KG graph (PPR) |
+| **Hybrid Retrieval** | 6-channel: vector + BM25 + L0/L1/L2 multi-vector + KG graph (PPR). The default mode is vector-only (since 2026-06); BM25 fusion and graph expansion are opt-in |
 | **Write-time Triggers** | Each memory can carry 2–6 "how will this be asked about later" phrasings (`triggers`), embedded separately and used only for recall — never rendered as evidence. Borrowed from Tencent T-Mem (EMNLP 2026). |
 | **4 Retrieval Profiles** | default, writing, debug, fact-check — tuned for different tasks |
 | **Session Continuity** | `checkpoint_session` + `resume_context` (full/light/summary modes) with repo-state guard |
