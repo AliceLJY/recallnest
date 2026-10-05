@@ -75,6 +75,10 @@ function formatForgetResult(result: ForgetResult): string {
   if (v && v.unverified.length > 0 && state !== "unverified") {
     lines.push(`Could not check: ${v.unverified.join(", ")}`);
   }
+  if (result.pinsArchived) {
+    // 归档是挪走不是删：文件里还有那段正文，调用方得知道它在哪
+    lines.push("Archived pin files were moved, not erased: they are in data/archive/forgotten-pins and still hold the snippet. Delete them there if the content itself has to go.");
+  }
   if (result.evidence?.reason) {
     lines.push(`Reason: ${result.evidence.reason}`);
   }
