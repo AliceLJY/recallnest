@@ -14,8 +14,8 @@ import { MemoryStore } from "../store.js";
  * 起因：`dedupCheck` 的候选不分 scope，分数落在软硬阈值之间时问模型，而提示词给了模型
  * 「可以在 actions 里标记删除」的能力，七处导入调用点原样执行 `store.delete`——不写审计、
  * 不记日志、错误吞掉。2026-09-22T16:38:03Z 记忆文件导入就这样删掉了当天手写进
- * memory:pivot 的一条偏好（f5b67b51），11 秒后同一轮导入写入了内容相近的文档切片。
- * 到 10-05 核对时，显式存过、不在主表、又没有 forget 记录的手写 pivot 记忆有 17 条。
+ * 人工维护那一层的一条偏好，11 秒后同一轮导入写入了内容相近的文档切片。
+ * 到 10-05 核对时，显式存过、不在主表、又没有 forget 记录的手写记忆有 17 条。
  */
 
 const cleanupPaths: string[] = [];
@@ -167,6 +167,19 @@ describe("多候选去重的提示词与解析", () => {
     expect(decision.action).toBe("CREATE");
     expect(decision.reason).toBe("不同的事");
     expect(Object.keys(decision).sort()).toEqual(["action", "reason"]);
+  });
+
+  it("只有一个候选时走单候选分支，同样只带出结论与原因", async () => {
+    const seen = { system: "" };
+    const llm = client(
+      JSON.stringify({ action: "SKIP", reason: "同一件事", actions: [{ match_index: 1, action: "delete", reason: "过时" }], extra: 1 }),
+      seen,
+    );
+    const viaMulti = await llm.dedupDecisionMulti("一条新进来的切片", CANDIDATES.slice(0, 1));
+    expect(viaMulti).toEqual({ action: "SKIP", reason: "同一件事" });
+    const direct = await llm.dedupDecision("一条新进来的切片", CANDIDATES[0].text);
+    expect(direct).toEqual({ action: "SKIP", reason: "同一件事" });
+    expect(seen.system).not.toContain("删除");
   });
 
   it("提示词不再给模型删除已有记忆的能力", async () => {

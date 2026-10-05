@@ -121,11 +121,11 @@ export type DedupReasonCounts = Record<DedupReason, number>;
  *
  * 2026-10-05 之前这里还有一个 `secondaryDeletes`：模型可以顺手标记「过时」的已有记忆，
  * 导入调用点原样 `store.delete`——候选不分 scope，不写审计、不记日志、错误吞掉。
- * 2026-09-22T16:38:03Z 记忆文件导入就这样删掉了当天手写进 memory:pivot 的一条偏好
- * （f5b67b51），11 秒后同一轮导入写入了内容相近的文档切片；到 10-05 核对时，显式存过、
- * 不在主表、又没有 forget 记录的手写 pivot 记忆有 17 条。导入只新增和跳过，删除一律走
- * forget_memory（有隐私级别检查与审计）。证据与脚本：sync-bridge
- * `AI产出/2026-10-05-recallnest-forget-三处缺口/`；回归用例 `ingest-dedup-no-deletes.test.ts`。
+ * 2026-09-22T16:38:03Z 记忆文件导入就这样删掉了当天手写进人工维护那一层的一条偏好，
+ * 11 秒后同一轮导入写入了内容相近的文档切片；到 10-05 核对时，显式存过、不在主表、又没有
+ * forget 记录的手写记忆有 17 条。导入只新增和跳过，删除一律走 forget_memory（有隐私级别
+ * 检查与审计）。经过与数字见 CHANGELOG「Ingest dedup can no longer delete existing memories」；
+ * 回归用例 `ingest-dedup-no-deletes.test.ts`。
  */
 export interface DedupCheckResult {
   action: "store" | "skip";

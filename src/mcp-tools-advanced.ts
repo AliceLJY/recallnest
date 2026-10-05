@@ -6,7 +6,7 @@ import { autoCapture } from "./capture-heuristic.js";
 import { computeSynthesisUptake } from "./consolidation-engine.js";
 import { runDataCheckup, formatCheckupReport } from "./data-checkup.js";
 import { runDream, formatDreamResult } from "./dream-pipeline.js";
-import { forgetMemory, type ForgetResult } from "./forget-engine.js";
+import { forgetMemory, summarizeVerification, type ForgetPinArchive, type ForgetResult } from "./forget-engine.js";
 import { exportMemoryGraph, formatGraphExportResult } from "./graph-export.js";
 import { archivePinAssetsForMemory, assetSummaryLine, buildBriefAsset, buildPinAsset, findPinAssetsForMemory, listMemoryAssets, listPinAssets, saveBriefAsset, savePinAsset, writeExportArtifact } from "./memory-assets.js";
 import { runMemoryLint, formatMemoryLintReport } from "./memory-lint.js";
@@ -32,23 +32,35 @@ function entryToRetrievalResult(entry: Awaited<ReturnType<MemoryStore["get"]>>):
   };
 }
 
-/** forget_memory 的输出：逐项报数，回读结果写在明处；有残留或没核成时第一行不打勾。 */
+/** The data/pins directory, as forget_memory uses it when nothing else is injected. */
+const defaultForgetPins: ForgetPinArchive = {
+  archiveForMemory: (id) => archivePinAssetsForMemory(id).length,
+  countForMemory: (id) => findPinAssetsForMemory(id).length,
+};
+
+/**
+ * forget_memory 的输出：逐项报数，回读结果写在明处。
+ * 第一行只有在回读「干净」时才打勾：id 取不到了、哪一层都没数出残留、也没有哪一层查不了。
+ */
 function formatForgetResult(result: ForgetResult): string {
   const id = result.memoryId.slice(0, 8);
   const count = (n: number | null | undefined) => (n === null || n === undefined ? "n/a" : String(n));
   const v = result.verification;
-  const leftovers: string[] = [];
-  if (v?.triggerRowsLeft) leftovers.push(`trigger rows ${v.triggerRowsLeft}`);
-  if (v?.pinsLeft) leftovers.push(`pins ${v.pinsLeft}`);
-  if (v?.kgTriplesLeft) leftovers.push(`KG triples ${v.kgTriplesLeft}`);
+  const state = v ? summarizeVerification(v) : "unverified";
 
   let head: string;
-  if (leftovers.length > 0) {
-    head = `⚠️ Memory ${id} forgotten, but the read-back found leftovers: ${leftovers.join(", ")}.`;
-  } else if (v?.primary === "gone") {
+  if (state === "clean") {
     head = `✅ Memory ${id} forgotten.`;
+  } else if (state === "leftovers" && v) {
+    const leftovers: string[] = [];
+    if (v.triggerRowsLeft) leftovers.push(`trigger rows ${v.triggerRowsLeft}`);
+    if (v.pinsLeft) leftovers.push(`pin files ${v.pinsLeft}`);
+    if (v.pinIndexRowsLeft) leftovers.push(`pin index rows ${v.pinIndexRowsLeft}`);
+    if (v.kgTriplesLeft) leftovers.push(`KG triples ${v.kgTriplesLeft}`);
+    head = `⚠️ Memory ${id} forgotten, but the read-back found leftovers: ${leftovers.join(", ")}.`;
   } else {
-    head = `⚠️ Memory ${id} deleted, but the read-back could not confirm it.`;
+    const unchecked = v && v.unverified.length > 0 ? v.unverified.join(", ") : "primary";
+    head = `⚠️ Memory ${id} deleted, but the read-back could not check: ${unchecked}.`;
   }
 
   const lines = [
@@ -56,10 +68,13 @@ function formatForgetResult(result: ForgetResult): string {
     `Privacy tier: ${result.evidence?.privacyTier || "unknown"}`,
     `KG triples removed: ${result.kgTriplesRemoved ? "yes" : "no/N/A"}`,
     `Trigger rows removed: ${count(result.triggerRowsRemoved)}`,
-    `Pins archived: ${count(result.pinsArchived)}`,
+    `Pins archived: ${count(result.pinsArchived)} (index rows removed: ${count(result.pinIndexRowsRemoved)})`,
     `Cascade demoted: ${result.cascadeResult.demotedCount} related memories`,
-    `Read-back: ${v?.primary ?? "unverified"} (trigger rows ${count(v?.triggerRowsLeft)}, pins ${count(v?.pinsLeft)}, KG triples ${count(v?.kgTriplesLeft)} left)`,
+    `Read-back: ${v?.primary ?? "unverified"} (left: trigger rows ${count(v?.triggerRowsLeft)}, pin files ${count(v?.pinsLeft)}, pin index rows ${count(v?.pinIndexRowsLeft)}, KG triples ${count(v?.kgTriplesLeft)})`,
   ];
+  if (v && v.unverified.length > 0 && state !== "unverified") {
+    lines.push(`Could not check: ${v.unverified.join(", ")}`);
+  }
   if (result.evidence?.reason) {
     lines.push(`Reason: ${result.evidence.reason}`);
   }
@@ -67,7 +82,7 @@ function formatForgetResult(result: ForgetResult): string {
 }
 
 export function registerAdvancedTools(deps: ToolRegistryDeps): void {
-  const { registerTool, getComponents, conflictStore, getKGExtractor, getKGStore, auditLogger } = deps;
+  const { registerTool, getComponents, conflictStore, getKGExtractor, getKGStore, auditLogger, forgetPins } = deps;
 
 registerTool(
   "store_workflow_pattern",
@@ -507,7 +522,7 @@ registerTool(
 
 registerTool(
   "forget_memory",
-  "Permanently forget a memory: delete the primary entry, remove its KG triples and trigger rows, archive pins made from it, demote related memories, read back to confirm, and log an audit trail. Requires confirm=true for durable-tier memories. Use when the user explicitly requests a memory be forgotten, or to clean up sensitive/incorrect data.",
+  "Permanently forget a memory: delete the primary entry, remove its KG triples and trigger rows, remove pins made from it (the file is archived, its indexed copy deleted), demote related memories, read back to confirm, and log an audit trail. Requires confirm=true for durable-tier memories. Use when the user explicitly requests a memory be forgotten, or to clean up sensitive/incorrect data.",
   {
     memoryId: z.string().min(1).max(128).describe("Memory ID to forget (full UUID or 8+ hex prefix)"),
     confirm: z.boolean().default(false).describe("Required confirmation — must be true for durable-tier memories"),
@@ -526,10 +541,7 @@ registerTool(
         kgStore: kgStoreInstance,
         auditLogger,
         triggerStore,
-        pins: {
-          archiveForMemory: (id) => archivePinAssetsForMemory(id).length,
-          countForMemory: (id) => findPinAssetsForMemory(id).length,
-        },
+        pins: forgetPins ?? defaultForgetPins,
       },
       { memoryId, confirm, reason, scopeFilter },
     );

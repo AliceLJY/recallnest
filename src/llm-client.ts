@@ -527,7 +527,8 @@ export class LLMClient {
 
       const parsed = parseJSON<DedupDecision>(response);
       if (parsed && (parsed.action === "CREATE" || parsed.action === "MERGE" || parsed.action === "SKIP")) {
-        return parsed;
+        // 只带出结论与原因。多候选分支只有一个候选时也走这里，模型多返回的字段同样不外传。
+        return { action: parsed.action, reason: parsed.reason ?? "" };
       }
 
       return { action: "CREATE", reason: "JSON 解析失败" };
