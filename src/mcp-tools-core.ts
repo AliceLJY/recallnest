@@ -399,7 +399,7 @@ registerTool(
     graph: z.boolean().default(false).optional().describe("Enable KG graph traversal (PPR) for relationship-aware search. Use when query involves entity relationships (e.g. 'what tools does Alice use', 'Bob的朋友')."),
     includeArchived: z.boolean().default(false).optional().describe("When true, also return archived/superseded/consolidated memories (default: only active)"),
     detail_level: z.enum(["brief", "normal", "full", "adaptive"]).default("normal").optional()
-      .describe("Result detail level: brief (ID+score+one-liner), normal (default, table), full (include metadata), adaptive (per-result L0/L1/L2 fidelity by relevance within an 8k token budget — high-relevance gets full text, lower gets summary/one-line)"),
+      .describe("Result detail level: normal (default — the full text of each hit, in rank order. One entry is capped at 2400 chars. Full text is handed out until an 8k-token budget is used up; hits past that point get a query-aware snippet instead of being dropped, so a long list can run past 8k by one snippet per remaining hit, and each related-scope block has its own budget. Any shortened entry says how much of it is shown and gives the id for memory_drill_down), brief (ID+score+one-liner), full (table with 120-char snippets plus extra metadata), adaptive (full text only for hits scoring above the threshold, query-aware snippet for the rest, 8k-token budget)"),
     topicTag: z.string().min(1).max(60).optional()
       .describe("Filter by topic tag (e.g. 'auth', 'deploy', 'testing'). Only returns memories tagged with this topic."),
     reconstruct: z.boolean().default(false).describe(

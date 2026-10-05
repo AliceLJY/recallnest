@@ -8,7 +8,7 @@ import { parseNarrative } from "./narrative-schema.js";
 import { getConfidence, getConfidenceMetadata } from "./confidence-tracker.js";
 import { estimateTokens } from "./context-collapse-renderer.js";
 import { evaluateEntryFreshness, createFreshnessCache } from "./freshness.js";
-import { fullTextScoreThreshold } from "./env-config.js";
+import { fullTextScoreThreshold, searchFirstScreen } from "./env-config.js";
 
 interface MemoryMetadata {
   source?: string;
@@ -301,8 +301,12 @@ function pickBestSnippet(query: string, text: string): string {
  * adaptive 专用 query-aware snippet：取匹配词周围窗口（而非整句/开头），保证匹配证据可见。
  * 解决 pickBestSnippet 的两个退化（Codex 审点4 C 版 P2）：① 短缩写 query（如 "CI"）
  * extractTerms 提取不到词 → 退回开头；② 匹配在超长句/log 行后段 → cleanSnippet 从头截断丢匹配。
- * 只给 adaptive 用，不改 pickBestSnippet（避免影响 normal/explain 的既有行为）。
+ * adaptive 档与默认第一屏（`formatFullTextResults` 里超预算降级的那条路）共用；旧表格（legacy）与 explain
+ * 走的是 pickBestSnippet，不经这里。
  */
+const ADAPTIVE_SNIPPET_BEFORE = 60;
+const ADAPTIVE_SNIPPET_AFTER = 180;
+
 function adaptiveSnippet(query: string, text: string): string {
   const clean = text.replace(/\s+/g, " ").trim();
   const lower = clean.toLowerCase();
@@ -330,10 +334,8 @@ function adaptiveSnippet(query: string, text: string): string {
   }
   if (matchIdx < 0) return pickBestSnippet(query, text); // 完全无匹配 → 退回整句最佳
 
-  const WINDOW_BEFORE = 60;
-  const WINDOW_AFTER = 180;
-  const start = Math.max(0, matchIdx - WINDOW_BEFORE);
-  const end = Math.min(clean.length, matchIdx + WINDOW_AFTER);
+  const start = Math.max(0, matchIdx - ADAPTIVE_SNIPPET_BEFORE);
+  const end = Math.min(clean.length, matchIdx + ADAPTIVE_SNIPPET_AFTER);
   let snip = clean.slice(start, end).trim();
   if (start > 0) snip = "…" + snip;
   if (end < clean.length) snip = snip + "…";
@@ -514,7 +516,11 @@ export function formatFullResults(
   return lines.join("\n");
 }
 
-export function formatSearchResults(
+/**
+ * 2026-10-05 之前的默认第一屏：表格 + 每条 120 字片段。函数体一个字没动，只是改了名。
+ * 现在只在 `RECALLNEST_SEARCH_FIRST_SCREEN=legacy` 时由 `formatSearchResults` 走到（退回开关）。
+ */
+export function formatLegacyTableResults(
   results: RetrievalResult[],
   context: RenderContext,
 ): string {
@@ -549,6 +555,182 @@ export function formatSearchResults(
 }
 
 const ADAPTIVE_TOKEN_BUDGET = 8000;
+
+/**
+ * 默认第一屏单条正文的封顶（按码点数）。
+ *
+ * 线是照库里的实际长度定的（2026-10-05 只读快照，138,501 条活跃记忆）：手写与提炼条目最长 2,278、
+ * 会话切片最长 2,077、记忆文件切片最长 1,523，都在线下，永远给全文；会被截的只有项目文档的大切片
+ * （`project:` 7,797 条，中位 2,401、最长 3,990）。封顶防的是一条长文档排第一时把后面几条的预算吃光。
+ */
+const FIRST_SCREEN_ENTRY_CAP = 2400;
+
+const DISTILLED_NOTE_FULLTEXT =
+  "entries with an orig line are batch-distilled paraphrases of old sessions; " +
+  "orig is the source text (it may be the assistant's words, not the user's) — trust orig";
+
+/**
+ * 条目行末尾的出处：有会话编号就给 `sess=前 8 位`（imgs 行、Deja 回查用的都是它）；文件名只在它不是
+ * 会话编号的重复时才给——Claude Code 的会话文件叫 `<会话编号>.jsonl`、Codex 的叫 `rollout-<时间>-<会话编号>.jsonl`，
+ * 再写一遍每条白占四五十个字。
+ */
+function getOriginLabel(result: RetrievalResult): string[] {
+  const meta = parseMetadata(result.entry);
+  const sessionId = typeof meta.sessionId === "string" ? meta.sessionId : "";
+  const file = getFileLabel(result);
+  const parts: string[] = [];
+  if (sessionId) parts.push(`sess=${sessionId.slice(0, 8)}`);
+  // 要整段会话编号对上才算重复：只对上前 8 位的可能是另有内容的文件名。
+  const repeatsSession = sessionId !== "" && file.endsWith(`${sessionId}.jsonl`);
+  if (file !== "-" && !repeatsSession) parts.push(file);
+  return parts;
+}
+
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/**
+ * adaptiveSnippet / cleanSnippet 按 UTF-16 下标切，窗口边上可能留下半个代理对。
+ * 默认第一屏这条路上把落单的那半个去掉；那两个函数本身不动（adaptive、legacy、explain 的输出不变）。
+ */
+function dropLoneSurrogates(text: string): string {
+  return text.replace(LONE_SURROGATE, "");
+}
+
+/** 片段里属于原文的字数：去掉片段函数在两头补的省略号。 */
+function snippetSourceChars(snippet: string): number {
+  return Array.from(snippet.replace(/^…/, "").replace(/(…|\.\.\.)$/, "")).length;
+}
+
+/** 按码点取开头一段，不把代理对切成两半。`total` 是整条的码点数。 */
+function headByCodePoints(text: string, max: number): { head: string; total: number; truncated: boolean } {
+  const points = Array.from(text);
+  if (points.length <= max) return { head: text, total: points.length, truncated: false };
+  return { head: points.slice(0, max).join(""), total: points.length, truncated: true };
+}
+
+/**
+ * 默认第一屏（2026-10-05 起）：按名次给正文全文。
+ *
+ * 为什么不沿用 120 字片段：同一批 48 条真实查询、同一份命中，三位读者盲判「只看这一屏就够」，
+ * 表格 + 120 字是 1 条、全文是 18 条；旧默认屏里正文只占 23%，5 条全文合计的中位字数反而比它短。
+ * 为什么不按分数给（adaptive 的做法）：分数是融合排序分，只表示这一批里的相对位置，排第一的中位
+ * 只有 0.64，43 条非空查询里 31 条一条全文都拿不到。所以这里只看名次，不看分数。
+ *
+ * 规则：
+ *   - 按传入顺序（handler 已排好）逐条给正文；单条超过 FIRST_SCREEN_ENTRY_CAP 只给开头那一段。
+ *   - 给全文的额度是 ADAPTIVE_TOKEN_BUDGET（与 adaptive 同一个数，正文与 orig 行一起算）。放不下的条目降成
+ *     匹配词周围的片段，后面更短的条目放得下仍给全文。
+ *   - 每条命中都列出来，不因预算整条消失——这一点有意不照 adaptive（它超预算会停并报 omitted）。
+ *     所以 8000 是「给全文给到哪为止」的线，不是整屏的硬顶：片段、以及整条不比片段窗口（240 字）长的短条目
+ *     不受它拦，整屏最多超出「剩下每条一个片段」（limit ≤ 20；20 条都是 2400 个汉字时约 12,000）。
+ *     先给所有条目预留片段再分全文的做法试算过：尾部的片段会把排第一的长条目挤成片段，和「按名次给」相反。
+ *   - search_memory 的 related-scope 附栏各调一次本函数，各有一份额度。
+ *   - 缩短过的条目各带一行说明：共多少字、给了多少、用哪个编号展开。顶上 Text 行报整屏的全文 / 截断 / 片段条数。
+ *   - 元数据每条一行。旧表格里的 Tier 与 Retrieval Path 两列不再出，会话文件名换成 `sess=前 8 位`；
+ *     这三样 detail_level=full 里还有。
+ *   - imgs / orig / fresh 三种附加行照旧。
+ */
+export function formatFullTextResults(
+  results: RetrievalResult[],
+  context: RenderContext,
+): string {
+  if (results.length === 0) return "No results found.";
+
+  const freshnessCache = createFreshnessCache();
+  const blocks: string[] = [];
+  let tokensUsed = 0;
+  let fullCount = 0;
+  let cappedCount = 0;
+  let snippetCount = 0;
+  let anyOrig = false;
+
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    const id = r.entry.id.slice(0, 8);
+    // 展开提示给完整编号：8 位前缀在库里有撞的（2026-10-05 快照 138,502 行里 2 组），撞了 memory_drill_down 取不回来。
+    const drillHint = `memory_drill_down ${r.entry.id} for the full text`;
+    const capped = headByCodePoints(r.entry.text, FIRST_SCREEN_ENTRY_CAP);
+    const orig = getDistilledSource(r);
+    const origLine = orig ? `   orig : ${dropLoneSurrogates(formatDistilledOrigin(orig))}` : "";
+    const origTokens = origLine ? estimateTokens(origLine) : 0;
+
+    let text = capped.head;
+    let cutNote = capped.truncated
+      ? `   … [truncated: showing ${FIRST_SCREEN_ENTRY_CAP} of ${capped.total} chars · ${drillHint}]`
+      : "";
+    let tokens = estimateTokens(text) + origTokens;
+    // 整条不比一个片段窗口长的条目不降级：降了也省不下字，只会多出一行「给了片段」的说明。
+    const worthSnipping = capped.total > ADAPTIVE_SNIPPET_BEFORE + ADAPTIVE_SNIPPET_AFTER;
+    if (worthSnipping && tokensUsed + tokens > ADAPTIVE_TOKEN_BUDGET) {
+      text = dropLoneSurrogates(adaptiveSnippet(context.query, r.entry.text));
+      cutNote = `   [snippet: token budget reached · showing ${snippetSourceChars(text)} of ${capped.total} chars · ${drillHint}]`;
+      tokens = estimateTokens(text) + origTokens;
+      snippetCount++;
+    } else if (capped.truncated) {
+      cappedCount++;
+    } else {
+      fullCount++;
+    }
+    tokensUsed += tokens;
+
+    const prov = getProvenanceSummary(r);
+    const header = [
+      id,
+      `${(r.score * 100).toFixed(1)}%`,
+      `${getDateLabel(r.entry.timestamp)} (${formatAgeLabel(r.entry.timestamp)})`,
+      getCategoryLabel(r),
+      getSourceLabel(r),
+      ...(prov !== "-" ? [prov] : []),
+      ...getOriginLabel(r),
+    ].join(" · ");
+    blocks.push(`[${i + 1}] ${header}`);
+    // fresh 管的是「这条还能不能照着用」，放在正文前面；只有声明过 dependsOn 的记忆才有（opt-in）。
+    const fresh = evaluateEntryFreshness(r.entry.metadata, freshnessCache);
+    if (fresh) blocks.push(`   fresh: ${fresh}`);
+    blocks.push(text);
+    if (cutNote) blocks.push(cutNote);
+    if (origLine) {
+      blocks.push(origLine);
+      anyOrig = true;
+    }
+    const imgs = formatSessionImages(r);
+    if (imgs) blocks.push(`   imgs : ${imgs}`);
+    blocks.push("");
+  }
+  // 去掉自己加的最后一个块间空行；不对整份输出 trimEnd，否则最后一条正文自己的结尾空白也会被吃掉。
+  blocks.pop();
+
+  // 全部给全的时候这一行只报条数；有缩短的才把封顶与预算写出来。
+  const shortened = cappedCount + snippetCount > 0;
+  const breakdown = [
+    `${fullCount} in full`,
+    ...(cappedCount > 0 ? [`${cappedCount} capped (${FIRST_SCREEN_ENTRY_CAP}-char cap)`] : []),
+    ...(snippetCount > 0 ? [`${snippetCount} snippet (${ADAPTIVE_TOKEN_BUDGET}-token budget)`] : []),
+  ].join(", ") + (shortened ? " — shortened entries say how much is shown" : "");
+  const lines = [
+    `Query   : ${context.query}`,
+    `Profile : ${context.profile}`,
+    `Hits    : ${results.length}`,
+    `Text    : ${breakdown}`,
+    ...(anyOrig ? [`Note    : ${DISTILLED_NOTE_FULLTEXT}`] : []),
+    "",
+    ...blocks,
+  ];
+  return lines.join("\n");
+}
+
+/**
+ * search_memory 默认档（detail_level=normal）、命令行 `search`、本地 UI 共用的入口。
+ * 默认出全文那一版；`RECALLNEST_SEARCH_FIRST_SCREEN=legacy` 退回表格 + 120 字片段。
+ */
+export function formatSearchResults(
+  results: RetrievalResult[],
+  context: RenderContext,
+): string {
+  return searchFirstScreen() === "legacy"
+    ? formatLegacyTableResults(results, context)
+    : formatFullTextResults(results, context);
+}
 
 /**
  * P-fidelity (点4): adaptive 保真度渲染 — 借鉴 RepoPrompt CE「保真度阶梯」的内核
