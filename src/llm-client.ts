@@ -175,10 +175,11 @@ export interface DedupDecision {
   reason: string;
 }
 
-/** Extended dedup decision with optional secondary actions on other existing memories. */
-export interface DedupDecisionMulti extends DedupDecision {
-  actions?: Array<{ match_index: number; action: "delete"; reason: string }>;
-}
+/**
+ * 多候选去重的结论。与单候选同形：只回答新切片「存 / 并 / 跳」。
+ * 2026-10-05 之前多一个 `actions`（让模型标记删除已有记忆），已拿掉，原因见 ingest.ts 的 DedupCheckResult。
+ */
+export type DedupDecisionMulti = DedupDecision;
 
 /** Six memory categories (OpenViking-inspired) */
 export type SmartCategory =
@@ -537,7 +538,8 @@ export class LLMClient {
 
   /**
    * Multi-candidate dedup decision: compare a new chunk against multiple existing
-   * memories and optionally return secondary delete actions on outdated entries.
+   * memories. Decides only what happens to the new chunk; existing memories are
+   * never modified or deleted from here.
    */
   async dedupDecisionMulti(
     newText: string,
@@ -563,12 +565,9 @@ export class LLMClient {
         "- MERGE：新记忆有补充信息，应该合并到已有记忆\n" +
         "- CREATE：新记忆是不同的事，应该独立存储\n" +
         "- 如果两条都是偏好陈述，同品牌/同主题下的不同条目，必须返回 CREATE\n\n" +
-        "额外能力：如果发现某些已有记忆已经过时（被新记忆或其他已有记忆完全取代），可以在 actions 里标记删除。\n\n" +
         "只输出一行 JSON：\n" +
-        '{"action":"CREATE|MERGE|SKIP","match_index":1,"reason":"简短原因","actions":[{"match_index":2,"action":"delete","reason":"被新记忆取代"}]}' + "\n\n" +
-        "- match_index 是 1-based 索引，指向你要操作的已有记忆\n" +
-        "- actions 是可选的，只在确实有过时记忆需要清理时才填\n" +
-        "- actions 里只支持 delete",
+        '{"action":"CREATE|MERGE|SKIP","match_index":1,"reason":"简短原因"}' + "\n\n" +
+        "- match_index 是 1-based 索引，指向与新记忆最相关的那条已有记忆",
         `${existingBlock}\n\n[新记忆]\n${newText.slice(0, 1000)}`,
       );
 
@@ -576,21 +575,8 @@ export class LLMClient {
 
       const parsed = parseJSON<DedupDecisionMulti>(response);
       if (parsed && (parsed.action === "CREATE" || parsed.action === "MERGE" || parsed.action === "SKIP")) {
-        // Validate secondary actions
-        const validActions = Array.isArray(parsed.actions)
-          ? parsed.actions.filter(
-              (a) =>
-                typeof a === "object" && a !== null &&
-                typeof a.match_index === "number" &&
-                a.match_index >= 1 && a.match_index <= existingEntries.length &&
-                a.action === "delete",
-            )
-          : [];
-        return {
-          action: parsed.action,
-          reason: parsed.reason ?? "",
-          actions: validActions.length > 0 ? validActions : undefined,
-        };
+        // 只带出结论与原因；模型多返回的字段（旧提示词教过它写 actions）一律丢掉
+        return { action: parsed.action, reason: parsed.reason ?? "" };
       }
 
       return { action: "CREATE", reason: "JSON 解析失败" };
