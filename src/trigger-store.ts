@@ -241,11 +241,25 @@ export class TriggerStore {
     });
   }
 
-  async deleteForMemory(memoryId: string): Promise<void> {
+  /**
+   * 删掉一条记忆的全部 trigger 行，返回删了几行。
+   * forget 引擎在删主行之前调它（2026-10-05 之前这个方法没有任何调用方，
+   * 记忆删掉后它的问法原文和向量留在侧表里）。
+   */
+  async deleteForMemory(memoryId: string): Promise<number> {
     return this.withWriteLock(async () => {
       await this.ensureInitialized();
-      await this.table!.delete(`memory_id = '${escapeSqlLiteral(memoryId)}'`);
+      const where = `memory_id = '${escapeSqlLiteral(memoryId)}'`;
+      const rows = await this.table!.countRows(where);
+      if (rows > 0) await this.table!.delete(where);
+      return rows;
     });
+  }
+
+  /** 这条记忆现在还有几行 trigger（forget 删后回读用）。 */
+  async countForMemory(memoryId: string): Promise<number> {
+    await this.ensureInitialized();
+    return this.table!.countRows(`memory_id = '${escapeSqlLiteral(memoryId)}'`);
   }
 
   /**

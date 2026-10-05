@@ -431,7 +431,7 @@ Examples live in [`integrations/examples/`](integrations/examples/):
 | `data_checkup` | Run data quality health checks on the memory store |
 | `dream` | Run offline memory consolidation (clustering, merging, pruning) |
 | `memory_lint` | Run memory quality checks: contradictions, duplicates, stale entries, orphans |
-| `forget_memory` | Cascade-delete a memory with KG cleanup, pin archival, and audit trail |
+| `forget_memory` | Delete a memory together with its KG triples and trigger rows, archive pins made from it, read back to confirm, and write an audit entry |
 | `export_graph` | Export memories as an interactive HTML knowledge graph |
 
 </details>

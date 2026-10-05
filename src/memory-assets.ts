@@ -76,6 +76,7 @@ const DATA_DIR = resolve(metaDir(import.meta), "../data");
 const PINS_DIR = join(DATA_DIR, "pins");
 const ASSETS_DIR = join(DATA_DIR, "assets");
 const ARCHIVE_DIR = join(DATA_DIR, "archive", "dirty-briefs");
+const FORGOTTEN_PINS_DIR = join(DATA_DIR, "archive", "forgotten-pins");
 const EXPORTS_DIR = join(DATA_DIR, "exports");
 
 function ensureDir(dir: string): string {
@@ -230,6 +231,57 @@ export function listPinAssets(limit = 20): Array<PinAsset & { path: string }> {
     }
   }
   return items;
+}
+
+/**
+ * 来源是这条记忆的 pin（不限条数）。pins 目录不存在就返回空，不顺手建目录；
+ * 读不出来的文件跳过——认不出它属于谁，就不动它。
+ */
+export function findPinAssetsForMemory(
+  memoryId: string,
+  pinsDir: string = PINS_DIR,
+): Array<PinAsset & { path: string }> {
+  if (!existsSync(pinsDir)) return [];
+  const items: Array<PinAsset & { path: string }> = [];
+  for (const name of readdirSync(pinsDir)) {
+    if (!name.endsWith(".json")) continue;
+    const path = join(pinsDir, name);
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf-8")) as PinAsset;
+      if (parsed?.source?.memoryId === memoryId) items.push({ ...parsed, path });
+    } catch {
+      // Skip corrupt asset files.
+    }
+  }
+  return items;
+}
+
+/**
+ * 把来源是这条记忆的 pin 挪出 pins 目录（forget 用）。
+ *
+ * pin 是记忆正文的一份拷贝（标题、摘要、320 字片段），会被 list_pins 列出、被 resume_context
+ * 拼进上下文；记忆被 forget 之后它不该继续出现。这里挪到 data/archive/forgotten-pins/ 而不是删：
+ * 文件离开了会被读到的目录，误删时还能挪回。同名不覆盖。
+ * 返回挪到的新路径。挪不动就抛错，由调用方决定要不要继续。
+ */
+export function archivePinAssetsForMemory(
+  memoryId: string,
+  dirs: { pinsDir?: string; archiveDir?: string } = {},
+): string[] {
+  const matches = findPinAssetsForMemory(memoryId, dirs.pinsDir ?? PINS_DIR);
+  if (matches.length === 0) return [];
+  const archiveDir = ensureDir(dirs.archiveDir ?? FORGOTTEN_PINS_DIR);
+  const moved: string[] = [];
+  for (const asset of matches) {
+    const stem = basename(asset.path, ".json");
+    let target = join(archiveDir, `${stem}.json`);
+    for (let n = 2; existsSync(target); n++) {
+      target = join(archiveDir, `${stem}-${n}.json`);
+    }
+    renameSync(asset.path, target);
+    moved.push(target);
+  }
+  return moved;
 }
 
 function listJsonRecords<T extends MemoryAsset>(dir: string, limit = 20): Array<T & { path: string }> {
