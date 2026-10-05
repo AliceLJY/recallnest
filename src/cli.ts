@@ -51,7 +51,8 @@ import {
   formatSynthesisPromoteResult,
 } from "./memory-promotion.js";
 import { runDream, formatDreamResult, formatDreamMetrics, DEFAULT_DREAM_CONFIG, classifyDreamFailure, shouldBlockDreamRun, partitionAutoDreamScopes } from "./dream-pipeline.js";
-import { dataDir as envDataDir, dreamBudgetMs } from "./env-config.js";
+import { dataDir as envDataDir, dreamBudgetMs, transcriptIngest } from "./env-config.js";
+import { planIngest } from "./ingest-plan.js";
 import { listScopesAboveThreshold, pruneWriteCounts } from "./activity-counter.js";
 import { isTranscriptScope } from "./memory-boundaries.js";
 import { maybeRunGc } from "./auto-gc.js";
@@ -1570,6 +1571,8 @@ program
     const results: any[] = [];
     // 记忆对账没执行 / 出错 / 护栏拦下（24 小时去抖后）→ 整条 ingest 以退出码 3 结束，调用脚本据此发专门的报警
     let memoryReconcileAlert = false;
+    // 对话原文 2026-10-06 起默认不入库（RECALLNEST_TRANSCRIPT_INGEST=on 才入）；这一轮跑哪些来源见 ingest-plan.ts
+    const plan = planIngest(source, transcriptIngest());
 
     // Pre-flight: validate embedding API before processing any files
     console.log("\n🔑 验证 Embedding API...");
@@ -1599,8 +1602,8 @@ program
       console.log("  ⚠️  LLM: 未配置，原始对话将跳过不存入（配置 config.json → llm 以启用）");
     }
 
-    // Drain pending queue if LLM is available
-    if (effectiveLlm) {
+    // Drain pending queue if LLM is available（队列里是对话切片，回填等于入库，跟着对话入库的开关走）
+    if (effectiveLlm && plan.drainPendingQueue) {
       const { drainPendingQueue } = await import("./ingest.js");
       const drained = await drainPendingQueue(store, embedder, effectiveLlm);
       if (drained.processed > 0) {
@@ -1614,12 +1617,16 @@ program
     }
     console.log();
     console.log(`🔄 开始导入记忆 (source: ${source})...\n`);
+    if (plan.skippedTranscriptSources.length > 0) {
+      console.log(`⏸  对话入库已关（RECALLNEST_TRANSCRIPT_INGEST 没有设为 on）：${plan.skippedTranscriptSources.join(" / ")} 不切片、不嵌入、不写库`);
+      console.log("   原文在 Deja 里查；Minis 投递目录的文件照样挪进存档；记忆文件照常。要重开见 env-config.ts transcriptIngest\n");
+    }
 
     const ingestOpts = { limit, verbose, noDedup, llm: effectiveLlm, recentHours };
 
     // CC Transcripts
     // CC 按 cwd 编码 project 子目录，所有有 jsonl 的子目录都要 ingest（不只是 jsonl 最多的那个）
-    if (source === "all" || source === "cc") {
+    if (plan.transcriptSources.includes("cc")) {
       console.log("📝 导入 Claude Code 对话...");
       const ccSource = config.sources.cc;
       if (ccSource) {
@@ -1639,7 +1646,7 @@ program
     }
 
     // Codex Sessions
-    if (source === "all" || source === "codex") {
+    if (plan.transcriptSources.includes("codex")) {
       console.log("🤖 导入 Codex 对话...");
       const r = await ingestCodexSessions(store, embedder, ingestOpts);
       results.push(r);
@@ -1647,7 +1654,7 @@ program
     }
 
     // Kimi Code Sessions (wire.jsonl 事件流，~/.kimi-code/sessions/)
-    if (source === "all" || source === "kimi") {
+    if (plan.transcriptSources.includes("kimi")) {
       console.log("🌙 导入 Kimi Code 对话...");
       const r = await ingestKimiSessions(store, embedder, ingestOpts);
       results.push(r);
@@ -1655,7 +1662,7 @@ program
     }
 
     // Gemini Sessions (JSON format under ~/.gemini/tmp/*/chats/)
-    if (source === "all" || source === "gemini") {
+    if (plan.transcriptSources.includes("gemini")) {
       console.log("💎 导入 Gemini 对话...");
       const r = await ingestGeminiSessions(store, embedder, {
         limit,
@@ -1669,7 +1676,7 @@ program
     }
 
     // Claude Desktop / claude.ai web conversations (CC transcript format)
-    if (source === "all" || source === "desktop") {
+    if (plan.transcriptSources.includes("desktop")) {
       const desktopSource = config.sources.desktop;
       if (desktopSource) {
         const desktopPath = resolve(metaDir(import.meta), "..", desktopSource.path);
@@ -1688,21 +1695,32 @@ program
     // Minis (iPhone) —— 手机 agent 自己把对话写进这个目录，ingest 顺带扫走。
     // 为什么是独立源而不是复用 desktop：scope 前缀决定了 memory-boundaries 怎么降权，
     // 混在 cc: 里的话来源在库里就分辨不出来（那正是 2026-08-12 起挂着的缺口）。
-    if (source === "all" || source === "minis") {
+    if (plan.minis !== "skip") {
       const minisSource = config.sources.minis;
       if (minisSource) {
         const minisPath = resolveSourcePath(minisSource.path, "minis");
         if (existsSync(minisPath)) {
-          console.log("📱 导入 Minis 对话...");
-          const r = await ingestCCTranscripts(store, embedder, minisPath, {
-            ...ingestOpts,
-            scopePrefix: "minis",
-          });
-          results.push(r);
-          console.log(`  ✅ Minis: ${formatIngestSummary(r)}`);
-          // 入库过的挪进 data/minis-archive（Deja 从那里读，记忆库不再读它），原因见 minis-archive.ts 文件头
+          if (plan.minis === "ingest-then-archive") {
+            console.log("📱 导入 Minis 对话...");
+            const r = await ingestCCTranscripts(store, embedder, minisPath, {
+              ...ingestOpts,
+              scopePrefix: "minis",
+            });
+            results.push(r);
+            console.log(`  ✅ Minis: ${formatIngestSummary(r)}`);
+          } else {
+            console.log("📱 Minis 对话：不入库，只挪存档...");
+          }
+          // 挪进 data/minis-archive（Deja 从那里读，记忆库不读它），原因见 minis-archive.ts 文件头。
+          // 入库开着：只挪台账里记着已入库的。入库关着：没有「已入库」可等，能解析出对话的就挪——
+          // 这里要是照旧拿台账当闸，文件永远不会被标成已处理，也就永远进不了 Deja，而且不报错
           const archiveDir = resolve(metaDir(import.meta), "..", "data", "minis-archive");
-          const moved = archiveIngestedMinisFiles(minisPath, archiveDir, isProcessed, (p) => parseCCTranscript(p).length > 0);
+          const moved = archiveIngestedMinisFiles(
+            minisPath,
+            archiveDir,
+            plan.minis === "ingest-then-archive" ? isProcessed : () => true,
+            (p) => parseCCTranscript(p).length > 0,
+          );
           if (moved.archived.length > 0 || moved.errors.length > 0) {
             const failed = moved.errors.length > 0
               ? `，${moved.errors.length} 个出错、原件留在原处：${moved.errors.join("；")}`
@@ -1716,7 +1734,7 @@ program
     }
 
     // Memory markdown files
-    if (source === "all" || source === "memory") {
+    if (plan.memory) {
       console.log("📚 导入记忆文件...");
       const memSource = config.sources.memory;
       if (memSource && memSource.path === "auto") {

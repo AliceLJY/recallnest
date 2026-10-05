@@ -260,3 +260,21 @@ describe("env-config searchFirstScreen — 默认第一屏的退回开关", () =
     }
   });
 });
+
+describe("env-config transcriptIngest — 对话原文入库的开关", () => {
+  it("不设时是关", () => {
+    delete process.env.RECALLNEST_TRANSCRIPT_INGEST;
+    expect(envConfig.transcriptIngest()).toBe(false);
+  });
+
+  it("只有恰好写成 on 才打开", () => {
+    process.env.RECALLNEST_TRANSCRIPT_INGEST = "on";
+    expect(envConfig.transcriptIngest()).toBe(true);
+
+    for (const other of ["On", "ON", " on ", "1", "true", "yes", "off", ""]) {
+      process.env.RECALLNEST_TRANSCRIPT_INGEST = other;
+      expect(envConfig.transcriptIngest()).toBe(false);
+    }
+    delete process.env.RECALLNEST_TRANSCRIPT_INGEST;
+  });
+});
