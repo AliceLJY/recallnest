@@ -53,6 +53,12 @@ Three things in that block carry most of the design:
   The line exists so you know there is something to go look at, and producing it cost no
   model call, no vector, and no storage.
 
+> The row above comes from transcript ingest. Since 2026-10-06 that step is off by default:
+> `ingest` no longer chunks conversation records into the store, so a default setup holds only
+> the memories you stored, distilled entries and memory files, and raw sessions are left to a
+> dedicated session-search tool. To get rows like this one back, see "Index existing
+> conversations" below.
+
 That last one is the approach in miniature: **store what makes a thing findable, not
 everything that could ever be asked about it.** The full reasoning — including the two
 places where the obvious implementation was wrong — is in
@@ -284,6 +290,14 @@ bun run seed:continuity
 bun run src/cli.ts doctor
 ```
 
+Since 2026-10-06, `ingest` does two things by default: it reconciles memory files
+(`sources.memory`) and moves files from the Minis drop folder into `data/minis-archive`. The six
+conversation sources (cc / codex / kimi / gemini / desktop / minis) are not chunked, embedded or
+written. To index transcripts as well, set `RECALLNEST_TRANSCRIPT_INGEST=on` in the environment
+that runs `ingest` (only the exact value `on` counts). Minis conversations archived while the
+switch was off are not picked up automatically; copy them from `data/minis-archive` back into
+the drop folder and run `ingest` again.
+
 ---
 
 ## Images: addressable, not embedded
@@ -501,7 +515,7 @@ bun run src/cli.ts lint --scope project:myapp   # lint a specific scope
 bun run src/cli.ts graph --open                 # export & open knowledge graph
 bun run src/cli.ts graph --max-nodes 50         # smaller graph
 
-# Ingestion & diagnostics
+# Ingestion & diagnostics (transcripts are not ingested by default; see "Index existing conversations")
 bun run src/cli.ts ingest --source all
 bun run src/cli.ts doctor
 ```
