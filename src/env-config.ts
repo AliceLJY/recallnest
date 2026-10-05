@@ -174,7 +174,9 @@ export const searchFirstScreen = (): "legacy" | "fulltext" =>
  *           记忆文件对账照常。
  *   true  — 只在显式设 `on` 时走：回到改动之前的行为。切块与入库的代码都还在（src/ingest.ts、
  *           src/event-segmenter.ts），重开只要在跑 ingest 的环境里加这一行；要把关掉期间以及此前的会话
- *           全部重新入库，先把 data/ingested-files.json 挪走再跑。
+ *           全部重新入库，先把 data/ingested-files.json 挪走再跑。Minis 例外：关着的时候它的文件已经从
+ *           投递目录挪进 data/minis-archive，入库不扫那个目录，要补就把想补的文件从存档拷回投递目录再跑
+ *           （拷，不是挪；跑完它们会被再挪回存档，同名同内容不会多存一份）。
  * 只认 `on` 这一个写法。
  */
 export const transcriptIngest = (): boolean => process.env.RECALLNEST_TRANSCRIPT_INGEST === "on";

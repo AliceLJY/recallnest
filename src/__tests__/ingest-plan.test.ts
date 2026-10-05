@@ -81,6 +81,39 @@ describe("对话来源清单", () => {
   });
 });
 
+/**
+ * 找出 body 里下标 idx 处的代码被哪些花括号块包着，返回每个块开头那一行（由内到外）。
+ * 只数花括号，不解析语法：模板字符串里的 `${…}` 是成对的，不影响计数。
+ */
+function enclosingBlockHeaders(body: string, idx: number): string[] {
+  const headers: string[] = [];
+  let depth = 0;
+  for (let i = idx - 1; i >= 0; i--) {
+    const ch = body[i];
+    if (ch === "}") depth++;
+    else if (ch === "{") {
+      if (depth > 0) { depth--; continue; }
+      const lineStart = body.lastIndexOf("\n", i) + 1;
+      headers.push(body.slice(lineStart, i + 1).trim());
+    }
+  }
+  return headers;
+}
+
+const TRANSCRIPT_GUARD = /^if \(plan\.transcriptSources\.includes\("(cc|codex|kimi|gemini|desktop)"\)\) \{$/;
+const MINIS_INGEST_GUARD = /^if \(plan\.minis === "ingest-then-archive" && ingestOpts\) \{$/;
+const INGEST_CALL = /await (ingestCCTranscripts|ingestCodexSessions|ingestKimiSessions|ingestGeminiSessions)\(/g;
+
+/** body 里每一处对话入库调用，有没有被一个「看计划」的条件块包住；返回没被包住的调用 */
+function unguardedIngestCalls(body: string): string[] {
+  const bad: string[] = [];
+  for (const call of body.matchAll(INGEST_CALL)) {
+    const headers = enclosingBlockHeaders(body, call.index);
+    if (!headers.some((h) => TRANSCRIPT_GUARD.test(h) || MINIS_INGEST_GUARD.test(h))) bad.push(`${call[1]}@${call.index}`);
+  }
+  return bad;
+}
+
 describe("cli.ts 的 ingest 命令不绕开计划", () => {
   const cli = readFileSync(join(resolve(import.meta.dir, "../.."), "src/cli.ts"), "utf-8");
   const start = cli.indexOf('.command("ingest")');
@@ -97,19 +130,21 @@ describe("cli.ts 的 ingest 命令不绕开计划", () => {
     expect(body).not.toMatch(/source === "all" \|\|/);
   });
 
-  it("四个对话入库函数的每一处调用，前面最近的那个条件都是计划里的字段", () => {
-    const calls = [...body.matchAll(/await (ingestCCTranscripts|ingestCodexSessions|ingestKimiSessions|ingestGeminiSessions)\(/g)];
+  it("六处对话入库调用，每一处都在一个看计划的条件块里面（按花括号的包含关系，不是看前面最近的一行）", () => {
     // cc、desktop、minis 各一处 ingestCCTranscripts，加 codex / kimi / gemini 各一处
-    expect(calls.length).toBe(6);
-    for (const call of calls) {
-      const before = body.slice(0, call.index);
-      const guards = [...before.matchAll(/if \((plan\.[^)]*\)?[^)]*)\) \{/g)];
-      const lastPlanGuard = before.lastIndexOf("if (plan.");
-      expect(lastPlanGuard).toBeGreaterThan(0);
-      const guard = before.slice(lastPlanGuard, before.indexOf("{", lastPlanGuard));
-      expect(guard).toMatch(/plan\.transcriptSources\.includes\("(cc|codex|kimi|gemini|desktop)"\)|plan\.minis === "ingest-then-archive"/);
-      expect(guards.length).toBeGreaterThan(0);
-    }
+    expect([...body.matchAll(INGEST_CALL)].length).toBe(6);
+    expect(unguardedIngestCalls(body)).toEqual([]);
+  });
+
+  it("反向校准：把一处调用挪到条件块外面、或者只在前面留一个空的条件块，这个检查都会报出来", () => {
+    const guard = 'if (plan.transcriptSources.includes("codex")) {';
+    expect(body).toContain(guard);
+    // 条件块变成空的，原来的块体变成无条件执行的裸块：调用前面最近的一行仍然是那个 if，但已经不在它里面
+    const emptied = body.replace(guard, `${guard}}\n    {`);
+    expect(unguardedIngestCalls(emptied).some((c) => c.startsWith("ingestCodexSessions"))).toBe(true);
+    // 整个条件拿掉
+    const removed = body.replace(guard, "{");
+    expect(unguardedIngestCalls(removed).some((c) => c.startsWith("ingestCodexSessions"))).toBe(true);
   });
 
   it("待处理队列的回填跟着开关走", () => {
@@ -118,5 +153,14 @@ describe("cli.ts 的 ingest 命令不绕开计划", () => {
 
   it("Minis 挪存档：入库开着拿台账当闸，关着时不等台账", () => {
     expect(body).toMatch(/plan\.minis === "ingest-then-archive" \? isProcessed : \(\) => true/);
+  });
+
+  it("关着时 Minis 只挪存档这一步排在嵌入接口预检之前（接口挂了也照样挪）；开着时的入库排在预检之后", () => {
+    const archiveOnly = body.indexOf('if (plan.minis === "archive-only") await runMinis();');
+    const preflight = body.indexOf("await embedder.test()");
+    const ingestThenArchive = body.indexOf('if (plan.minis === "ingest-then-archive") await runMinis(ingestOpts);');
+    expect(archiveOnly).toBeGreaterThan(0);
+    expect(preflight).toBeGreaterThan(archiveOnly);
+    expect(ingestThenArchive).toBeGreaterThan(preflight);
   });
 });
