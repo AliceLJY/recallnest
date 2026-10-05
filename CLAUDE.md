@@ -32,7 +32,7 @@
 ## 5. Feature Flag
 
 - `RECALLNEST_MULTI_VECTOR=true` — 多向量 L0/L1/L2 检索
-- `RECALLNEST_KG_MODE=true` — KG 三元组提取 + 图遍历（2026-10-06 注：`kg_triples` 里有 4,948 条的来源记忆已随会话原文切片删除，来源 id 悬空。读取端查不到来源会跳过，但图遍历先截名额再查（`retriever.ts` 的 PPR 与 `expandViaKG`），所以开这个开关之前先清掉来源不在 memories 表里的三元组）
+- `RECALLNEST_KG_MODE=true` — KG 三元组提取 + 图遍历（2026-10-06 注：`kg_triples` 里有 6,331 条的来源记忆已在这一天删除——会话原文切片带走 4,948 条、同日删掉的 4 月无层级摘要带走 1,383 条——来源 id 悬空。读取端查不到来源会跳过，但图遍历先截名额再查（`retriever.ts` 的 PPR 与 `expandViaKG`），所以开这个开关之前先清掉来源不在 memories 表里的三元组）
 - `RECALLNEST_EMOTION_SCORING=true` — Emotion detection + salience-weighted Weibull decay + arousal boost + retrieval scoring
 - `RECALLNEST_CONSTRUCTIVE_RETRIEVAL=true` — Multi-source candidate expansion + source-map grounded reconstruction (resume default, search opt-in)
 - `RECALLNEST_NARRATIVE_MODE=true` — Autobiographical narrative metadata layer (life-period / general-event / specific-event)
@@ -42,7 +42,7 @@
 
 - `RECALLNEST_SEARCH_FIRST_SCREEN`（默认不设 = 全文，`=legacy` 回旧样式）— `formatSearchResults` 出哪种第一屏，search_memory 默认档（`detail_level` 不传或 `normal`）、命令行 `search`、本地 UI 共用。**2026-10-05 起默认是全文**（Alice 看过第一屏盲判后拍板）：按名次给每条命中的正文全文，单条封顶 2,400 字，总量沿用 adaptive 的 8,000 token 预算，放不下的降成片段，缩短过的条目写明共多少字、给了多少。显式设 `legacy` 回到改动之前的表格 + 每条 120 字，逐字节不变（旧函数体没动，只改名为 `formatLegacyTableResults`）。只认 `legacy` 这一个写法。brief / full / adaptive 三档与 HTTP `/v1/search` 不受这个开关影响（依据、做法与复验：sync-bridge `AI产出/2026-10-05-RecallNest性价比测算/` 的 `第一屏研究.md`、`plan-改第一屏.md` 与 README）
 
-- `RECALLNEST_TRANSCRIPT_INGEST`（默认不设 = 关，`=on` 回旧行为）— `ingest` 要不要把对话记录（cc / codex / kimi / gemini / desktop / minis）切块、嵌入、写进 memories 表。**2026-10-06 起默认关**（Alice 拍板：原文由 Deja 索引，记忆库只放提炼产物；生产库里已有切片的删除另见文末所列方案）。关着时：六个对话来源不跑、待处理队列不回填；记忆文件对账照常；Minis 投递目录照样挪进 `data/minis-archive`：不等入库台账，改成等文件放稳（至少 60 秒没被改过）且整个文件写完（以换行结尾、每行都解析得出），并排在嵌入接口预检之前。`scripts/re-ingest-cc.sh`（先清空整个库再全量导入）在开关关着时清库之前就退出。只认 `on` 这一个写法。闸在 `cli.ts ingest` 内部（`src/ingest-plan.ts` 的 `planIngest`），两个定时入口（launchd `incremental-ingest`、`pull-from-macbook.sh` 拉完之后）走的是同一条命令，脚本没动。`cli.ts import` / MCP `import_conversations` 是另一条路，不受它管。重开：直接设 `on` = 只接着往后入；先挪走 `data/ingested-files.json` 再开 = 全部重建；Minis 要从存档拷回投递目录（方案、互审与演练：sync-bridge `AI产出/2026-10-05-RecallNest性价比测算/plan-删原文切片层.md`）
+- `RECALLNEST_TRANSCRIPT_INGEST`（默认不设 = 关，`=on` 回旧行为）— `ingest` 要不要把对话记录（cc / codex / kimi / gemini / desktop / minis）切块、嵌入、写进 memories 表。**2026-10-06 起默认关**（Alice 拍板：原文由 Deja 索引，记忆库只放提炼产物；生产库里已有切片的删除另见文末所列方案）。关着时：六个对话来源不跑、待处理队列不回填；记忆文件对账照常；Minis 投递目录照样挪进 `data/minis-archive`：不等入库台账，改成等文件放稳（至少 60 秒没被改过）且整个文件写完（以换行结尾、每行都解析得出），并排在嵌入接口预检之前。`scripts/re-ingest-cc.sh`（先清空整个库再全量导入）在开关关着时清库之前就退出。只认 `on` 这一个写法。闸在 `cli.ts ingest` 内部（`src/ingest-plan.ts` 的 `planIngest`），两个定时入口（launchd `incremental-ingest`、`pull-from-macbook.sh` 拉完之后）走的是同一条命令，脚本没动。`cli.ts import` / MCP `import_conversations` 是另一条路，不受它管（显式工具，人要导一个对话文件时用）。自动往库里导对话的还有仓库之外的一个定时脚本（sync-bridge `scripts-bin/agy-conversations-sync.sh`，把 AGY 对话逐条 `import` 进 `project:antigravity-cli`）：2026-10-06 起它读同一个开关、默认不导；已导入的 7,250 行（`source=conversation_import`，其中 1,322 行是隐式偏好双写出来的同文副本）与 2026-04 留下的 2,771 行无层级一句话摘要同日删除，库到 18,646 行（方案与互审：sync-bridge `AI产出/2026-10-05-RecallNest性价比测算/plan-停AGY导入并删存量.md`）。重开：直接设 `on` = 只接着往后入；先挪走 `data/ingested-files.json` 再开 = 全部重建；Minis 要从存档拷回投递目录（方案、互审与演练：sync-bridge `AI产出/2026-10-05-RecallNest性价比测算/plan-删原文切片层.md`）
 
 非布尔旋钮（不是 feature flag，默认不设即保持老行为）：
 
