@@ -234,8 +234,12 @@ export function listPinAssets(limit = 20): Array<PinAsset & { path: string }> {
 }
 
 /**
- * 来源是这条记忆的 pin（不限条数）。pins 目录不存在就返回空，不顺手建目录；
- * 读不出来的文件跳过——认不出它属于谁，就不动它。
+ * 来源是这条记忆的 pin 文件（不限条数）。pins 目录不存在就返回空，不顺手建目录。
+ *
+ * 「读不了」和「读出来不是 JSON」分开处理：
+ * - 读不了（EIO、EACCES、iCloud 占位文件的 EDEADLK……）直接抛出。说不清这个文件属于谁，
+ *   就不能当它不存在——forget 靠这里判断「还有没有 pin」，吞掉错误等于谎报没有。
+ * - 不是 JSON 的跳过：list_pins 和 resume_context 同样读不了它，它进不了任何输出。
  */
 export function findPinAssetsForMemory(
   memoryId: string,
@@ -243,15 +247,17 @@ export function findPinAssetsForMemory(
 ): Array<PinAsset & { path: string }> {
   if (!existsSync(pinsDir)) return [];
   const items: Array<PinAsset & { path: string }> = [];
-  for (const name of readdirSync(pinsDir)) {
-    if (!name.endsWith(".json")) continue;
-    const path = join(pinsDir, name);
+  for (const dirent of readdirSync(pinsDir, { withFileTypes: true })) {
+    if (dirent.isDirectory() || !dirent.name.endsWith(".json")) continue;
+    const path = join(pinsDir, dirent.name);
+    const raw = readFileSync(path, "utf-8");
+    let parsed: PinAsset;
     try {
-      const parsed = JSON.parse(readFileSync(path, "utf-8")) as PinAsset;
-      if (parsed?.source?.memoryId === memoryId) items.push({ ...parsed, path });
+      parsed = JSON.parse(raw) as PinAsset;
     } catch {
-      // Skip corrupt asset files.
+      continue;
     }
+    if (parsed?.source?.memoryId === memoryId) items.push({ ...parsed, path });
   }
   return items;
 }
@@ -259,10 +265,13 @@ export function findPinAssetsForMemory(
 /**
  * 把来源是这条记忆的 pin 挪出 pins 目录（forget 用）。
  *
- * pin 是记忆正文的一份拷贝（标题、摘要、320 字片段），会被 list_pins 列出、被 resume_context
+ * pin 文件是记忆正文的一份拷贝（标题、摘要、320 字片段），会被 list_pins 列出、被 resume_context
  * 拼进上下文；记忆被 forget 之后它不该继续出现。这里挪到 data/archive/forgotten-pins/ 而不是删：
  * 文件离开了会被读到的目录，误删时还能挪回。同名不覆盖。
- * 返回挪到的新路径。挪不动就抛错，由调用方决定要不要继续。
+ * 返回挪到的新路径。读不了或挪不动就抛错，由调用方决定要不要继续。
+ *
+ * 只管文件这一半。pin 在主表里还有一行可检索的索引副本（asset-sync.ts），那一半由
+ * forget 引擎在同一步里删。
  */
 export function archivePinAssetsForMemory(
   memoryId: string,

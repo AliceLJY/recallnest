@@ -19,6 +19,7 @@ import type { WorkflowObservationStore } from "./workflow-observation-store.js";
 import type { KGExtractor } from "./kg-extractor.js";
 import type { KGStore } from "./kg-store.js";
 import type { AuditLogger } from "./audit-log.js";
+import type { ForgetPinArchive } from "./forget-engine.js";
 
 export type ToolTier = "core" | "advanced" | "governance";
 export type ToolSchema = Parameters<McpServer["tool"]>[2];
@@ -45,4 +46,9 @@ export interface ToolRegistryDeps {
   getKGExtractor: () => KGExtractor | null;
   /** Live getter for the lazily-initialized KG store (null unless RECALLNEST_KG_MODE=true). */
   getKGStore: () => KGStore | null;
+  /**
+   * Pin files that forget_memory archives. Left unset at the runtime entry, which gives the
+   * data/pins directory; tests set it so that no case reads or moves a real pin.
+   */
+  forgetPins?: ForgetPinArchive;
 }

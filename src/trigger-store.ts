@@ -245,6 +245,9 @@ export class TriggerStore {
    * 删掉一条记忆的全部 trigger 行，返回删了几行。
    * forget 引擎在删主行之前调它（2026-10-05 之前这个方法没有任何调用方，
    * 记忆删掉后它的问法原文和向量留在侧表里）。
+   * 返回的是删除前一刻数到的行数：写锁只管本进程，别的进程若恰在这两步之间给同一条记忆
+   * 加了行，那些行照样会被删（删除按条件），只是不计入返回值。
+   * 侧表还不存在时，这里和 countForMemory 都会像写入路径一样把它建出来（空表）。
    */
   async deleteForMemory(memoryId: string): Promise<number> {
     return this.withWriteLock(async () => {

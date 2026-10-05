@@ -18,6 +18,8 @@ export type AuditOperation =
   | "supersede"
   | "consolidate"
   | "forget"
+  /** A forget that stopped after changing something (see forget-engine.ts). Not a `forget`: the memory may still be there. */
+  | "forget_incomplete"
   | "cascade_forget"
   | "reject";
 
