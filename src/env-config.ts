@@ -165,6 +165,20 @@ export const fullTextScoreThreshold = (): number =>
 export const searchFirstScreen = (): "legacy" | "fulltext" =>
   process.env.RECALLNEST_SEARCH_FIRST_SCREEN === "legacy" ? "legacy" : "fulltext";
 
+// --- 对话原文入库（2026-10-06 起默认关）---
+
+/**
+ * `ingest` 要不要把对话记录（cc / codex / kimi / gemini / desktop / minis）切块、嵌入、写进 memories 表：
+ *   false — 默认（2026-10-06 起，Alice 拍板）：对话原文由 Deja 统一树索引，记忆库只放提炼产物。
+ *           这六个来源不切片不嵌入；Minis 投递目录里的文件照样挪进 data/minis-archive（Deja 从那里读）；
+ *           记忆文件对账照常。
+ *   true  — 只在显式设 `on` 时走：回到改动之前的行为。切块与入库的代码都还在（src/ingest.ts、
+ *           src/event-segmenter.ts），重开只要在跑 ingest 的环境里加这一行；要把关掉期间以及此前的会话
+ *           全部重新入库，先把 data/ingested-files.json 挪走再跑。
+ * 只认 `on` 这一个写法。
+ */
+export const transcriptIngest = (): boolean => process.env.RECALLNEST_TRANSCRIPT_INGEST === "on";
+
 // --- String settings with `||` default (empty string falls through) ---
 
 export const dataDir = (): string => process.env.RECALLNEST_DATA_DIR || "data";

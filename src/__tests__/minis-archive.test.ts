@@ -176,6 +176,32 @@ describe("archiveIngestedMinisFiles", () => {
     expect(parseCCTranscript(bad).length).toBe(0);
   });
 
+  it("对话入库关着时 cli 传的判据是「一律算数」：没进过台账的文件照样挪进存档，格式不合规的照样留在原处报错", () => {
+    const good = join(drop, "conversation-20261006-没入过库.jsonl");
+    const bad = join(drop, "conversation-20261006-格式坏了.jsonl");
+    const body = [
+      { type: "user", sessionId: "0c9d2f6e-1a7b-4c3d-9e8f-5b6a7c8d9e0f", uuid: "u1", parentUuid: null, timestamp: "2026-10-06T00:10:00+08:00", source: "minis", message: { role: "user", content: "帮我把今天聊的三件事按先后顺序列一下，我收工前要看一眼" } },
+      { type: "assistant", sessionId: "0c9d2f6e-1a7b-4c3d-9e8f-5b6a7c8d9e0f", uuid: "u2", parentUuid: "u1", timestamp: "2026-10-06T00:11:00+08:00", source: "minis", message: { role: "assistant", content: "好的，按先后顺序是：先定了方案，再做了演练，最后核对了数字。" } },
+    ].map((r) => JSON.stringify(r)).join("\n") + "\n";
+    writeFileSync(good, body);
+    writeFileSync(bad, "这不是 jsonl\n");
+
+    // 反向校准：同样两个文件，拿空台账当闸（入库开着、但这一轮没入库）时一个都挪不走
+    const gated = archiveIngestedMinisFiles(drop, archive, ledgerOf(), (p) => parseCCTranscript(p).length > 0);
+    expect(gated.archived).toEqual([]);
+    expect(gated.pending.sort()).toEqual(["conversation-20261006-格式坏了.jsonl", "conversation-20261006-没入过库.jsonl"].sort());
+
+    const result = archiveIngestedMinisFiles(drop, archive, () => true, (p) => parseCCTranscript(p).length > 0);
+
+    const target = join(archive, "conversation-20261006-没入过库.jsonl");
+    expect(result.archived).toEqual([target]);
+    expect(readFileSync(target, "utf-8")).toBe(body);
+    expect(existsSync(good)).toBe(false);
+    expect(existsSync(bad)).toBe(true);
+    expect(result.errors.length).toBe(1);
+    expect(result.errors[0]).toContain("格式坏了");
+  });
+
   it("只管投递目录顶层的 .jsonl：子目录和别的文件不碰", () => {
     const nested = join(drop, "sub", "x.jsonl");
     mkdirSync(join(drop, "sub"));
