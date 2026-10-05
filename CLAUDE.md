@@ -32,7 +32,7 @@
 ## 5. Feature Flag
 
 - `RECALLNEST_MULTI_VECTOR=true` — 多向量 L0/L1/L2 检索
-- `RECALLNEST_KG_MODE=true` — KG 三元组提取 + 图遍历
+- `RECALLNEST_KG_MODE=true` — KG 三元组提取 + 图遍历（2026-10-06 注：`kg_triples` 里有 4,948 条的来源记忆已随会话原文切片删除，来源 id 悬空。读取端查不到来源会跳过，但图遍历先截名额再查（`retriever.ts` 的 PPR 与 `expandViaKG`），所以开这个开关之前先清掉来源不在 memories 表里的三元组）
 - `RECALLNEST_EMOTION_SCORING=true` — Emotion detection + salience-weighted Weibull decay + arousal boost + retrieval scoring
 - `RECALLNEST_CONSTRUCTIVE_RETRIEVAL=true` — Multi-source candidate expansion + source-map grounded reconstruction (resume default, search opt-in)
 - `RECALLNEST_NARRATIVE_MODE=true` — Autobiographical narrative metadata layer (life-period / general-event / specific-event)
