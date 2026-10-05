@@ -70,7 +70,7 @@ Hits    : 5
 
 | 能力 | 说明 |
 |---|---|
-| **混合检索** | 6 通道：向量 + BM25 + L0/L1/L2 多向量 + KG 图（PPR） |
+| **混合检索** | 6 通道：向量 + BM25 + L0/L1/L2 多向量 + KG 图（PPR）。默认只走向量（2026-06 起），BM25 融合与图扩展要在配置里打开 |
 | **4 套检索策略** | default、writing、debug、fact-check —— 按任务类型调优 |
 | **会话连续性** | `checkpoint_session` + `resume_context`（full/light/summary 三种模式）+ 仓库状态守卫 |
 | **会话蒸馏** | 3 层对话压缩：微缩 → LLM 结构化摘要 → 知识提取 |
