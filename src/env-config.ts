@@ -153,6 +153,18 @@ export const triggerLengthExempt = (): boolean =>
 export const fullTextScoreThreshold = (): number =>
   popularityRanking() === "bounded" ? 0.80 : 0.85;
 
+// --- search_memory 默认第一屏给多少正文（2026-10-05）---
+
+/**
+ * `formatSearchResults` 出哪种样式——search_memory 默认档（detail_level=normal）、命令行 `search`、本地 UI 共用：
+ *   fulltext — 默认（2026-10-05 起，Alice 看过第一屏盲判后拍板）：按名次给正文全文，单条封顶、总量有预算，
+ *              缩短过的条目写明共多少字、给了多少（memory-output.ts `formatFullTextResults`）
+ *   legacy   — 只在显式设 `legacy` 时走：改动之前的表格 + 每条 120 字片段，逐字节不变。
+ *              退回旧样式只要在 mcp.env 里加这一行；已经开着的进程要重启才读得到。
+ */
+export const searchFirstScreen = (): "legacy" | "fulltext" =>
+  process.env.RECALLNEST_SEARCH_FIRST_SCREEN === "legacy" ? "legacy" : "fulltext";
+
 // --- String settings with `||` default (empty string falls through) ---
 
 export const dataDir = (): string => process.env.RECALLNEST_DATA_DIR || "data";

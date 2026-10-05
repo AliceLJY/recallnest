@@ -24,6 +24,7 @@ const KEYS = [
   "RECALLNEST_DREAM_BUDGET_MS",
   "RECALLNEST_SYNTHESIS_MODEL",
   "RECALLNEST_EMBEDDING_TIMEOUT_MS",
+  "RECALLNEST_SEARCH_FIRST_SCREEN",
 ];
 
 const saved: Record<string, string | undefined> = {};
@@ -241,5 +242,21 @@ describe("env-config embeddingTimeoutMs — embedding 客户端的超时旋钮",
   it("正常值原样返回", () => {
     process.env.RECALLNEST_EMBEDDING_TIMEOUT_MS = "60000";
     expect(envConfig.embeddingTimeoutMs()).toBe(60_000);
+  });
+});
+
+describe("env-config searchFirstScreen — 默认第一屏的退回开关", () => {
+  it("不设时是 fulltext", () => {
+    expect(envConfig.searchFirstScreen()).toBe("fulltext");
+  });
+
+  it("只有恰好写成 legacy 才退回旧样式", () => {
+    process.env.RECALLNEST_SEARCH_FIRST_SCREEN = "legacy";
+    expect(envConfig.searchFirstScreen()).toBe("legacy");
+
+    for (const other of ["Legacy", "LEGACY", " legacy ", "1", "true", "fulltext", ""]) {
+      process.env.RECALLNEST_SEARCH_FIRST_SCREEN = other;
+      expect(envConfig.searchFirstScreen()).toBe("fulltext");
+    }
   });
 });
