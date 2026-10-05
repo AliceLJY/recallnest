@@ -20,6 +20,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# 2026-10-06：对话原文默认不再入库（RECALLNEST_TRANSCRIPT_INGEST=on 才入，见 src/env-config.ts transcriptIngest）。
+# 这个脚本第 2 步会清空整个库（reset 清的是 memories 表里的全部记忆，不只是对话切片），第 4 步才导入；
+# 开关关着时第 4 步一段对话都不会导入，跑完只剩一个被清空的库。所以清库之前先看开关，不满足就什么都不做。
+if [ "${RECALLNEST_TRANSCRIPT_INGEST:-}" != "on" ]; then
+  echo "❌ 对话入库是关着的（RECALLNEST_TRANSCRIPT_INGEST 没有设为 on）。" >&2
+  echo "   这个脚本会先清空整个库，随后的导入却不会导入任何对话——不执行。" >&2
+  echo "   确实要全量重建对话切片：先把库备份好，再跑 RECALLNEST_TRANSCRIPT_INGEST=on bash scripts/re-ingest-cc.sh" >&2
+  exit 2
+fi
+
 # Sidecar files live beside the database, which config.json may point outside
 # the repo. Ask the same resolver the server uses instead of assuming ./data.
 DATA_DIR="$(bun -e 'import { resolveDataDir } from "./src/runtime-config.ts"; console.log(resolveDataDir());')"

@@ -40,7 +40,7 @@ import {
   parseCCTranscript,
 } from "./ingest.js";
 import { runDoctor, formatDoctorResults } from "./doctor.js";
-import { archiveIngestedMinisFiles } from "./minis-archive.js";
+import { archiveIngestedMinisFiles, isCompleteJsonl, settledCheck } from "./minis-archive.js";
 import { isProcessed } from "./tracker.js";
 import { persistCaseMemory, persistMemory, persistWorkflowPattern } from "./capture-engine.js";
 import {
@@ -1579,8 +1579,8 @@ program
     }
 
     // Minis 投递目录 → data/minis-archive（Deja 从那里读，记忆库不读它），原因见 minis-archive.ts 文件头。
-    // 入库开着：先入库，再只挪台账里记着已入库的。入库关着：没有「已入库」可等，能解析出对话的就挪——
-    // 这里要是照旧拿台账当闸，文件永远不会被标成已处理，也就永远进不了 Deja，而且不报错。
+    // 入库开着：先入库，再只挪台账里记着已入库的。入库关着：没有「已入库」可等，放稳了（至少 60 秒没被改过）、
+    // 整个文件写完了、能解析出对话的就挪——这里要是照旧拿台账当闸，文件永远不会被标成已处理，也就永远进不了 Deja，而且不报错。
     const runMinis = async (ingestOpts?: { limit?: number; verbose: boolean; noDedup: boolean; llm: typeof llm | null; recentHours?: number }) => {
       const minisSource = config.sources.minis;
       if (!minisSource) return;
@@ -1601,8 +1601,9 @@ program
       const moved = archiveIngestedMinisFiles(
         minisPath,
         archiveDir,
-        plan.minis === "ingest-then-archive" ? isProcessed : () => true,
-        (p) => parseCCTranscript(p).length > 0,
+        plan.minis === "ingest-then-archive" ? isProcessed : settledCheck(),
+        // 关着时多看一条「文件写完了」：解析会跳过残缺行，半截文件也解析得出对话
+        (p) => (plan.minis === "ingest-then-archive" || isCompleteJsonl(p)) && parseCCTranscript(p).length > 0,
       );
       if (moved.archived.length > 0 || moved.errors.length > 0) {
         const failed = moved.errors.length > 0

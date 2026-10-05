@@ -12,7 +12,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseCCTranscript } from "../ingest.js";
-import { archiveIngestedMinisFiles, type IngestedCheck } from "../minis-archive.js";
+import { archiveIngestedMinisFiles, isCompleteJsonl, MINIS_SETTLE_MS, settledCheck, type IngestedCheck } from "../minis-archive.js";
 
 let root: string;
 let drop: string;
@@ -176,7 +176,76 @@ describe("archiveIngestedMinisFiles", () => {
     expect(parseCCTranscript(bad).length).toBe(0);
   });
 
-  it("对话入库关着时 cli 传的判据是「一律算数」：没进过台账的文件照样挪进存档，格式不合规的照样留在原处报错", () => {
+  it("对话入库关着时的判据 settledCheck：刚改过的文件留给下一轮，放稳了的才挪；默认静置 60 秒", () => {
+    const fresh = join(drop, "conversation-20261006-刚落地.jsonl");
+    const settled = join(drop, "conversation-20261006-放稳了.jsonl");
+    const body = [
+      { type: "user", sessionId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d", uuid: "u1", parentUuid: null, timestamp: "2026-10-06T00:10:00+08:00", source: "minis", message: { role: "user", content: "把今晚定下来的几件事按顺序记一下，明天早上我要对着做" } },
+      { type: "assistant", sessionId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d", uuid: "u2", parentUuid: "u1", timestamp: "2026-10-06T00:11:00+08:00", source: "minis", message: { role: "assistant", content: "记好了：第一件是备份，第二件是演练，第三件是核对数字，顺序不要调换。" } },
+    ].map((r) => JSON.stringify(r)).join("\n") + "\n";
+    writeFileSync(fresh, body);
+    writeFileSync(settled, body.replace("明天早上", "后天早上"));
+    const now = Date.now();
+    utimesSync(fresh, new Date(now - 5_000), new Date(now - 5_000));
+    utimesSync(settled, new Date(now - MINIS_SETTLE_MS - 5_000), new Date(now - MINIS_SETTLE_MS - 5_000));
+    expect(MINIS_SETTLE_MS).toBe(60_000);
+
+    const result = archiveIngestedMinisFiles(drop, archive, settledCheck(), (p) => parseCCTranscript(p).length > 0);
+
+    expect(result.archived).toEqual([join(archive, "conversation-20261006-放稳了.jsonl")]);
+    expect(result.pending).toEqual(["conversation-20261006-刚落地.jsonl"]);
+    expect(result.errors).toEqual([]);
+    expect(existsSync(fresh)).toBe(true);
+    expect(existsSync(settled)).toBe(false);
+
+    // 下一轮（时钟往后拨过静置期）刚才那个也挪走
+    const later = archiveIngestedMinisFiles(drop, archive, settledCheck(MINIS_SETTLE_MS, () => now + MINIS_SETTLE_MS), (p) => parseCCTranscript(p).length > 0);
+    expect(later.archived).toEqual([join(archive, "conversation-20261006-刚落地.jsonl")]);
+    expect(existsSync(fresh)).toBe(false);
+  });
+
+  it("对话入库关着时还要看文件写完没有：最后一行只写了一半的不挪、原件留着并报出来；补完之后才挪", () => {
+    const src = join(drop, "conversation-20261006-写到一半.jsonl");
+    const full = [
+      { type: "user", sessionId: "9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e6f", uuid: "u1", parentUuid: null, timestamp: "2026-10-06T00:10:00+08:00", source: "minis", message: { role: "user", content: "先把第一段发给我看看，后面的我边看边补充，不着急一次写完" } },
+      { type: "assistant", sessionId: "9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e6f", uuid: "u2", parentUuid: "u1", timestamp: "2026-10-06T00:11:00+08:00", source: "minis", message: { role: "assistant", content: "好的，第一段在这里：我们先把要做的事按先后排好，再逐件核对有没有遗漏。" } },
+    ].map((r) => JSON.stringify(r));
+    const half = full[0] + "\n" + full[1].slice(0, 40); // 一整行 user + 半行 assistant
+    writeFileSync(src, half);
+    const old = new Date(Date.now() - MINIS_SETTLE_MS - 5_000);
+    utimesSync(src, old, old);
+    // 解析会跳过残缺行，所以半截文件照样「有可用的对话」——只靠它拦不住
+    expect(parseCCTranscript(src).length).toBeGreaterThan(0);
+    expect(isCompleteJsonl(src)).toBe(false);
+    const check = (p: string) => isCompleteJsonl(p) && parseCCTranscript(p).length > 0;
+
+    const first = archiveIngestedMinisFiles(drop, archive, settledCheck(), check);
+    expect(first.archived).toEqual([]);
+    expect(first.errors.length).toBe(1);
+    expect(first.errors[0]).toContain("还没写完");
+    expect(readFileSync(src, "utf-8")).toBe(half);
+    expect(existsSync(archive)).toBe(false);
+
+    // 没有以换行结尾也算没写完
+    writeFileSync(src, full.join("\n"));
+    utimesSync(src, old, old);
+    expect(isCompleteJsonl(src)).toBe(false);
+
+    // 以换行结尾、但中间有一行是残缺的，同样算没写完（不能只看结尾）
+    writeFileSync(src, full[1].slice(0, 40) + "\n" + full[0] + "\n");
+    utimesSync(src, old, old);
+    expect(parseCCTranscript(src).length).toBeGreaterThan(0);
+    expect(isCompleteJsonl(src)).toBe(false);
+
+    writeFileSync(src, full.join("\n") + "\n");
+    utimesSync(src, old, old);
+    expect(isCompleteJsonl(src)).toBe(true);
+    const second = archiveIngestedMinisFiles(drop, archive, settledCheck(), check);
+    expect(second.archived).toEqual([join(archive, "conversation-20261006-写到一半.jsonl")]);
+    expect(existsSync(src)).toBe(false);
+  });
+
+  it("判据放行之后（这里直接传「一律算数」）：没进过台账的文件照样挪进存档，格式不合规的照样留在原处报错", () => {
     const good = join(drop, "conversation-20261006-没入过库.jsonl");
     const bad = join(drop, "conversation-20261006-格式坏了.jsonl");
     const body = [

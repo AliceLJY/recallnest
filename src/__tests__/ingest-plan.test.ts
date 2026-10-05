@@ -147,12 +147,19 @@ describe("cli.ts 的 ingest 命令不绕开计划", () => {
     expect(unguardedIngestCalls(removed).some((c) => c.startsWith("ingestCodexSessions"))).toBe(true);
   });
 
-  it("待处理队列的回填跟着开关走", () => {
-    expect(body).toMatch(/if \(effectiveLlm && plan\.drainPendingQueue\)/);
+  it("待处理队列的回填跟着开关走：调用在 `if (effectiveLlm && plan.drainPendingQueue)` 这个块里面", () => {
+    const calls = [...body.matchAll(/await drainPendingQueue\(/g)];
+    expect(calls.length).toBe(1);
+    const guarded = (text: string) => [...text.matchAll(/await drainPendingQueue\(/g)].every((c) =>
+      enclosingBlockHeaders(text, c.index).some((h) => h === "if (effectiveLlm && plan.drainPendingQueue) {"));
+    expect(guarded(body)).toBe(true);
+    // 反向校准：条件块清空、调用落到块外，这个检查要报
+    const guard = "if (effectiveLlm && plan.drainPendingQueue) {";
+    expect(guarded(body.replace(guard, `${guard}}\n    {`))).toBe(false);
   });
 
-  it("Minis 挪存档：入库开着拿台账当闸，关着时不等台账", () => {
-    expect(body).toMatch(/plan\.minis === "ingest-then-archive" \? isProcessed : \(\) => true/);
+  it("Minis 挪存档：入库开着拿台账当闸，关着时不等台账、只等文件放稳", () => {
+    expect(body).toMatch(/plan\.minis === "ingest-then-archive" \? isProcessed : settledCheck\(\)/);
   });
 
   it("关着时 Minis 只挪存档这一步排在嵌入接口预检之前（接口挂了也照样挪）；开着时的入库排在预检之后", () => {
@@ -162,5 +169,24 @@ describe("cli.ts 的 ingest 命令不绕开计划", () => {
     expect(archiveOnly).toBeGreaterThan(0);
     expect(preflight).toBeGreaterThan(archiveOnly);
     expect(ingestThenArchive).toBeGreaterThan(preflight);
+  });
+});
+
+
+describe("scripts/re-ingest-cc.sh（先清空整个库、再全量导入）", () => {
+  // 只读脚本原文，不执行：这个脚本一旦真的跑到 reset 就会清库
+  const script = readFileSync(join(resolve(import.meta.dir, "../.."), "scripts/re-ingest-cc.sh"), "utf-8");
+
+  it("对话入库关着时在清库之前就退出：看开关的那一段排在 reset 之前，并且以非零退出", () => {
+    const check = script.indexOf('if [ "${RECALLNEST_TRANSCRIPT_INGEST:-}" != "on" ]; then');
+    const reset = script.indexOf("cli.ts reset --yes");
+    expect(check).toBeGreaterThan(0);
+    expect(reset).toBeGreaterThan(check);
+    const block = script.slice(check, script.indexOf("\nfi\n", check));
+    expect(block).toContain("exit 2");
+    // 看开关之前不能有任何会动库或动台账的命令（注释行不算）
+    const before = script.slice(0, check).split("\n").filter((line) => !line.trim().startsWith("#")).join("\n");
+    expect(before).not.toMatch(/cli\.ts (reset|ingest)|ingested-files\.json/);
+    expect(before.trim().split("\n").filter(Boolean)).toEqual(["set -euo pipefail", 'cd "$(dirname "$0")/.."']);
   });
 });

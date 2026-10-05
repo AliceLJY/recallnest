@@ -50,6 +50,10 @@ Hits    : 5
 - **`imgs : …`** —— 那个 session 里有 52 张图，**一张都没进数据库**。这一行的存在只是让你知道
   那儿有东西可看，而产生它没花一次模型调用、没多一个向量、没占一份存储。
 
+> 上面这一行来自「对话原文入库」。2026-10-06 起这一步默认关：`ingest` 不再把对话记录切块写进库，
+> 默认配置下库里只有你存进去的记忆、提炼产物和记忆文件，原始对话交给专门的会话检索工具去查。
+> 要让库里重新出现这样的行，见下文「索引已有对话」。
+
 最后这条就是整套做法的缩影：**只存"让一样东西能被找到"所需的部分，不存"将来可能被问到"的一切。**
 完整的推理——包括最显然的那种实现错在哪两个地方——在
 [图片：可寻址，而不是被编码](#图片可寻址而不是被编码)。
@@ -280,6 +284,11 @@ bun run seed:continuity
 bun run src/cli.ts doctor
 ```
 
+2026-10-06 起，`ingest` 默认只做两件事：对账记忆文件（`sources.memory`），以及把 Minis 投递目录里的文件挪进
+`data/minis-archive`。六个对话来源（cc / codex / kimi / gemini / desktop / minis）不切片、不嵌入、不写库。
+要把对话原文也索引进来，在运行 `ingest` 的环境里设 `RECALLNEST_TRANSCRIPT_INGEST=on`（只认 `on` 这一个写法）。
+关着期间挪进存档的 Minis 对话不会自动补进来，要补就把文件从 `data/minis-archive` 拷回投递目录再跑。
+
 ---
 
 ## 图片：可寻址，而不是被编码
@@ -483,7 +492,7 @@ bun run src/cli.ts lint --scope project:myapp   # 指定 scope
 bun run src/cli.ts graph --open                 # 导出并打开知识图谱
 bun run src/cli.ts graph --max-nodes 50         # 较小的图
 
-# 导入与诊断
+# 导入与诊断（对话原文默认不入库，见「索引已有对话」）
 bun run src/cli.ts ingest --source all
 bun run src/cli.ts doctor
 ```

@@ -18,7 +18,8 @@
  * 那种文件同样会被挪走——原文在存档里，要补导就从存档拷回投递目录。
  *
  * 2026-10-06 起对话原文默认不再入库（env-config.ts `transcriptIngest`），上面说的「入库」这一步默认不跑：
- * cli.ts 这时传进来的 `isIngested` 是「一律算数」，于是规则变成「至少有一行可用对话的就挪」，其余不变
+ * cli.ts 这时传进来的 `isIngested` 是 `settledCheck()`（文件至少 60 秒没被改过），于是规则变成
+ * 「放稳了、整个文件写完了（`isCompleteJsonl`）、且至少有一行可用对话的就挪」，其余不变
  * （同名不同内容另存 -2、格式不合规的留在原处报错、先复制核对再删原件）。记忆库不再收 Minis 的对话，
  * Deja 照旧从存档读。把入库重新打开（RECALLNEST_TRANSCRIPT_INGEST=on）就回到上面那套按台账挪的规则。
  */
@@ -46,6 +47,19 @@ export interface MinisArchiveResult {
 
 export type IngestedCheck = (filePath: string, size: number, mtimeMs: number) => boolean;
 
+/** 对话入库关着时，文件至少这么久没被改过才挪（毫秒） */
+export const MINIS_SETTLE_MS = 60_000;
+
+/**
+ * 对话入库关着时用的判据：文件已经至少 quietMs 没被改过。
+ * 入库开着的时候，一个文件要先被整个读完、切片、嵌入、记进台账，之后大小和 mtime 都没变才会被挪——
+ * 这段时间等于一个隐含的静置期，正在写的文件过不了。关掉入库后这段时间没有了，这里把它显式补回来：
+ * 刚落地、可能还在写或还在同步的文件留给下一轮（下一轮它的 mtime 自然就够老了）。
+ */
+export function settledCheck(quietMs: number = MINIS_SETTLE_MS, now: () => number = Date.now): IngestedCheck {
+  return (_filePath, _size, mtimeMs) => now() - mtimeMs >= quietMs;
+}
+
 /** 同名但内容不同（同一场对话后来又导出过一版）时另起 -2、-3，两版都留着；内容相同就复用。 */
 function pickTarget(archiveDir: string, name: string, bytes: Buffer): { path: string; alreadyThere: boolean } {
   const ext = extname(name);
@@ -55,6 +69,21 @@ function pickTarget(archiveDir: string, name: string, bytes: Buffer): { path: st
     if (!existsSync(candidate)) return { path: candidate, alreadyThere: false };
     if (readFileSync(candidate).equals(bytes)) return { path: candidate, alreadyThere: true };
   }
+}
+
+/**
+ * 一个 jsonl 是不是写完了：以换行结尾，且每个非空行都解析得出 JSON。
+ * 对话入库关着时挪存档之前用它把关——解析对话的函数会跳过残缺行，一个只写了一半的文件照样「有可用的对话行」，
+ * 不看这一条的话，半截文件会被当成完整的收走、原件删掉。读不了（比如 iCloud 占位文件）时照旧抛错，由调用方记进 errors。
+ */
+export function isCompleteJsonl(filePath: string): boolean {
+  const text = readFileSync(filePath, "utf-8");
+  if (!text.endsWith("\n")) return false;
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try { JSON.parse(line); } catch { return false; }
+  }
+  return true;
 }
 
 export function archiveIngestedMinisFiles(
@@ -79,7 +108,7 @@ export function archiveIngestedMinisFiles(
       // 一行可用对话都没有的文件，台账也会记成已处理（0 chunks）。这种不收走，留在投递目录报错：
       // 悄悄挪走的话，Minis 导出格式哪天变了，谁都看不见
       if (!hasConversation(source)) {
-        result.errors.push(`${name}: 没有可用的对话行（格式不合规），留在原处`);
+        result.errors.push(`${name}: 没有可用的对话行（格式不合规或还没写完），留在原处`);
         continue;
       }
 

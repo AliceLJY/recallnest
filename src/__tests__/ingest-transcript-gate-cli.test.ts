@@ -11,7 +11,7 @@
  */
 import { afterAll, describe, expect, it } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -26,9 +26,18 @@ const DIM = 8;
 const tmpDirs: string[] = [];
 const servers: Server[] = [];
 
+/**
+ * 存档目录按源码位置算（<仓库>/data/minis-archive），不看 RECALLNEST_DATA_DIR。下面那条用例里的半截文件，
+ * 代码正确时不会被挪进去；万一哪天代码改坏了，它会被挪进这个真实目录（Deja 会去读它）。
+ * 所以不管用例过没过，收尾时都把这个文件名从存档目录里拿掉——只拿用例自己造的这一个名字。
+ */
+const HALF_WRITTEN_NAME = "conversation-测试用-写到一半-ingest-gate-cli.jsonl";
+const STRAY_IN_REAL_ARCHIVE = join(REPO_ROOT, "data", "minis-archive", HALF_WRITTEN_NAME);
+
 afterAll(async () => {
   for (const s of servers) await new Promise<void>((done) => s.close(() => done()));
   while (tmpDirs.length) rmSync(tmpDirs.pop()!, { recursive: true, force: true });
+  rmSync(STRAY_IN_REAL_ARCHIVE, { force: true });
 });
 
 interface MockEmbeddings {
@@ -145,11 +154,22 @@ describe("ingest 命令：对话入库关着（默认）", () => {
     // 这样既能从输出看出这一步确实跑了，又不会真的往仓库的 data/minis-archive 里挪东西（那个目录按源码位置算）
     const drop = join(h.dataDir, "..", "minis-drop");
     mkdirSync(drop);
-    writeFileSync(join(drop, "conversation-格式坏了.jsonl"), JSON.stringify({ sessionId: "x", text: "没有 type 和 message 字段" }) + "\n");
+    const bad = join(drop, "conversation-格式坏了.jsonl");
+    writeFileSync(bad, JSON.stringify({ sessionId: "x", text: "没有 type 和 message 字段" }) + "\n");
+    // 关着时只挪至少 60 秒没被改过的文件：把它的修改时间拨到五分钟前，否则这一轮它只会被留给下一轮、什么都不报
+    const fiveMinutesAgo = new Date(Date.now() - 300_000);
+    utimesSync(bad, fiveMinutesAgo, fiveMinutesAgo);
     const cfg = JSON.parse(readFileSync(h.configPath, "utf-8"));
     cfg.embedding.baseURL = DEAD_EMBEDDINGS;
     cfg.sources = { minis: { path: drop, glob: "*.jsonl", description: "test" } };
     writeFileSync(h.configPath, JSON.stringify(cfg));
+
+    // 再放一个只写了一半的：第一行是完整的一轮，第二行断在中间。解析会跳过残缺行，所以它「有可用的对话」；
+    // 命令要是不另外看「文件写完没有」，就会把它当成完整的挪进仓库的存档目录、把原件删掉
+    const half = join(drop, HALF_WRITTEN_NAME);
+    writeFileSync(half, JSON.stringify(turn("user", "u1", null, "这一行是完整的，下一行写到一半就断了，文件其实还没有导出完。")) + "\n" + JSON.stringify(turn("assistant", "u2", "u1", "这一行会被截断在中间，后半句不存在")).slice(0, 60));
+    utimesSync(half, fiveMinutesAgo, fiveMinutesAgo);
+    expect(parseCCTranscript(half).length).toBeGreaterThan(0);
 
     const r = await runIngest(["--source", "all"], { LOCAL_MEMORY_CONFIG: h.configPath, RECALLNEST_DATA_DIR: h.dataDir });
 
@@ -157,6 +177,10 @@ describe("ingest 命令：对话入库关着（默认）", () => {
     expect(r.out).toContain("Embedding API 验证失败");
     expect(r.out).toContain("Minis 对话：不入库，只挪存档");
     expect(r.out).toContain("conversation-格式坏了.jsonl: 没有可用的对话行");
+    expect(r.out).toContain(`${HALF_WRITTEN_NAME}: 没有可用的对话行（格式不合规或还没写完）`);
+    expect(r.out).toContain("0 个移入");
+    expect(existsSync(half)).toBe(true);
+    expect(existsSync(STRAY_IN_REAL_ARCHIVE)).toBe(false);
     expect(r.out.indexOf("只挪存档")).toBeLessThan(r.out.indexOf("Embedding API 验证失败"));
     expect(existsSync(join(drop, "conversation-格式坏了.jsonl"))).toBe(true);
     expect(await rowCount(h.dbPath)).toBe(1);
