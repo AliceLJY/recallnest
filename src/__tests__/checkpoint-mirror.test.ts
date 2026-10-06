@@ -562,6 +562,33 @@ describe("after the third review round (R3)", () => {
     expect((await mirrorCheckpoint(deps, record({ sessionId: "p3" }))).status).toBe("disabled");
   });
 
+  it("purge sees a row committed by another writer while it waited for the lock", async () => {
+    const dir = tempDir("rn-ckpt-purge-late-");
+    const dbPath = join(dir, "db");
+    const lockDir = join(dir, "locks");
+    const offFile = join(dir, "checkpoint-mirror.off");
+    const store = new MemoryStore({ dbPath, vectorDim: 3 });
+    // A non-mirror row so the table exists while no mirror row does yet.
+    await store.upsert({ id: checkpointMirrorId("other-scope"), text: "别的", vector: [0, 0, 1], category: "events", scope: "memory:pivot", importance: 0.5, timestamp: Date.now(), metadata: "{}" });
+    const { withWriteLock } = await import("../distill-lock.js");
+    const { purgeCheckpointMirror } = await import("../checkpoint-mirror.js");
+    let releaseHolder!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseHolder = resolve; });
+    const holder = withWriteLock("checkpoint-mirror-write", async () => {
+      await gate;
+      // The in-flight writer commits the session's first mirror row, then releases.
+      await store.upsertUnlessNewer({ id: checkpointMirrorId("late"), text: "在途写入", vector: [1, 0, 0], category: "events", scope: CHECKPOINT_MIRROR_SCOPE, importance: 0.5, timestamp: Date.now(), metadata: "{}" });
+    }, { lockDir });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const purging = purgeCheckpointMirror(dbPath, { offFile, lockDir });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    releaseHolder();
+    await holder;
+    expect(await purging).toEqual({ rowsBefore: 1, rowsAfter: 0 });
+    const fresh = new MemoryStore({ dbPath, vectorDim: 3 });
+    expect((await fresh.list(["checkpoint"], undefined, 10, 0, "exact")).length).toBe(0);
+  });
+
   it("a dry run against an existing store leaves every table version as it was", async () => {
     const h = harness();
     await mirrorCheckpoint(h.deps, record({ sessionId: "dry-1" }));
