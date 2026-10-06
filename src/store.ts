@@ -599,6 +599,38 @@ export class MemoryStore implements MemoryStorePort {
   }
 
   /**
+   * Upsert that never moves a row back in time: a row already holding a newer timestamp is left
+   * as it is. The check is the merge's own condition, so it holds even when the caller's lock has
+   * expired and another writer got in first. Returns whether the row was inserted or updated.
+   * Used by the checkpoint mirror (src/checkpoint-mirror.ts), whose timestamp is the checkpoint's.
+   */
+  async upsertUnlessNewer(entry: MemoryEntry): Promise<boolean> {
+    await this.ensureInitialized();
+    // Every column present, defaults as in store(): lance 2.0's conditional merge panics on a source
+    // batch missing columns ("Incorrect number of arrays for StructArray fields"), which the
+    // unconditional merge in upsert() tolerates.
+    const full: MemoryEntry = {
+      ...entry,
+      metadata: entry.metadata || "{}",
+      language: entry.language || "en",
+      fts_text: entry.fts_text || entry.text,
+    };
+    const result = await withWriteLock("store-write", async () =>
+      this.table!.mergeInsert("id")
+        .whenMatchedUpdateAll({ where: "target.timestamp <= source.timestamp" })
+        .whenNotMatchedInsertAll()
+        .execute([full]),
+    { expireMs: 30_000 });
+    const written = (result?.numInsertedRows ?? 0) + (result?.numUpdatedRows ?? 0) > 0;
+    if (written) {
+      try {
+        await incrementWriteCount(entry.scope, 1, { statsPath: this.activityStatsPath() });
+      } catch { /* activity tracking is best-effort */ }
+    }
+    return written;
+  }
+
+  /**
    * Import a pre-built entry while preserving its id/timestamp.
    * Used for re-embedding / migration / A/B testing across embedding models.
    * Intentionally separate from `store()` to keep normal writes simple.
@@ -829,6 +861,7 @@ export class MemoryStore implements MemoryStorePort {
     limit = 20,
     offset = 0,
     scopeMatch: ScopeMatchMode = "family",
+    excludeScopes?: string[],
   ): Promise<MemoryEntry[]> {
     await this.ensureInitialized();
 
@@ -836,6 +869,10 @@ export class MemoryStore implements MemoryStorePort {
 
     // Build where conditions
     const conditions: string[] = [];
+
+    if (excludeScopes && excludeScopes.length > 0) {
+      conditions.push(scopeExclusionClause(excludeScopes));
+    }
 
     if (scopeFilter && scopeFilter.length > 0) {
       // 收窄必须在 SQL 里：limit 是在这之后下推的，事后过滤等于先截断再筛，
