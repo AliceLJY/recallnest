@@ -10,6 +10,7 @@ import { resolveRecallMode } from "./runtime-config.js";
 import { buildRetrievalContext, resolveScopeSelection } from "./scope-policy.js";
 import { createScopeSuggester } from "./scope-suggester.js";
 import { buildSessionCheckpointResult } from "./session-engine.js";
+import { mirrorCheckpointWithDeadline } from "./checkpoint-mirror.js";
 import { formatCheckpointSaved, formatCheckpointSummary, formatResumeContext } from "./session-output.js";
 import { matchesTemporalConstraint, type TemporalConstraint } from "./temporal-parser.js";
 import { buildManagedCheckpointObservation, buildManagedResumeObservation } from "./workflow-observation-managed.js";
@@ -223,6 +224,11 @@ registerTool(
       ...result,
       record: storedRecord,
     }));
+    // Mirror into the memory table so search_memory can find it; never throws, capped wait.
+    await mirrorCheckpointWithDeadline(() => {
+      const { store, embedder } = getComponents();
+      return { store, embedder };
+    }, storedRecord);
     return {
       content: [{
         type: "text" as const,
