@@ -70,8 +70,9 @@ import {
   WorkflowPatternInputSchema,
   type WorkflowPatternInput,
 } from "./memory-schema.js";
-import { classifyLegacyScope, MemoryStore, type MemoryEntry } from "./store.js";
-import { backfillCheckpointMirror } from "./checkpoint-mirror.js";
+import { classifyLegacyScope, loadLanceDB, MemoryStore, type MemoryEntry } from "./store.js";
+import { backfillCheckpointMirror, openReadOnlyMirrorReader, purgeCheckpointMirror, type CheckpointMirrorDeps } from "./checkpoint-mirror.js";
+import { autoRegisterBabelMemory } from "./language-hook.js";
 import { ConflictStatusSchema } from "./conflict-schema.js";
 import { resolveConflictCandidate } from "./conflict-engine.js";
 import { escalateConflicts } from "./conflict-escalation.js";
@@ -288,7 +289,10 @@ function parseRequiredLimitOption(value: string | undefined, field: string, min 
  * 用的那把、forget 记录也读错地方；从别的工作区跑时尤其容易错位（第三轮互审 N1）。库里必须已有 memories 表，
  * 免得路径写错时对着一个新建的空库「对账」。
  */
-function checkReconcilePaths(config: LocalMemoryConfig): { ok: boolean; reason: string; dataDir: string; dbPath: string } {
+function checkReconcilePaths(
+  config: LocalMemoryConfig,
+  options: { requireTable?: boolean } = {},
+): { ok: boolean; reason: string; dataDir: string; dbPath: string } {
   const dbPath = resolveDbPath(config);
   const dataDir = resolve(envDataDir());
   const real = (p: string): string => {
@@ -297,7 +301,7 @@ function checkReconcilePaths(config: LocalMemoryConfig): { ok: boolean; reason: 
   if (real(dataDir) !== real(resolveDataDir(config))) {
     return { ok: false, reason: `锁与审计目录 ${dataDir} 和库所在目录 ${resolveDataDir(config)} 不一致（从仓库根目录运行，或设 RECALLNEST_DATA_DIR）`, dataDir, dbPath };
   }
-  if (!existsSync(join(dbPath, "memories.lance"))) {
+  if (options.requireTable !== false && !existsSync(join(dbPath, "memories.lance"))) {
     return { ok: false, reason: `库目录里没有 memories 表：${dbPath}`, dataDir, dbPath };
   }
   return { ok: true, reason: "", dataDir, dbPath };
@@ -1858,15 +1862,22 @@ program
   .option("--checkpoints-dir <dir>", "演练用：从这个目录读 checkpoint，而不是 data/session-checkpoints")
   .action(async (options: { dryRun?: boolean; dbPath?: string; checkpointsDir?: string }) => {
     const config = loadConfig();
-    const prodDbPath = resolveDbPath(config);
-    const { store: prodStore, embedder } = createComponents(config);
-    let store = prodStore;
+    // The mirror's write lock lives under the data dir resolved from the working directory, the
+    // database under the repo; both must be the ones the running MCP / API processes use, or the
+    // backfill and a live save would hold different locks (互审 R3 N1). Run from the repo root.
     // A drill copy given on the command line — not config.dbPath, which only resolveDbPath reads.
     const drillCopy = options.dbPath;
+    const paths = checkReconcilePaths(config, { requireTable: !drillCopy });
+    if (!paths.ok) {
+      console.error(`❌ ${paths.reason}`);
+      process.exitCode = 2;
+      return;
+    }
+    const { store: prodStore, embedder } = createComponents(config);
+    let dbPath = paths.dbPath;
     if (drillCopy) {
       const target = realpathSync(resolve(expandHome(drillCopy)));
-      const prodReal = existsSync(prodDbPath) ? realpathSync(prodDbPath) : prodDbPath;
-      if (target === prodReal) {
+      if (existsSync(paths.dbPath) && target === realpathSync(paths.dbPath)) {
         console.error("❌ --db-path 指向的就是生产库；写生产库不传这个参数");
         process.exitCode = 2;
         return;
@@ -1876,16 +1887,30 @@ program
         process.exitCode = 2;
         return;
       }
-      store = new MemoryStore({ dbPath: target, vectorDim: embedder.dimensions });
+      dbPath = target;
     }
     const { SessionCheckpointStore } = await import("./session-store.js");
     const checkpointStore = options.checkpointsDir
       ? new SessionCheckpointStore(resolve(expandHome(options.checkpointsDir)))
       : new SessionCheckpointStore();
     const records = await checkpointStore.listRecent({ limit: Number.MAX_SAFE_INTEGER });
-    console.log(`库: ${drillCopy ? store.dbPath : prodDbPath}`);
+    console.log(`库: ${dbPath}`);
     console.log(`checkpoint 目录: ${checkpointStore.dataDir}`);
-    const result = await backfillCheckpointMirror({ store, embedder }, records, {
+    let deps: CheckpointMirrorDeps;
+    if (options.dryRun) {
+      // Plain reads only — MemoryStore's initialization could add columns or build an index.
+      const reader = await openReadOnlyMirrorReader(dbPath);
+      deps = {
+        store: { getById: (id: string) => reader.getById(id), upsertUnlessNewer: async () => { throw new Error("dry run does not write"); } },
+        embedder,
+      };
+    } else {
+      // Same tokenizer the MCP server registers at startup, so backfilled rows get the same
+      // language / fts_text as rows the MCP tool writes (互审 R3 N3).
+      await autoRegisterBabelMemory();
+      deps = { store: drillCopy ? new MemoryStore({ dbPath, vectorDim: embedder.dimensions }) : prodStore, embedder };
+    }
+    const result = await backfillCheckpointMirror(deps, records, {
       dryRun: Boolean(options.dryRun),
       onProgress: (done, total) => {
         if (done % 50 === 0 || done === total) console.log(`  ${done}/${total}`);
@@ -1893,6 +1918,34 @@ program
     });
     console.log(JSON.stringify({ dryRun: Boolean(options.dryRun), ...result }, null, 2));
     if ((result.statuses.failed ?? 0) > 0) process.exitCode = 1;
+  });
+
+// ─── checkpoint-mirror-purge ─────────────────────────────────────────────────
+// 撤回 checkpoint 镜像：建 data/checkpoint-mirror.off 停掉所有进程的镜像写入（每次写都读它），
+// 再持镜像写锁按 scope 精确等于 checkpoint 删除。不带 --yes 只数不删。恢复镜像：删掉开关文件。
+
+program
+  .command("checkpoint-mirror-purge")
+  .description("撤回 checkpoint 镜像：停写并删除 scope 恰为 checkpoint 的全部行（不带 --yes 只数）")
+  .option("--yes", "确认执行")
+  .action(async (options: { yes?: boolean }) => {
+    const config = loadConfig();
+    const paths = checkReconcilePaths(config);
+    if (!paths.ok) {
+      console.error(`❌ ${paths.reason}`);
+      process.exitCode = 2;
+      return;
+    }
+    console.log(`库: ${paths.dbPath}`);
+    if (!options.yes) {
+      const table = await (await (await loadLanceDB()).connect(paths.dbPath)).openTable("memories");
+      console.log(`scope = 'checkpoint' 的行数: ${await table.countRows("scope = 'checkpoint'")}（加 --yes 才会停写并删除）`);
+      return;
+    }
+    const result = await purgeCheckpointMirror(paths.dbPath);
+    console.log(JSON.stringify(result, null, 2));
+    console.log("开关文件 data/checkpoint-mirror.off 已建，镜像写入已停；要恢复，删掉这个文件。几分钟后再跑一次本命令（不带 --yes）确认仍是 0。");
+    if (result.rowsAfter !== 0) process.exitCode = 1;
   });
 
 // ─── reconcile-memory ────────────────────────────────────────────────────────
