@@ -393,10 +393,11 @@ export async function purgeCheckpointMirror(
   const offFile = options.offFile ?? DEFAULT_OFF_FILE;
   mkdirSync(dirname(offFile), { recursive: true });
   writeFileSync(offFile, `checkpoint mirror turned off for purge at ${new Date().toISOString()}\n`);
-  const lancedb = await loadLanceDB();
-  const table = await (await lancedb.connect(dbPath)).openTable("memories");
   const exact = `scope = '${escapeSqlLiteral(CHECKPOINT_MIRROR_SCOPE)}'`;
   return withWriteLock(MIRROR_LOCK_KEY, async () => {
+    // Open the table only once the lock is held: a handle opened earlier keeps the version it
+    // saw and would miss a row another process committed while we waited (互审 Codex 复看 N4).
+    const table = await (await (await loadLanceDB()).connect(dbPath)).openTable("memories");
     const rowsBefore = await table.countRows(exact);
     if (rowsBefore > 0) {
       await withWriteLock("store-write", async () => { await table.delete(exact); }, {
