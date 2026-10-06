@@ -232,6 +232,11 @@ const TABLE_NAME = "memories";
  * 应用层双检 `matchesScopeFilter(row, filter, mode)` 必须传同一个 mode，否则 SQL 收紧了
  * 应用层又放行（或反之），两层判据打架。
  */
+/** `scope NOT IN (...)` — exact scope names, never prefix families. */
+export function scopeExclusionClause(excludeScopes: string[]): string {
+  return `(scope NOT IN (${excludeScopes.map((scope) => `'${escapeSqlLiteral(scope)}'`).join(", ")}))`;
+}
+
 export function scopeWhereClause(scopeFilter: string[], mode: ScopeMatchMode = "family"): string {
   return scopeFilter
     .map(scope => {
@@ -651,6 +656,7 @@ export class MemoryStore implements MemoryStorePort {
     minScore = 0.3,
     scopeFilter?: string[],
     scopeMatch: ScopeMatchMode = "family",
+    excludeScopes?: string[],
   ): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
@@ -662,8 +668,13 @@ export class MemoryStore implements MemoryStorePort {
     // Apply scope filter if provided. Default mode "family" = 历史行为（含冒号精确 /
     // 无冒号前缀）；exact 由调用方显式声明。**必须下推到 SQL，不能事后在应用层滤**——
     // top-k 在收窄前就被兄弟 scope 占满，滤完只剩残缺候选（2026-08-16 互审 C1）。
-    if (scopeFilter && scopeFilter.length > 0) {
-      query = query.where(`(${scopeWhereClause(scopeFilter, scopeMatch)})`);
+    // Exclusions are pushed down for the same reason (resolveExcludedScopes in memory-boundaries.ts).
+    const where = [
+      ...(scopeFilter && scopeFilter.length > 0 ? [`(${scopeWhereClause(scopeFilter, scopeMatch)})`] : []),
+      ...(excludeScopes && excludeScopes.length > 0 ? [scopeExclusionClause(excludeScopes)] : []),
+    ];
+    if (where.length > 0) {
+      query = query.where(where.join(" AND "));
     }
 
     const results = await query.toArray();
@@ -681,6 +692,7 @@ export class MemoryStore implements MemoryStorePort {
       if (!matchesScopeFilter(rowScope, scopeFilter, scopeMatch)) {
         continue;
       }
+      if (excludeScopes?.includes(rowScope)) continue;
 
       mapped.push({
         entry: {
@@ -702,7 +714,7 @@ export class MemoryStore implements MemoryStorePort {
     return mapped;
   }
 
-  async bm25Search(query: string, limit = 5, scopeFilter?: string[]): Promise<MemorySearchResult[]> {
+  async bm25Search(query: string, limit = 5, scopeFilter?: string[], excludeScopes?: string[]): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
     if (!this.ftsIndexCreated) {
@@ -716,8 +728,12 @@ export class MemoryStore implements MemoryStorePort {
       let searchQuery = this.table!.search(query, "fts").limit(safeLimit);
 
       // Apply scope filter if provided (family mode, same as vectorSearch's default)
-      if (scopeFilter && scopeFilter.length > 0) {
-        searchQuery = searchQuery.where(`(${scopeWhereClause(scopeFilter)})`);
+      const where = [
+        ...(scopeFilter && scopeFilter.length > 0 ? [`(${scopeWhereClause(scopeFilter)})`] : []),
+        ...(excludeScopes && excludeScopes.length > 0 ? [scopeExclusionClause(excludeScopes)] : []),
+      ];
+      if (where.length > 0) {
+        searchQuery = searchQuery.where(where.join(" AND "));
       }
 
       const results = await searchQuery.toArray();
@@ -730,6 +746,7 @@ export class MemoryStore implements MemoryStorePort {
         if (!matchesScopeFilter(rowScope, scopeFilter)) {
           continue;
         }
+        if (excludeScopes?.includes(rowScope)) continue;
 
         // LanceDB FTS _score is raw BM25 (unbounded). Normalize with sigmoid.
         // LanceDB may return BigInt for numeric columns; coerce safely.

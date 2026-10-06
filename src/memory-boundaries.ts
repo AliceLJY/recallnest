@@ -99,6 +99,25 @@ export function isTranscriptScope(scope: string): boolean {
   return TRANSCRIPT_SCOPE_PREFIXES.some((prefix) => scope.startsWith(prefix));
 }
 
+/**
+ * Scope of the session-checkpoint mirror (src/checkpoint-mirror.ts): one `events` row per session.
+ * Lives here so the retriever can refer to it without importing the mirror module.
+ */
+export const CHECKPOINT_MIRROR_SCOPE = "checkpoint";
+
+/**
+ * Scopes a retrieval must keep out of its candidate pool. The vector / BM25 candidate pool is
+ * cut to at most 20 rows before the category filter runs, so rows that the category filter is
+ * certain to drop still take candidate slots from the rows it would keep. Mirror rows are all
+ * `events`; any other category filter therefore drops every one of them — excluding the scope up
+ * front is lossless and keeps category searches as they were before the mirror existed.
+ */
+export function resolveExcludedScopes(params: { category?: string; excludeScopes?: string[] }): string[] {
+  const excluded = new Set(params.excludeScopes ?? []);
+  if (params.category && params.category !== "events") excluded.add(CHECKPOINT_MIRROR_SCOPE);
+  return [...excluded];
+}
+
 export function isDurableMemoryScope(scope: string): boolean {
   return scope.startsWith("memory:") || scope.startsWith("asset:");
 }

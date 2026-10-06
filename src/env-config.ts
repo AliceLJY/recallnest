@@ -181,6 +181,13 @@ export const searchFirstScreen = (): "legacy" | "fulltext" =>
  */
 export const transcriptIngest = (): boolean => process.env.RECALLNEST_TRANSCRIPT_INGEST === "on";
 
+/**
+ * RECALLNEST_CHECKPOINT_MIRROR（2026-10-07）：checkpoint 存完后要不要同步镜像进记忆库（src/checkpoint-mirror.ts）。
+ * 默认开；只认 `off` 这一个写法来关。另有文件开关 data/checkpoint-mirror.off，每次调用时读，
+ * 已经在跑的进程不用重启就停（环境变量只在进程启动时读进来）。
+ */
+export const checkpointMirror = (): boolean => process.env.RECALLNEST_CHECKPOINT_MIRROR !== "off";
+
 // --- String settings with `||` default (empty string falls through) ---
 
 export const dataDir = (): string => process.env.RECALLNEST_DATA_DIR || "data";

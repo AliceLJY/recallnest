@@ -70,7 +70,8 @@ import {
   WorkflowPatternInputSchema,
   type WorkflowPatternInput,
 } from "./memory-schema.js";
-import { classifyLegacyScope, type MemoryEntry } from "./store.js";
+import { classifyLegacyScope, MemoryStore, type MemoryEntry } from "./store.js";
+import { backfillCheckpointMirror } from "./checkpoint-mirror.js";
 import { ConflictStatusSchema } from "./conflict-schema.js";
 import { resolveConflictCandidate } from "./conflict-engine.js";
 import { escalateConflicts } from "./conflict-escalation.js";
@@ -1842,6 +1843,56 @@ program
       console.log("⚠️ 记忆对账需要人看（见上面 Memory: 行），以退出码 3 结束");
       process.exitCode = 3;
     }
+  });
+
+// ─── checkpoint-mirror-backfill ───────────────────────────────────────────────
+// checkpoint 镜像（src/checkpoint-mirror.ts）的一次性回填：每场会话取最新的 rich checkpoint 写进 scope
+// `checkpoint`，已是这一版的跳过，可重复跑。输出只有计数，不打印 checkpoint 正文。
+// --db-path / --checkpoints-dir 只给演练用：指向生产库以外的副本；指向配置里的生产库会被拒绝（生产库不传这个参数）。
+
+program
+  .command("checkpoint-mirror-backfill")
+  .description("把现有 checkpoint 按会话取最新一份镜像进记忆库（scope checkpoint；默认写库，--dry-run 只数）")
+  .option("--dry-run", "只数会做什么，不嵌入、不写库")
+  .option("--db-path <dir>", "演练用：写进这个 LanceDB 副本，而不是配置里的生产库")
+  .option("--checkpoints-dir <dir>", "演练用：从这个目录读 checkpoint，而不是 data/session-checkpoints")
+  .action(async (options: { dryRun?: boolean; dbPath?: string; checkpointsDir?: string }) => {
+    const config = loadConfig();
+    const prodDbPath = resolveDbPath(config);
+    const { store: prodStore, embedder } = createComponents(config);
+    let store = prodStore;
+    // A drill copy given on the command line — not config.dbPath, which only resolveDbPath reads.
+    const drillCopy = options.dbPath;
+    if (drillCopy) {
+      const target = realpathSync(resolve(expandHome(drillCopy)));
+      const prodReal = existsSync(prodDbPath) ? realpathSync(prodDbPath) : prodDbPath;
+      if (target === prodReal) {
+        console.error("❌ --db-path 指向的就是生产库；写生产库不传这个参数");
+        process.exitCode = 2;
+        return;
+      }
+      if (!existsSync(join(target, "memories.lance"))) {
+        console.error(`❌ 库目录里没有 memories 表：${target}`);
+        process.exitCode = 2;
+        return;
+      }
+      store = new MemoryStore({ dbPath: target, vectorDim: embedder.dimensions });
+    }
+    const { SessionCheckpointStore } = await import("./session-store.js");
+    const checkpointStore = options.checkpointsDir
+      ? new SessionCheckpointStore(resolve(expandHome(options.checkpointsDir)))
+      : new SessionCheckpointStore();
+    const records = await checkpointStore.listRecent({ limit: Number.MAX_SAFE_INTEGER });
+    console.log(`库: ${drillCopy ? store.dbPath : prodDbPath}`);
+    console.log(`checkpoint 目录: ${checkpointStore.dataDir}`);
+    const result = await backfillCheckpointMirror({ store, embedder }, records, {
+      dryRun: Boolean(options.dryRun),
+      onProgress: (done, total) => {
+        if (done % 50 === 0 || done === total) console.log(`  ${done}/${total}`);
+      },
+    });
+    console.log(JSON.stringify({ dryRun: Boolean(options.dryRun), ...result }, null, 2));
+    if ((result.statuses.failed ?? 0) > 0) process.exitCode = 1;
   });
 
 // ─── reconcile-memory ────────────────────────────────────────────────────────
