@@ -98,7 +98,9 @@ export const DEFAULT_DREAM_CONFIG: DreamConfig = {
   maxEntriesPerRun: 500,
   autoRunBudgetMs: 2 * 60 * 60 * 1000,
   autoExcludeScopes: ["memory"],
-  neverDreamScopes: ["memory:pivot"],
+  // checkpoint（2026-10-07）：每场会话一行的 checkpoint 镜像（src/checkpoint-mirror.ts），只由镜像自己按会话覆盖；
+  // 合并它会把不同会话的状态揉成一条，或把正在被覆盖的行标成 superseded。
+  neverDreamScopes: ["memory:pivot", "checkpoint"],
   gc: DEFAULT_AUTO_GC_CONFIG,
 };
 

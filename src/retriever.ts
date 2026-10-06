@@ -18,7 +18,7 @@ import { weibullDecay, resolveTier, isDecayExempt, adjustHalfLifeForEmotion, com
 import { logInfo, logWarn } from "./stderr-log.js";
 import { matchesScopeFilter } from "./scope-policy.js";
 import type { TriggerStore, TriggerHit } from "./trigger-store.js";
-import { extractBoundaryMetadata, isDurableMemoryScope, isTranscriptScope } from "./memory-boundaries.js";
+import { extractBoundaryMetadata, isDurableMemoryScope, isTranscriptScope, resolveExcludedScopes } from "./memory-boundaries.js";
 import type { TraceCollector } from "./retrieval-trace.js";
 import { extractTopicTag } from "./topic-tag.js";
 import { filterInterference } from "./rif.js";
@@ -196,6 +196,11 @@ export interface RetrievalContext {
   validAt?: number;
   /** F3: When true, include expired memories (demoted 80%). Default: false. */
   includeExpired?: boolean;
+  /**
+   * Scopes kept out of the candidate pool (pushed down into the vector / BM25 queries). A category
+   * filter other than `events` also excludes the checkpoint-mirror scope — see resolveExcludedScopes.
+   */
+  excludeScopes?: string[];
 }
 
 export interface RetrievalResult extends MemorySearchResult {
@@ -857,6 +862,8 @@ export class MemoryRetriever {
   async retrieve(context: RetrievalContext): Promise<RetrievalResultSet> {
     const { query: rawQuery, limit, scopeFilter, category, includeArchived, trace, graph } = context;
     const safeLimit = clampInt(limit, 1, 20);
+    const excluded = resolveExcludedScopes(context);
+    const excludeScopes = excluded.length > 0 ? excluded : undefined;
 
     // Adaptive retrieval: skip trivial queries to save embedding API calls
     if (shouldSkipRetrieval(rawQuery)) {
@@ -881,19 +888,19 @@ export class MemoryRetriever {
 
     // For vector-only mode, use legacy behavior
     if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
-      results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace);
+      results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, undefined, excludeScopes);
     } else {
       // Hybrid retrieval with vector + BM25 weighted score fusion (+ optional PPR graph)
-      results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, graph);
+      results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, graph, undefined, excludeScopes);
     }
 
     // 0-hit fallback: minScore filter 把所有候选过滤光时，放宽阈值（=0）重试一次。
     // 只在原 path 0 hit 触发；正常召回不受影响。
     if (results.length === 0) {
       if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
-        results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, 0);
+        results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, 0, excludeScopes);
       } else {
-        results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, graph, 0);
+        results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, graph, 0, excludeScopes);
       }
     }
 
@@ -906,7 +913,7 @@ export class MemoryRetriever {
     // 字符串匹配，是 embedding 本质，跟语言无关）。普通词（mem0/recallnest/GitHub）不触发，日常
     // 语义召回不受影响。
     if (hasExactToken(rawQuery)) {
-      results = await this.supplementExactTokenWithBm25(query, results, safeLimit, scopeFilter, category, includeArchived);
+      results = await this.supplementExactTokenWithBm25(query, results, safeLimit, scopeFilter, category, includeArchived, excludeScopes);
     }
 
     // LME-2: Multi-hop retrieval — extract entities from first-pass results,
@@ -1045,10 +1052,11 @@ export class MemoryRetriever {
     scopeFilter?: string[],
     category?: string,
     includeArchived?: boolean,
+    excludeScopes?: string[],
   ): Promise<RetrievalResult[]> {
     if (!this.store.hasFtsSupport) return vectorResults;
     const ftsQuery = tokenizeFts(expandQuery(query), detectLang(query));
-    const bm25 = await this.runBM25Search(ftsQuery, Math.max(limit, 5), scopeFilter, category, includeArchived);
+    const bm25 = await this.runBM25Search(ftsQuery, Math.max(limit, 5), scopeFilter, category, includeArchived, excludeScopes);
     const vecIds = new Set(vectorResults.map(r => r.entry.id));
     const supplements = bm25
       .filter(b => !vecIds.has(b.entry.id))
@@ -1094,6 +1102,8 @@ export class MemoryRetriever {
         context.includeArchived,
         undefined, // no trace for follow-up
         context.graph,
+        undefined,
+        resolveExcludedScopes(context).length > 0 ? resolveExcludedScopes(context) : undefined,
       ).catch(() => [] as RetrievalResult[]),
     );
     const followUpResults = await Promise.all(followUpPromises);
@@ -1194,6 +1204,7 @@ export class MemoryRetriever {
     includeArchived?: boolean,
     trace?: TraceCollector,
     minScoreOverride?: number,
+    excludeScopes?: string[],
   ): Promise<RetrievalResult[]> {
     // Temporal reasoning for vector-only mode
     const temporal = parseTemporalQuery(query);
@@ -1214,7 +1225,7 @@ export class MemoryRetriever {
     // plus a few more local scoring passes, no extra API; P1.2's vector-only savings come from
     // skipping hybrid BM25/fusion/rerank, not from fetch size.
     const fetchLimit = Math.max(limit, this.config.candidatePoolSize ?? limit);
-    const results = await this.store.vectorSearch(queryVector, fetchLimit, vectorMinScore, scopeFilter);
+    const results = await this.store.vectorSearch(queryVector, fetchLimit, vectorMinScore, scopeFilter, undefined, excludeScopes);
     trace?.endStage(results.length, results.map(r => r.score));
 
     // Filter by category if specified
@@ -1268,6 +1279,7 @@ export class MemoryRetriever {
     trace?: TraceCollector,
     graph?: boolean,
     minScoreOverride?: number,
+    excludeScopes?: string[],
   ): Promise<RetrievalResult[]> {
     // Adaptive pool: widen candidate pool for aggregation queries ("how many", "all the")
     const multiplier = (this.config.adaptivePoolMultiplier ?? 1) > 1 && isAggregationQuery(query)
@@ -1297,8 +1309,8 @@ export class MemoryRetriever {
 
     trace?.startStage("vector_search", 0);
     const [vectorResults, bm25Results, pprResults] = await Promise.all([
-      this.runVectorSearch(queryVector, candidatePoolSize, scopeFilter, category, includeArchived),
-      this.runBM25Search(ftsQuery, candidatePoolSize, scopeFilter, category, includeArchived),
+      this.runVectorSearch(queryVector, candidatePoolSize, scopeFilter, category, includeArchived, excludeScopes),
+      this.runBM25Search(ftsQuery, candidatePoolSize, scopeFilter, category, includeArchived, excludeScopes),
       pprPromise,
     ]);
     trace?.endStage(vectorResults.length, vectorResults.map(r => r.score));
@@ -1609,10 +1621,11 @@ export class MemoryRetriever {
     scopeFilter?: string[],
     category?: string,
     includeArchived?: boolean,
+    excludeScopes?: string[],
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
     let results: MemorySearchResult[];
     try {
-      results = await this.store.vectorSearch(queryVector, limit, 0.1, scopeFilter);
+      results = await this.store.vectorSearch(queryVector, limit, 0.1, scopeFilter, undefined, excludeScopes);
     } catch (err) {
       // Fail-open: log warning and continue with empty results (backport from v1.0.30)
       logWarn("vectorSearch failed, continuing with empty results:", err);
@@ -1641,8 +1654,9 @@ export class MemoryRetriever {
     scopeFilter?: string[],
     category?: string,
     includeArchived?: boolean,
+    excludeScopes?: string[],
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
-    const results = await this.store.bm25Search(query, limit, scopeFilter);
+    const results = await this.store.bm25Search(query, limit, scopeFilter, excludeScopes);
 
     // Filter by category if specified
     const afterCategory = category
