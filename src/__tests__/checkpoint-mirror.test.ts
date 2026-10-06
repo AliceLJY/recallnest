@@ -463,3 +463,123 @@ describe("backfill", () => {
     expect(await h.rows()).toHaveLength(0);
   });
 });
+
+describe("after the third review round (R3)", () => {
+  it("upsertUnlessNewer never moves a row back in time (the merge's own condition)", async () => {
+    const dir = tempDir("rn-ckpt-unless-");
+    const store = new MemoryStore({ dbPath: join(dir, "db"), vectorDim: 3 });
+    const row = (timestamp: number, text: string) => ({
+      id: "00000000-0000-0000-0000-0000000000a1", text, vector: [1, 0, 0], category: "events" as const,
+      scope: CHECKPOINT_MIRROR_SCOPE, importance: 0.5, timestamp, metadata: "{}",
+    });
+    expect(await store.upsertUnlessNewer(row(200, "v200"))).toBe(true);
+    expect(await store.upsertUnlessNewer(row(100, "v100"))).toBe(false);
+    expect((await store.getById("00000000-0000-0000-0000-0000000000a1"))?.text).toBe("v200");
+    expect(await store.upsertUnlessNewer(row(200, "v200b"))).toBe(true);
+    expect(await store.upsertUnlessNewer(row(300, "v300"))).toBe(true);
+    expect((await store.getById("00000000-0000-0000-0000-0000000000a1"))?.text).toBe("v300");
+  });
+
+  it("a writer whose view went stale (e.g. its lock expired) still cannot overwrite a newer row", async () => {
+    const h = harness();
+    await mirrorCheckpoint(h.deps, record({ checkpointId: "new", summary: "新版", updatedAt: "2026-10-06T11:00:00.000Z" }));
+    // Simulate a writer that read the row before the newer one landed: its reads see nothing.
+    const staleView: CheckpointMirrorDeps = { ...h.deps, store: { getById: async () => null, upsertUnlessNewer: (e) => h.store.upsertUnlessNewer(e) } };
+    const result = await mirrorCheckpoint(staleView, record({ checkpointId: "old", summary: "旧版", updatedAt: "2026-10-06T10:00:00.000Z" }));
+    expect(result.status).toBe("skipped-stale");
+    const [row] = await h.rows();
+    expect(row.metadata.checkpointId).toBe("new");
+  });
+
+  it("mirror rows stay out of the canonical-match scan window, so a cross-category write still conflicts", async () => {
+    const dir = tempDir("rn-ckpt-window-");
+    const store = new MemoryStore({ dbPath: join(dir, "db"), vectorDim: 3 });
+    const now = Date.now();
+    const KEY = "entities-window-edge-target";
+    await store.upsert({
+      id: "00000000-0000-0000-0000-0000000000b1", text: "窗口边缘的 durable 行", vector: [0, 1, 0], category: "entities",
+      scope: "memory:pivot", importance: 0.7, timestamp: now - 10_000,
+      metadata: JSON.stringify({ canonicalKey: KEY, boundary: { layer: "durable", authority: "structured-memory", conflictPolicy: "latest-wins", originalCategory: "entities" } }),
+    });
+    await store.storeBatch(Array.from({ length: 999 }, (_, i) => ({
+      id: `00000000-0000-0000-0000-1${String(i).padStart(11, "0")}`, text: `填充 ${i}`, vector: [0, 0, 1], category: "events" as const,
+      scope: "memory:filler", importance: 0.5, metadata: "{}",
+    })));
+    await store.upsert({
+      id: checkpointMirrorId("window-session"), text: "镜像行", vector: [1, 0, 0], category: "events", scope: CHECKPOINT_MIRROR_SCOPE,
+      importance: 0.5, timestamp: now + 60_000, metadata: JSON.stringify({ checkpointMirror: true, boundary: { layer: "session", authority: "session-checkpoint", conflictPolicy: "latest-wins" } }),
+    });
+    // Calibration: without the exclusion the target is pushed out of the newest-1000 window.
+    expect((await store.list(undefined, undefined, 1000, 0)).some((e) => e.id === "00000000-0000-0000-0000-0000000000b1")).toBe(false);
+    expect((await store.list(undefined, undefined, 1000, 0, undefined, [CHECKPOINT_MIRROR_SCOPE])).some((e) => e.id === "00000000-0000-0000-0000-0000000000b1")).toBe(true);
+    const conflicts: unknown[] = [];
+    const { writeDurableEntry } = await import("../capture-engine.js");
+    const out = await writeDurableEntry({
+      store,
+      embedder: { embedPassage: async () => [0, 1, 0] },
+      conflictStore: {
+        async save(r: unknown) { conflicts.push(r); return r as never; },
+        async replace(r: unknown) { return r as never; },
+        async getOpenByFingerprint() { return null; },
+        async getLatestByFingerprint() { return null; },
+      } as never,
+    }, {
+      text: "同 key 另一类别", vector: [0, 1, 0], category: "events", scope: "memory:pivot", importance: 0.7,
+      metadata: "{}", canonicalKey: KEY, source: "agent",
+    });
+    expect(out.disposition).toBe("conflict");
+    expect(conflicts).toHaveLength(1);
+  });
+
+  it("purge turns the mirror off and deletes exactly scope `checkpoint`, waiting for an in-flight locked write", async () => {
+    const dir = tempDir("rn-ckpt-purge-");
+    const dbPath = join(dir, "db");
+    const lockDir = join(dir, "locks");
+    const offFile = join(dir, "checkpoint-mirror.off");
+    const store = new MemoryStore({ dbPath, vectorDim: 3 });
+    const deps: CheckpointMirrorDeps = { store, embedder: { embedPassage: async () => [1, 2, 3] }, offFile, lockDir };
+    await mirrorCheckpoint(deps, record({ sessionId: "p1" }));
+    await mirrorCheckpoint(deps, record({ sessionId: "p2" }));
+    for (const scope of ["checkpoint-other", "checkpoint:family"]) {
+      await store.upsert({ id: checkpointMirrorId(scope), text: scope, vector: [1, 1, 1], category: "events", scope, importance: 0.5, timestamp: Date.now(), metadata: "{}" });
+    }
+    const { withWriteLock } = await import("../distill-lock.js");
+    let releasedAt = 0;
+    const holder = withWriteLock("checkpoint-mirror-write", async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      releasedAt = Date.now();
+    }, { lockDir });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const { purgeCheckpointMirror } = await import("../checkpoint-mirror.js");
+    const result = await purgeCheckpointMirror(dbPath, { offFile, lockDir });
+    const purgedAt = Date.now();
+    await holder;
+    expect(releasedAt).toBeGreaterThan(0);
+    expect(purgedAt).toBeGreaterThanOrEqual(releasedAt); // it waited for the in-flight locked write
+    expect(result).toEqual({ rowsBefore: 2, rowsAfter: 0 });
+    const left = (await store.list(undefined, undefined, 100, 0)).map((e) => e.scope).sort();
+    expect(left).toEqual(["checkpoint-other", "checkpoint:family"]);
+    expect((await mirrorCheckpoint(deps, record({ sessionId: "p3" }))).status).toBe("disabled");
+  });
+
+  it("a dry run against an existing store leaves every table version as it was", async () => {
+    const h = harness();
+    await mirrorCheckpoint(h.deps, record({ sessionId: "dry-1" }));
+    const dbPath = (h.store as unknown as { dbPath: string }).dbPath;
+    const { loadLanceDB } = await import("../store.js");
+    const versions = async () => {
+      const db = await (await loadLanceDB()).connect(dbPath);
+      return Promise.all((await db.tableNames()).map(async (n) => `${n}:${await (await db.openTable(n)).version()}`));
+    };
+    const before = await versions();
+    const { openReadOnlyMirrorReader } = await import("../checkpoint-mirror.js");
+    const reader = await openReadOnlyMirrorReader(dbPath);
+    const result = await backfillCheckpointMirror(
+      { ...h.deps, store: { getById: (id) => reader.getById(id), upsertUnlessNewer: async () => { throw new Error("dry run does not write"); } } },
+      [record({ sessionId: "dry-1" }), record({ sessionId: "dry-2" })],
+      { dryRun: true },
+    );
+    expect(result.statuses).toEqual({ unchanged: 1, "would-embed": 1 });
+    expect(await versions()).toEqual(before);
+  });
+});

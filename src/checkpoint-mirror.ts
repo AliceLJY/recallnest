@@ -24,8 +24,8 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 
 import { metaDir } from "./compat.js";
 import { withWriteLock } from "./distill-lock.js";
@@ -37,7 +37,7 @@ import { redactSecrets } from "./pii-detector.js";
 import type { SessionCheckpointRecord } from "./session-schema.js";
 import { checkpointFileName, classifyCheckpointQuality } from "./session-store.js";
 import { logWarn } from "./stderr-log.js";
-import { deterministicId, type MemoryEntry, type MemoryStore } from "./store.js";
+import { deterministicId, escapeSqlLiteral, loadLanceDB, type MemoryEntry, type MemoryStore } from "./store.js";
 
 export { CHECKPOINT_MIRROR_SCOPE };
 const MIRROR_CATEGORY = "events" as const;
@@ -72,7 +72,7 @@ export interface CheckpointMirrorResult {
 }
 
 export interface CheckpointMirrorDeps {
-  store: Pick<MemoryStore, "getById" | "upsert">;
+  store: Pick<MemoryStore, "getById" | "upsertUnlessNewer">;
   embedder: Pick<Embedder, "embedPassage">;
   /** Kill-switch file; defaults to data/checkpoint-mirror.off next to the checkpoint files. */
   offFile?: string;
@@ -221,7 +221,7 @@ export async function mirrorCheckpoint(
       const decision = decideMirrorWrite(current, record, text);
       if (decision !== "write") return { status: decision, id };
       const language = detectLang(text);
-      await deps.store.upsert({
+      const written = await deps.store.upsertUnlessNewer({
         id,
         text,
         vector,
@@ -233,6 +233,9 @@ export async function mirrorCheckpoint(
         language,
         fts_text: tokenizeFts(text, language),
       });
+      // The merge itself refuses to move a row back in time — this catches a writer whose lock
+      // expired mid-write while a newer checkpoint got in (timestamp = the checkpoint's updatedAt).
+      if (!written) return { status: "skipped-stale", id };
       const status: CheckpointMirrorStatus = !current ? "stored" : current.text === text ? "refreshed" : "replaced";
       return { status, id };
     }, { expireMs: 60_000, ...(deps.lockDir ? { lockDir: deps.lockDir } : {}) });
@@ -338,4 +341,69 @@ export async function backfillCheckpointMirror(
     options.onProgress?.(index + 1, selected.length);
   }
   return { checkpoints: records.length, sessions, sessionsWithoutRich, statuses };
+}
+
+/**
+ * A getById that only reads: connect + openTable + query, never MemoryStore's initialization
+ * (which may add columns, create the table or build the FTS index). For --dry-run, so that a
+ * dry run against the production store provably writes nothing.
+ */
+export async function openReadOnlyMirrorReader(dbPath: string): Promise<Pick<MemoryStore, "getById">> {
+  const lancedb = await loadLanceDB();
+  const table = await (await lancedb.connect(dbPath)).openTable("memories");
+  return {
+    async getById(id: string): Promise<MemoryEntry | null> {
+      const rows = await table.query()
+        .select(["id", "text", "category", "scope", "importance", "timestamp", "metadata"])
+        .where(`id = '${escapeSqlLiteral(id)}'`)
+        .limit(1)
+        .toArray();
+      if (rows.length === 0) return null;
+      const row = rows[0];
+      return {
+        id: String(row.id),
+        text: String(row.text),
+        vector: [],
+        category: row.category as MemoryEntry["category"],
+        scope: String(row.scope ?? ""),
+        importance: Number(row.importance),
+        timestamp: Number(row.timestamp),
+        metadata: String(row.metadata || "{}"),
+      };
+    },
+  };
+}
+
+export interface CheckpointMirrorPurgeResult {
+  rowsBefore: number;
+  rowsAfter: number;
+}
+
+/**
+ * Rollback: turn the mirror off (create the off file), then — holding the mirror's write lock, so
+ * a write that already passed its own off-check finishes first — delete every row whose scope is
+ * exactly `checkpoint`. Writers that reach the lock afterwards see the off file and stop.
+ * Residual: a writer frozen for longer than the lock's 60 s expiry inside its millisecond-long
+ * locked section could still insert after the delete; count again a few minutes later.
+ */
+export async function purgeCheckpointMirror(
+  dbPath: string,
+  options: { offFile?: string; lockDir?: string } = {},
+): Promise<CheckpointMirrorPurgeResult> {
+  const offFile = options.offFile ?? DEFAULT_OFF_FILE;
+  mkdirSync(dirname(offFile), { recursive: true });
+  writeFileSync(offFile, `checkpoint mirror turned off for purge at ${new Date().toISOString()}\n`);
+  const lancedb = await loadLanceDB();
+  const table = await (await lancedb.connect(dbPath)).openTable("memories");
+  const exact = `scope = '${escapeSqlLiteral(CHECKPOINT_MIRROR_SCOPE)}'`;
+  return withWriteLock(MIRROR_LOCK_KEY, async () => {
+    const rowsBefore = await table.countRows(exact);
+    if (rowsBefore > 0) {
+      await withWriteLock("store-write", async () => { await table.delete(exact); }, {
+        expireMs: 30_000,
+        ...(options.lockDir ? { lockDir: options.lockDir } : {}),
+      });
+    }
+    return { rowsBefore, rowsAfter: await table.countRows(exact) };
+  }, { expireMs: 60_000, waitTimeoutMs: 120_000, ...(options.lockDir ? { lockDir: options.lockDir } : {}) });
 }

@@ -35,6 +35,7 @@ import { deterministicId, type MemoryEntry, type MemoryStore } from "./store.js"
 import {
   buildDefaultCanonicalKey,
   buildStructuredMemoryBoundary,
+  CHECKPOINT_MIRROR_SCOPE,
   extractBoundaryMetadata,
   extractCanonicalKey,
   extractPromotedFrom,
@@ -467,7 +468,9 @@ async function findCanonicalMatches(
   canonicalKey: string,
 ): Promise<MemoryEntry[]> {
   if (!store.list) return [];
-  const entries = await store.list(undefined, undefined, CANONICAL_SCAN_LIMIT, 0);
+  // Checkpoint-mirror rows are session layer (never a match below) but carry recent timestamps;
+  // keep them out of the newest-N window so they cannot push durable rows out of it.
+  const entries = await store.list(undefined, undefined, CANONICAL_SCAN_LIMIT, 0, undefined, [CHECKPOINT_MIRROR_SCOPE]);
   return entries.filter((entry) => {
     const boundary = extractBoundaryMetadata(entry.metadata);
     if (boundary?.layer !== "durable") return false;
