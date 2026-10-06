@@ -13,6 +13,11 @@ export function classifyCheckpointQuality(record: SessionCheckpointRecord): Chec
   return isFallback && !hasContent ? "minimal" : "rich";
 }
 
+/** File name a checkpoint is saved under (updatedAt with ":" and "." made file-safe, then the id). */
+export function checkpointFileName(record: Pick<SessionCheckpointRecord, "updatedAt" | "checkpointId">): string {
+  return `${record.updatedAt.replace(/[:.]/g, "-")}-${record.checkpointId}.json`;
+}
+
 export interface SessionCheckpointQuery {
   sessionId?: string;
   scope?: string;
@@ -74,8 +79,7 @@ export class SessionCheckpointStore {
 
   async save(record: SessionCheckpointRecord): Promise<SessionCheckpointRecord> {
     const parsed = SessionCheckpointRecordSchema.parse(record);
-    const timestampToken = parsed.updatedAt.replace(/[:.]/g, "-");
-    const path = join(this.dataDir, `${timestampToken}-${parsed.checkpointId}.json`);
+    const path = join(this.dataDir, checkpointFileName(parsed));
     try {
       const suffix = `-${parsed.checkpointId}.json`;
       for (const name of readdirSync(this.dataDir).filter((item) => item.endsWith(suffix))) {

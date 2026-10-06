@@ -1,4 +1,5 @@
 import { listPinAssets, type PinAsset } from "./memory-assets.js";
+import { CHECKPOINT_MIRROR_SCOPE } from "./memory-boundaries.js";
 import * as envConfig from "./env-config.js";
 import { buildStableContextSections } from "./context-composer-stable.js";
 import {
@@ -59,6 +60,9 @@ async function retrieveCandidates(
   },
 ): Promise<RetrievalResult[]> {
   const { category, query, limit, scope } = params;
+  // Checkpoint mirror rows are for search_memory; resume_context already reads this session's own
+  // checkpoint from the checkpoint store, and its stable / task sections stay as they were.
+  const excludeScopes = [CHECKPOINT_MIRROR_SCOPE];
 
   if (!scope) {
     return retriever.retrieve({
@@ -66,6 +70,7 @@ async function retrieveCandidates(
       limit,
       ...(category ? { category } : {}),
       source: "auto-recall",
+      excludeScopes,
     });
   }
 
@@ -76,12 +81,14 @@ async function retrieveCandidates(
       ...(category ? { category } : {}),
       scopeFilter: [scope],
       source: "auto-recall",
+      excludeScopes,
     }),
     retriever.retrieve({
       query,
       limit: Math.min(10, limit * 2),
       ...(category ? { category } : {}),
       source: "auto-recall",
+      excludeScopes,
     }),
   ]);
 

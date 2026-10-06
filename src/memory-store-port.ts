@@ -71,5 +71,6 @@ export interface MemoryStorePort {
     minScore?: number,
     scopeFilter?: string[],
     scopeMatch?: ScopeMatchMode,
+    excludeScopes?: string[],
   ): Promise<MemorySearchResult[]>;
 }

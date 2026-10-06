@@ -11,6 +11,7 @@ import { DurableMemoryCategorySchema } from "./memory-schema.js";
 import { persistCaseMemory, persistMemory, persistMemoryBatch, persistWorkflowPattern, promoteMemory } from "./capture-engine.js";
 import { buildSessionCheckpointResult } from "./session-engine.js";
 import { SessionCheckpointStore } from "./session-store.js";
+import { mirrorCheckpointWithDeadline } from "./checkpoint-mirror.js";
 import { composeResumeContext } from "./context-composer.js";
 import { extractMemoryProvenance } from "./memory-boundaries.js";
 import { ConflictStatusSchema } from "./conflict-schema.js";
@@ -454,6 +455,11 @@ async function handleCheckpoint(request: Request): Promise<Response> {
       ...result,
       record: stored,
     }));
+    // Mirror into the memory table so search can find it; never throws, capped wait.
+    await mirrorCheckpointWithDeadline(() => {
+      const { store, embedder } = getComponents();
+      return { store, embedder };
+    }, stored);
     return jsonResponse(stored, 201);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
