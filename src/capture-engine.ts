@@ -935,6 +935,23 @@ async function writeTriggersForEntry(
   }
 }
 
+/**
+ * Longest text the implicit preference dual-write will copy, in UTF-16 code
+ * units (`String.length`) of the schema-normalized text — a rough cap, not a
+ * precise character count.
+ * The 13 derived rows found in the production table on 2026-10-10 were all
+ * 446–1,653 characters of narrative; the statements the feature is for
+ * ("I use Figma for design") are a single short sentence.
+ */
+export const IMPLICIT_PREFERENCE_MAX_TEXT_CHARS = 120;
+
+/** Whether a just-stored memory should also get a derived preferences copy. */
+export function shouldDeriveImplicitPreference(category: string, text: string): boolean {
+  if (category === "preferences") return false;
+  if (text.length > IMPLICIT_PREFERENCE_MAX_TEXT_CHARS) return false;
+  return inferImplicitUsageSlot(text) !== null;
+}
+
 export async function persistMemory(
   deps: PersistMemoryDeps,
   rawInput: unknown,
@@ -1328,22 +1345,32 @@ export async function persistMemory(
       .catch(() => {}); // Must never block
   }
 
-  // LME-1: Implicit preference dual-write — when a non-preference memory
-  // contains an implicit usage signal ("I use X", "I have X", etc.),
+  // LME-1: Implicit preference dual-write — when a short non-preference memory
+  // is itself an implicit usage statement ("I use X", "I have X", etc.),
   // store an additional preferences copy so it can be recalled via the
   // low-threshold preference retrieval path (hardMinScore 0.25 vs 0.35).
+  // Only short texts qualify: a long narrative that happens to contain one
+  // "我用 X 做了…" clause is not a usage statement, and copying it whole into
+  // preferences only duplicates the source row (see shouldDeriveImplicitPreference).
   // Async & non-blocking: the primary write is already done.
+  // Not on "conflict" either: the incoming text was parked in the conflict
+  // store, nothing was written, and `entry` is the existing row it collided with.
   if (
     disposition !== "deduped" &&
-    input.category !== "preferences" &&
-    inferImplicitUsageSlot(input.text)
+    disposition !== "conflict" &&
+    shouldDeriveImplicitPreference(input.category, input.text)
   ) {
     const prefCanonicalKey = buildDefaultCanonicalKey({ category: "preferences", text: input.text });
     const prefSlot = inferImplicitUsageSlot(input.text);
     const prefMetadata = buildStructuredMetadata({
       source: input.source,
-      tags: [...(input.tags ?? []), "derived-preference", `derived-from:${entry.id}`],
-      capture: "implicit_preference_dual_write_v1",
+      // The source row's own tags stay on the source row. `pinned` would exempt
+      // the copy from decay and business tags would make it count as a second
+      // record of whatever the source row records.
+      tags: ["derived-preference", `derived-from:${entry.id}`],
+      // v2 (2026-10-10): length cap, no inherited tags. v1 rows copied any length
+      // and carried every tag of the source row.
+      capture: "implicit_preference_dual_write_v2",
       category: "preferences",
       canonicalKey: prefCanonicalKey,
       extra: prefSlot ? { preferenceSlot: prefSlot } : undefined,
