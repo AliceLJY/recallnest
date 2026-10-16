@@ -63,13 +63,16 @@
     "node": ">=22"
   },
   "overrides": {
-    "fast-uri": "^3.1.6",
-    "qs": "^6.16.0"
+    "fast-uri": "^3.1.8",
+    "qs": "^6.16.0",
+    "hono": "^4.13.7",
+    "ip-address": "^10.7.1",
+    "proxy-addr": "^2.0.8"
   },
   "dependencies": {
     "@hono/node-server": "1.19.17",
     "@lancedb/lancedb": "^0.26.0",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "commander": "^12.0.0",
     "openai": "^7.5.0",
     "tsx": "^4.19.0",
