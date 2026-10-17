@@ -21,6 +21,7 @@ import { createRetriever } from "../retriever.js";
 import type { SessionCheckpointRecord } from "../session-schema.js";
 import { FALLBACK_SUMMARY } from "../session-engine.js";
 import { SessionCheckpointStore } from "../session-store.js";
+import { acquireLock, lockPathForKey, releaseLock } from "../distill-lock.js";
 import { MemoryStore } from "../store.js";
 
 /**
@@ -609,4 +610,31 @@ describe("after the third review round (R3)", () => {
     expect(result.statuses).toEqual({ unchanged: 1, "would-embed": 1 });
     expect(await versions()).toEqual(before);
   });
+});
+
+describe("nested lock waits (PR #27 re-review)", () => {
+  // The mirror lock's critical section takes store-write. While a writer holds the mirror lock and
+  // waits on a busy store-write, the next mirror waits on the mirror lock: with the old 10 s default
+  // it timed out ("failed") and its searchable row was never written.
+  it("a second mirror waiting behind one that is stuck on store-write for 12 s still lands its row", async () => {
+    const h = harness();
+    const storeWrite = { lockPath: lockPathForKey("store-write") };
+    expect(acquireLock(storeWrite)).toBe(true);
+    let released = false;
+    const release = setTimeout(() => { releaseLock(storeWrite); released = true; }, 12_000);
+    try {
+      const first = mirrorCheckpoint(h.deps, record({ sessionId: "nested-a", checkpointId: "chk-a" }));
+      await new Promise((r) => setTimeout(r, 300)); // first is now inside the mirror lock, waiting on store-write
+      const second = mirrorCheckpoint(h.deps, record({ sessionId: "nested-b", checkpointId: "chk-b" }));
+      const [a, b] = await Promise.all([first, second]);
+      expect(released).toBe(true);
+      expect(a.status).toBe("stored");
+      expect(b.status).toBe("stored");
+      const ids = (await h.rows()).map((row) => row.id).sort();
+      expect(ids).toEqual([checkpointMirrorId("nested-a"), checkpointMirrorId("nested-b")].sort());
+    } finally {
+      clearTimeout(release);
+      if (!released) releaseLock(storeWrite);
+    }
+  }, 60_000);
 });
