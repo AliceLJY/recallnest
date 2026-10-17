@@ -16,6 +16,37 @@
 
 ## Unreleased
 
+## v4.0.0 — Locks the kernel enforces, and deletions that stay deleted (2026-10-18)
+
+Three things make this a major release: RecallNest now runs on Bun only, its cross-process
+locks are now held by the kernel instead of guessed from lock files, and several defaults
+and HTTP replies changed. Most of the rest are fixes for data that could silently go wrong
+under concurrency — a deleted memory written back, an orphan history row, two writers
+holding the same lock — found by a read-only audit of the repository and fixed one pull
+request at a time.
+
+### Upgrading from v3
+
+1. **Install Bun.** RecallNest no longer runs on Node.js. The npm launcher still starts
+   under Node (`engines.node >= 22`) and hands off to `bun`; without Bun it exits with
+   install instructions.
+2. **Stop every RecallNest process before starting v4** — the MCP server in every client,
+   the HTTP API, the gateway, and any scheduled jobs (ingest, dream, reconcile). Old
+   processes do not honour the new `flock` locks and can still delete lock files by the old
+   rules, so old and new versions must not run at the same time.
+3. **HTTP `POST /v1/store`:** only `stored` / `updated` / `promoted` answer `201` with
+   `stored: true`; `deduped`, `conflict` and `rejected` now answer `200` with
+   `stored: false` (`rejected` adds `rejectionReason`). Clients that only check for 2xx are
+   unaffected.
+4. **`ingest` no longer indexes conversation transcripts by default.** Set
+   `RECALLNEST_TRANSCRIPT_INGEST=on` to keep the v3 behaviour.
+5. **`search_memory` returns each hit's full text by default.**
+   `RECALLNEST_SEARCH_FIRST_SCREEN=legacy` restores the v3 table byte for byte.
+6. **Writes can wait up to 30 s for the store lock** (was 10 s); the HTTP servers keep idle
+   connections for 75 s. Clients with a shorter request timeout should raise it.
+
+Existing LanceDB data opens in place; there is no export or import step.
+
 ### Changed
 
 - **Cross-process locks now use kernel `flock(2)` instead of lock files reclaimed when they look stale; RecallNest is now Bun-only (#27).** The old `acquireLock` read a lock file's pid and mtime, decided it was reclaimable, then unlinked and re-created it — two processes that both saw the same stale file could both end up holding it (8 child processes racing for a lock left by a dead holder: more than one winner in 15–30 of 40 rounds), and a waiter's own `expireMs` decided when a live holder's lock counted as expired (a 30-minute repair holding `store-write` lost it after 30 s). Now each lock is an fd held for the lock's lifetime under `flock(LOCK_EX|LOCK_NB)` via `bun:ffi` (libc on Linux, libSystem on macOS); the kernel releases it when the process exits or is killed, so there is no staleness reclaim, pid check or heartbeat. After acquiring, the code checks the path still names the locked inode; release unlinks while holding, then unlocks and closes. A holder past its `maxHoldMs` (old name `expireMs` still accepted) logs loudly and gets an `AbortSignal`, but the lock is not taken away from it; waiters' timeout errors name the holder pid and how long it has held.

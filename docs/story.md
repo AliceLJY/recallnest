@@ -1,6 +1,6 @@
 # RecallNest：一份记忆，所有终端共用
 
-> 状态：v3.0.1（2026 年 9 月 6 日），持续维护中；跑在我自己的 Mac mini 上，Claude Code、Codex、Kimi、Antigravity、豆包桌面版和手机都连着它。开源，MIT 协议。
+> 状态：v4.0.0（2026 年 10 月 18 日），持续维护中；跑在我自己的 Mac mini 上，Claude Code、Codex、Kimi、Antigravity、豆包桌面版和手机都连着它。开源，MIT 协议。
 > 入口：[GitHub 仓库](https://github.com/AliceLJY/recallnest) · [中文说明](https://github.com/AliceLJY/recallnest/blob/main/README_CN.md)
 
 ## 它解决什么
