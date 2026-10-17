@@ -10,7 +10,7 @@
 
 [![GitHub](https://img.shields.io/github/stars/AliceLJY/recallnest?style=social)](https://github.com/AliceLJY/recallnest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Runtime](https://img.shields.io/badge/Runtime-Bun_|_Node.js_22+-f9f1e1?logo=bun)](https://bun.sh)
+[![Runtime](https://img.shields.io/badge/Runtime-Bun-f9f1e1?logo=bun)](https://bun.sh)
 [![LanceDB](https://img.shields.io/badge/LanceDB-Vector+FTS-orange)](https://lancedb.com)
 [![MCP](https://img.shields.io/badge/MCP-44_tools-blue)](https://modelcontextprotocol.io)
 [![CI](https://github.com/AliceLJY/recallnest/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLJY/recallnest/actions/workflows/ci.yml)
@@ -229,7 +229,7 @@ npm install -g recallnest      # 全局安装
 recallnest doctor
 ```
 
-支持 Node.js 22+（通过 tsx）或 Bun，无需 clone 仓库。
+需要 [Bun](https://bun.sh)：RecallNest 不能在 Node.js 上运行。npm 装的启动脚本只负责转交给 Bun，找不到 `bun` 时会给出安装方法后退出。无需 clone 仓库。
 
 ### 方式 C：手动安装
 

@@ -44,6 +44,7 @@ import { homedir } from "node:os";
 import { join, isAbsolute } from "node:path";
 import { execFile } from "node:child_process";
 import * as envConfig from "./env-config.js";
+import { HTTP_WRITE_IDLE_TIMEOUT_S } from "./store-write-budget.js";
 
 const HOME = homedir();
 const PORT = clampInt(envConfig.gatewayPortRaw(), 8791, 1, 65535);
@@ -195,6 +196,9 @@ function fileSearch(query: string, scope: string, limit: number): Promise<FileHi
 // ── server ───────────────────────────────────────────────────────────────────
 const server = Bun.serve({
   port: PORT,
+  // Writes can wait up to 30 s for store-write before they start; Bun's 10 s default would drop
+  // the connection while the handler still commits.
+  idleTimeout: HTTP_WRITE_IDLE_TIMEOUT_S,
   hostname: HOST,
   async fetch(request) {
     const id = randomUUID().slice(0, 8);

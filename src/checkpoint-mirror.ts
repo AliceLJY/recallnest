@@ -38,6 +38,7 @@ import type { SessionCheckpointRecord } from "./session-schema.js";
 import { checkpointFileName, classifyCheckpointQuality } from "./session-store.js";
 import { logWarn } from "./stderr-log.js";
 import { deterministicId, escapeSqlLiteral, loadLanceDB, STORE_WRITE_LOCK_OPTS, type MemoryEntry, type MemoryStore } from "./store.js";
+import { STORE_WRITE_NESTED_WAIT_MS } from "./store-write-budget.js";
 
 export { CHECKPOINT_MIRROR_SCOPE };
 const MIRROR_CATEGORY = "events" as const;
@@ -238,7 +239,13 @@ export async function mirrorCheckpoint(
       if (!written) return { status: "skipped-stale", id };
       const status: CheckpointMirrorStatus = !current ? "stored" : current.text === text ? "refreshed" : "replaced";
       return { status, id };
-    }, { expireMs: 60_000, ...(deps.lockDir ? { lockDir: deps.lockDir } : {}) });
+    }, {
+      expireMs: 60_000,
+      // The section below takes store-write (upsertUnlessNewer): wait long enough for a holder that
+      // is itself waiting on store-write, or the next mirror times out and its row is dropped.
+      waitTimeoutMs: STORE_WRITE_NESTED_WAIT_MS,
+      ...(deps.lockDir ? { lockDir: deps.lockDir } : {}),
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logWarn(`[checkpoint-mirror] session=${record.sessionId} failed: ${message}`);
@@ -406,5 +413,5 @@ export async function purgeCheckpointMirror(
       });
     }
     return { rowsBefore, rowsAfter: await table.countRows(exact) };
-  }, { expireMs: 60_000, waitTimeoutMs: 120_000, ...(options.lockDir ? { lockDir: options.lockDir } : {}) });
+  }, { expireMs: 60_000, waitTimeoutMs: 2 * STORE_WRITE_NESTED_WAIT_MS, ...(options.lockDir ? { lockDir: options.lockDir } : {}) });
 }

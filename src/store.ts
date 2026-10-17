@@ -12,6 +12,7 @@ import type { DurableMemoryCategory } from "./memory-schema.js";
 import { matchesScopeFilter, type ScopeMatchMode } from "./scope-policy.js";
 import { detectEmotionIfEnabled } from "./emotion-detector.js";
 import { withWriteLock } from "./distill-lock.js";
+import { STORE_WRITE_LOCK_OPTS, STORE_WRITE_LONG_LOCK_OPTS } from "./store-write-budget.js";
 import { incrementWriteCount } from "./activity-counter.js";
 import type { MemoryStorePort, MemoryStoreStats, MemoryStoreUpdate } from "./memory-store-port.js";
 import { clearVersionGroupMetadata, planSingletonVersionGroupRepairs } from "./version-manager.js";
@@ -103,21 +104,9 @@ export interface LegacyScopeAudit {
 // store-write lock options
 // ============================================================================
 
-/**
- * Options for every `store-write` critical section (this file, checkpoint-mirror.ts). The lock is a
- * kernel flock (distill-lock.ts): nobody can take it from a live holder, it is freed the moment the
- * holder exits or is killed. `maxHoldMs` only raises the stuck-holder warning. Waiters wait at least
- * as long as a normal hold may last: with a shorter budget (the old 10 s default against 30 s holds)
- * a waiter throws while a healthy holder is still inside its own window.
- */
-export const STORE_WRITE_LOCK_OPTS = { maxHoldMs: 30_000, waitTimeoutMs: 30_000 } as const;
-
-/**
- * For the singleton version-group pass, which scans the whole table under the lock: same wait
- * budget, but it may legitimately hold for longer, so it only counts as stuck after 30 minutes —
- * at which point it stops at the next batch boundary (see repairSingletonVersionGroups).
- */
-export const STORE_WRITE_LONG_LOCK_OPTS = { maxHoldMs: 30 * 60_000, waitTimeoutMs: 30_000 } as const;
+// The store-write lock options live in store-write-budget.ts (the HTTP servers size their timeouts
+// from them too); re-exported here for existing callers.
+export { STORE_WRITE_LOCK_OPTS, STORE_WRITE_LONG_LOCK_OPTS };
 
 // ============================================================================
 // Deterministic ID
