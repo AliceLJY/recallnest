@@ -10,6 +10,7 @@ import { createComponentResolver, loadConfig, loadDotEnv } from "./runtime-confi
 import { DurableMemoryCategorySchema } from "./memory-schema.js";
 import { persistCaseMemory, persistMemory, persistMemoryBatch, persistWorkflowPattern, promoteMemory } from "./capture-engine.js";
 import { buildSessionCheckpointResult } from "./session-engine.js";
+import { buildStoreHttpResponse } from "./store-receipts.js";
 import { SessionCheckpointStore } from "./session-store.js";
 import { mirrorCheckpointWithDeadline } from "./checkpoint-mirror.js";
 import { composeResumeContext } from "./context-composer.js";
@@ -243,17 +244,8 @@ async function handleStore(request: Request): Promise<Response> {
   try {
     const { store, embedder } = getComponents();
     const stored = await persistMemory({ store, embedder, conflictStore, auditLogger }, body);
-
-    return jsonResponse({
-      id: stored.id,
-      stored: stored.disposition !== "conflict",
-      disposition: stored.disposition,
-      storedAt: stored.storedAt,
-      category: stored.category,
-      scope: stored.resolvedScope,
-      canonicalKey: stored.canonicalKey,
-      conflictId: stored.conflictId,
-    }, 201);
+    const response = buildStoreHttpResponse(stored);
+    return jsonResponse(response.body, response.status);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return errorResponse(400, message);
