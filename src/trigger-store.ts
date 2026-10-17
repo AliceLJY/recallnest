@@ -21,6 +21,7 @@ import { matchesScopeFilter, type ScopeMatchMode } from "./scope-policy.js";
 import { readConsistencyInterval as envReadConsistencyInterval } from "./env-config.js";
 import { logWarn } from "./stderr-log.js";
 import { textOverlapScore, tokenize } from "./multi-vector.js";
+import { redactSecrets } from "./pii-detector.js";
 
 export const TRIGGER_TABLE_NAME = "memory_triggers";
 
@@ -76,14 +77,18 @@ export interface TriggerStoreStats {
   memories: number;
 }
 
-/** 规整 trigger 文本：去空白、去重（不分大小写）、丢太短太长的、封顶 6 条。 */
+/**
+ * 规整 trigger 文本：脱敏、去空白、去重（不分大小写）、丢太短太长的、封顶 6 条。
+ * 脱敏放在这里（2026-10-17）：trigger 原文会进 metadata.triggers、侧表和外部嵌入接口，
+ * 写入、回填、侧表重建都经过这一个函数。
+ */
 export function normalizeTriggerTexts(texts: readonly string[] | undefined | null): string[] {
   if (!texts || texts.length === 0) return [];
   const seen = new Set<string>();
   const out: string[] = [];
   for (const raw of texts) {
     if (typeof raw !== "string") continue;
-    const text = raw.replace(/\s+/g, " ").trim().replace(/[。．.！!？?；;，,、]+$/u, "").trim();
+    const text = redactSecrets(raw).text.replace(/\s+/g, " ").trim().replace(/[。．.！!？?；;，,、]+$/u, "").trim();
     if (text.length < MIN_TRIGGER_LENGTH || text.length > MAX_TRIGGER_LENGTH) continue;
     const key = text.toLowerCase();
     if (seen.has(key)) continue;
