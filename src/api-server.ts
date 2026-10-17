@@ -7,6 +7,7 @@
  */
 
 import { createComponentResolver, loadConfig, loadDotEnv } from "./runtime-config.js";
+import { HTTP_WRITE_IDLE_TIMEOUT_S } from "./store-write-budget.js";
 import { DurableMemoryCategorySchema } from "./memory-schema.js";
 import { persistCaseMemory, persistMemory, persistMemoryBatch, persistWorkflowPattern, promoteMemory } from "./capture-engine.js";
 import { buildSessionCheckpointResult } from "./session-engine.js";
@@ -665,6 +666,9 @@ if (import.meta.main) {
 
   const server = Bun.serve({
     port,
+    // Writes can wait up to 30 s for store-write before they start; Bun's 10 s default would drop
+    // the connection while the handler still commits.
+    idleTimeout: HTTP_WRITE_IDLE_TIMEOUT_S,
     hostname: LOCAL_HTTP_HOSTNAME,
     async fetch(request) {
       const policy = await enforceLocalHttpRequestPolicy(request);

@@ -104,6 +104,7 @@ const ACTIVITY_LOCK_KEY = "activity-stats";
 const ACTIVITY_LOCK_OPTS = { onBusy: "wait" as const, waitTimeoutMs: 2_000, expireMs: 30_000 };
 
 async function withStatsLock<T>(fn: () => T): Promise<T> {
+  // lock-wait: no store-write inside — fn only reads and rewrites the activity stats file.
   const outcome = await withLock(ACTIVITY_LOCK_KEY, async () => fn(), ACTIVITY_LOCK_OPTS);
   // onBusy:"wait" resolves ran:true or throws on timeout; ran:false unreachable.
   if (!outcome.ran) throw new Error("activity-stats lock unavailable");
