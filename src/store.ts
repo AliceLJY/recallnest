@@ -100,6 +100,27 @@ export interface LegacyScopeAudit {
 }
 
 // ============================================================================
+// store-write lock options
+// ============================================================================
+
+/**
+ * Options for every `store-write` critical section in this file. The expiry is written into the
+ * lock file, so other processes reclaim the lock only once its holder has gone this long without
+ * finishing (or, with a heartbeat, without refreshing). Waiters wait as long as that expiry: with
+ * a shorter budget (the old 10 s default against a 30 s expiry) a waiter throws while a live
+ * holder is still inside its own window, and can never get as far as reclaiming a stalled one.
+ */
+export const STORE_WRITE_LOCK_OPTS = { expireMs: 30_000, waitTimeoutMs: 30_000 } as const;
+
+/**
+ * For a critical section that can outlast the expiry (the singleton version-group pass scans the
+ * whole table): keep the same 30 s expiry and refresh the lock file while it runs. Previously it
+ * passed a 30-minute expiry, which only its own waiting honoured — every other writer judged it
+ * by 30 s and reclaimed it while it was still writing.
+ */
+export const STORE_WRITE_LONG_LOCK_OPTS = { ...STORE_WRITE_LOCK_OPTS, heartbeatMs: 5_000 } as const;
+
+// ============================================================================
 // Deterministic ID
 // ============================================================================
 
@@ -493,7 +514,7 @@ export class MemoryStore implements MemoryStorePort {
         // window a crash could tear). toWrite is already in-batch deduped by id above,
         // so the merge key matches ≤1 existing row (given no pre-existing dup-id rows).
         await this.table!.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute(toWrite);
-      }, { expireMs: 30_000 });
+      }, STORE_WRITE_LOCK_OPTS);
     } catch (err: any) {
       const code = err.code || "";
       const message = err.message || String(err);
@@ -560,7 +581,7 @@ export class MemoryStore implements MemoryStorePort {
           inserted: fresh.map((e) => e.id),
           skippedExisting: candidates.filter((e) => existingIds.has(e.id)).map((e) => e.id),
         };
-      }, { expireMs: 30_000 });
+      }, STORE_WRITE_LOCK_OPTS);
     } catch (err: any) {
       const code = err.code || "";
       const message = err.message || String(err);
@@ -603,7 +624,7 @@ export class MemoryStore implements MemoryStorePort {
     await this.ensureInitialized();
     await withWriteLock("store-write", async () => {
       await this.table!.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute([entry]);
-    }, { expireMs: 30_000 });
+    }, STORE_WRITE_LOCK_OPTS);
     // Per-scope write count drives dream activation. Best-effort — never block a write.
     try {
       await incrementWriteCount(entry.scope, 1, { statsPath: this.activityStatsPath() });
@@ -633,7 +654,7 @@ export class MemoryStore implements MemoryStorePort {
         .whenMatchedUpdateAll({ where: "target.timestamp <= source.timestamp" })
         .whenNotMatchedInsertAll()
         .execute([full]),
-    { expireMs: 30_000 });
+    STORE_WRITE_LOCK_OPTS);
     const written = (result?.numInsertedRows ?? 0) + (result?.numUpdatedRows ?? 0) > 0;
     if (written) {
       try {
@@ -1219,7 +1240,7 @@ export class MemoryStore implements MemoryStorePort {
       // 只更新已存在的行：锁内读完之后被不拿锁的 delete() 删掉的行不插回来
       const res = await this.table!.mergeInsert("id").whenMatchedUpdateAll().execute([updated]);
       return res.numUpdatedRows > 0 ? updated : null;
-    }, { expireMs: 30_000 });
+    }, STORE_WRITE_LOCK_OPTS);
   }
 
   /**
@@ -1289,7 +1310,7 @@ export class MemoryStore implements MemoryStorePort {
         return { status: "missing" };
       }
       return { status: "replaced", entry: updated, history };
-    }, { expireMs: 30_000 });
+    }, STORE_WRITE_LOCK_OPTS);
 
     if (result.status === "replaced") {
       // 与 upsert() 一致：历史行算一次写入，驱动 dream 激活。尽力而为，不阻塞写入。
@@ -1398,7 +1419,7 @@ export class MemoryStore implements MemoryStorePort {
       // 不能把它插回来（2026-09-24 上线前代码单审）
       const res = await this.table!.mergeInsert("id").whenMatchedUpdateAll().execute([updated]);
       return res.numUpdatedRows > 0 ? updated : null;
-    }, { expireMs: 30_000 });
+    }, STORE_WRITE_LOCK_OPTS);
 
     const prev = this.metadataPatchQueues.get(fullId) ?? Promise.resolve();
     // Isolate prior failures so one rejected patch can't wedge the queue.
@@ -1505,7 +1526,7 @@ export class MemoryStore implements MemoryStorePort {
         // 只更新已存在的行：锁内读完之后被不拿锁的 delete() 删掉的行不插回来，返回实际更新数（2026-09-24 上线前代码单审）
         const res = await this.table!.mergeInsert("id").whenMatchedUpdateAll().execute(toWrite);
         return res.numUpdatedRows;
-      }, { expireMs: 30_000 });
+      }, STORE_WRITE_LOCK_OPTS);
     }
     return written;
   }
@@ -1583,7 +1604,7 @@ export class MemoryStore implements MemoryStorePort {
         repaired += result.numUpdatedRows;
       }
       return repaired;
-    }, { expireMs: 30 * 60_000 });
+    }, STORE_WRITE_LONG_LOCK_OPTS);
   }
 
   async bulkDelete(scopeFilter: string[], beforeTimestamp?: number): Promise<number> {

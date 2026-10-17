@@ -1,5 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
-import { existsSync, writeFileSync, readFileSync, mkdirSync, statSync, utimesSync } from "node:fs";
+import { existsSync, writeFileSync, readFileSync, mkdirSync, statSync, utimesSync, readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -13,6 +14,7 @@ import {
   withWriteLock,
   lockPathForKey,
   stampLock,
+  refreshLock,
   type DistillLockConfig,
 } from "../distill-lock.js";
 
@@ -301,5 +303,135 @@ describe("lock ownership token (release safety)", () => {
     expect(acquireLock({ lockPath: p, expireMs: 60_000 })).toBe(true);
     releaseLock({ lockPath: p });
     expect(existsSync(p)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2026-10-17: holder-declared expiry, heartbeat, compare-and-delete reclaim
+// (multi-process races live in distill-lock-multiprocess.test.ts)
+// ---------------------------------------------------------------------------
+
+describe("holder-declared expiry", () => {
+  it("writes its own expireMs as the third field of the lock body", () => {
+    expect(acquireLock(cfg({ expireMs: 45_000 }))).toBe(true);
+    const [pid, token, ttl] = readFileSync(lockPath, "utf-8").split(":");
+    expect(pid).toBe(String(process.pid));
+    expect(token!.length).toBeGreaterThan(0);
+    expect(ttl).toBe("45000");
+  });
+
+  it("judges a live holder by the expiry in its file, not the waiter's", () => {
+    writeFileSync(lockPath, `${process.pid}:long-holder:1800000`, "utf-8");
+    const past = new Date(Date.now() - 31_000);
+    utimesSync(lockPath, past, past);
+    expect(acquireLock(cfg({ expireMs: 30_000 }))).toBe(false);
+    expect(readFileSync(lockPath, "utf-8")).toBe(`${process.pid}:long-holder:1800000`);
+  });
+
+  it("still reclaims once the holder's own expiry has passed", () => {
+    writeFileSync(lockPath, `${process.pid}:short-holder:5000`, "utf-8");
+    const past = new Date(Date.now() - 6_000);
+    utimesSync(lockPath, past, past);
+    expect(acquireLock(cfg({ expireMs: 3_600_000 }))).toBe(true);
+  });
+
+  it("falls back to the waiter's expireMs for a legacy body without the field", () => {
+    writeFileSync(lockPath, `${process.pid}:legacy-token`, "utf-8");
+    const past = new Date(Date.now() - 31_000);
+    utimesSync(lockPath, past, past);
+    expect(acquireLock(cfg({ expireMs: 30_000 }))).toBe(true);
+  });
+});
+
+describe("withLock heartbeat", () => {
+  it("keeps a holder that outlives its expiry from being reclaimed while fn runs", async () => {
+    const p = lockPathForKey("hb-keep", tempDir);
+    let midRunAcquired: boolean | null = null;
+    const out = await withLock("hb-keep", async () => {
+      await new Promise((r) => setTimeout(r, 700));
+      // Same pid ⇒ "alive"; only the mtime decides. 700 ms > 300 ms expiry, but heartbeats refreshed it.
+      midRunAcquired = acquireLock({ lockPath: p, expireMs: 300 });
+      return "ok";
+    }, { lockDir: tempDir, expireMs: 300, heartbeatMs: 50 });
+    expect(out.ran).toBe(true);
+    expect(midRunAcquired).toBe(false);
+    expect(existsSync(p)).toBe(false);
+  });
+
+  it("without a heartbeat the same holder is reclaimable (calibrates the test above)", async () => {
+    const p = lockPathForKey("hb-none", tempDir);
+    let midRunAcquired: boolean | null = null;
+    await withLock("hb-none", async () => {
+      await new Promise((r) => setTimeout(r, 700));
+      midRunAcquired = acquireLock({ lockPath: p, expireMs: 300 });
+    }, { lockDir: tempDir, expireMs: 300 });
+    expect(midRunAcquired).toBe(true);
+  });
+
+  it("refreshLock never touches a lock that another owner has reclaimed", () => {
+    const p = lockPathForKey("hb-reclaimed", tempDir);
+    expect(acquireLock({ lockPath: p, expireMs: 60_000 })).toBe(true);
+    writeFileSync(p, "99999:other-owner:60000", "utf-8");
+    const past = new Date(Date.now() - 50_000);
+    utimesSync(p, past, past);
+    expect(refreshLock({ lockPath: p })).toBe(false);
+    expect(Math.abs(statSync(p).mtimeMs - past.getTime())).toBeLessThan(1000);
+    releaseLock({ lockPath: p });
+    expect(readFileSync(p, "utf-8")).toBe("99999:other-owner:60000");
+  });
+});
+
+describe("reclaim through the compare-and-delete marker", () => {
+  const markerFor = (path: string, content: string) =>
+    `${path}.cas-${createHash("sha256").update(content).digest("hex").slice(0, 16)}`;
+
+  it("concedes while a live process holds the marker for the stale content", () => {
+    const stale = "999999:dead-holder";
+    writeFileSync(lockPath, stale, "utf-8");
+    writeFileSync(markerFor(lockPath, stale), `${process.pid}:busy-reclaimer`, "utf-8");
+    expect(acquireLock(cfg())).toBe(false);
+    expect(readFileSync(lockPath, "utf-8")).toBe(stale);
+  });
+
+  it("breaks a marker left by a reclaimer that died mid-way, then reclaims", () => {
+    const stale = "999999:dead-holder";
+    const marker = markerFor(lockPath, stale);
+    writeFileSync(lockPath, stale, "utf-8");
+    writeFileSync(marker, "999998:dead-reclaimer", "utf-8");
+    expect(acquireLock(cfg())).toBe(true);
+    expect(readFileSync(lockPath, "utf-8").startsWith(`${process.pid}:`)).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("release defers to a live reclaimer that holds the marker for our body", () => {
+    // The reclaimer is already removing exactly our body and will create its own lock next.
+    // A plain read-then-unlink release could instead remove the lock it creates in that gap.
+    expect(acquireLock(cfg())).toBe(true);
+    const body = readFileSync(lockPath, "utf-8");
+    const marker = markerFor(lockPath, body);
+    writeFileSync(marker, `${process.pid}:busy-reclaimer`, "utf-8");
+    releaseLock(cfg());
+    expect(readFileSync(lockPath, "utf-8")).toBe(body);
+    expect(readFileSync(marker, "utf-8")).toBe(`${process.pid}:busy-reclaimer`);
+  });
+
+  it("never reclaims a just-created lock whose body is not written yet (older writer mid-create)", () => {
+    writeFileSync(lockPath, "", "utf-8"); // O_EXCL open done, body not yet written
+    expect(acquireLock(cfg())).toBe(false);
+    expect(readFileSync(lockPath, "utf-8")).toBe("");
+  });
+
+  it("reclaims an unparsable lock file once it is past the grace period", () => {
+    writeFileSync(lockPath, "", "utf-8");
+    const past = new Date(Date.now() - 6_000);
+    utimesSync(lockPath, past, past);
+    expect(acquireLock(cfg())).toBe(true);
+  });
+
+  it("leaves no marker or temp files behind after a reclaim and a release", () => {
+    writeFileSync(lockPath, "999999:dead-holder", "utf-8");
+    expect(acquireLock(cfg())).toBe(true);
+    releaseLock(cfg());
+    expect(readdirSync(tempDir)).toEqual([]);
   });
 });
