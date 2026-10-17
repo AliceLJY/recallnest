@@ -11,7 +11,8 @@
  * 只读约定：
  * - 读侧表与主表只用 query()，侧表不存在就返回空，绝不建表（TriggerStore.ensureInitialized 会建表，这里不用它）；
  * - 检索一律 source:"auto-recall"——retriever 里三处强化写入（频次台账、evolution 访问计数、AccessTracker）
- *   都以 source !== "auto-recall" 为条件，跑多少遍都不改库；
+ *   都以 source !== "auto-recall" 为条件，跑多少遍都不改库；同时 trivialQueryGate:false，
+ *   和 search_memory 一样不过琐碎查询闸（那道闸只管自动召回）；
  * - 报告只含 id 与数字，不含 trigger 原文（原文是她的口语问法，不进仓库、不进报告）。
  * 审计日志不归这里管：调用方（eval/known-item.ts）负责把 retriever 的 audit logger 换成空实现。
  */
@@ -19,7 +20,7 @@
 import { loadLanceDB } from "./store.js";
 import { TRIGGER_TABLE_NAME } from "./trigger-store.js";
 import { isActiveMemory } from "./memory-evolution.js";
-import { shouldSkipRetrieval } from "./adaptive-retrieval.js";
+import { shouldSkipRetrievalFor } from "./adaptive-retrieval.js";
 import { matchesScopeFilter } from "./scope-policy.js";
 import type { RetrievalContext, RetrievalResult } from "./retriever.js";
 
@@ -89,7 +90,7 @@ export interface KnownItemResult {
   returned: number;
   /** 排在宿主前面、分数被截平在 1.0 的条数（宿主不在窗口里时数整个窗口） */
   saturatedAbove: number;
-  /** 检索入口 shouldSkipRetrieval 判成琐碎查询、整条跳过（这不是排序问题，单独计数） */
+  /** 检索入口整条跳过（这不是排序问题，单独计数）。琐碎查询闸只管自动召回，这里关着，只有空查询会计入 */
   gateSkipped: boolean;
   scopeMismatch: boolean;
 }
@@ -257,12 +258,15 @@ export async function runKnownItemEval(
   const limit = Math.max(1, Math.min(20, Math.floor(opts.limit ?? 20)));
   const out: KnownItemResult[] = [];
   for (const c of cases) {
-    const results = await retriever.retrieve({
+    // 量的是人主动搜的样子（search_memory 不过琐碎查询闸），source 标 auto-recall 只为不写库
+    const context: RetrievalContext = {
       query: c.query,
       limit,
       scopeFilter: [c.scope],
       source: "auto-recall",
-    });
+      trivialQueryGate: false,
+    };
+    const results = await retriever.retrieve(context);
     const ids = results.map((r) => r.entry.id);
     const idx = ids.indexOf(c.hostId);
     const above = idx >= 0 ? results.slice(0, idx) : results;
@@ -277,7 +281,7 @@ export async function runKnownItemEval(
       top1Score: results.length > 0 ? results[0].score : null,
       returned: results.length,
       saturatedAbove: above.filter((r) => r.score >= SATURATED_SCORE).length,
-      gateSkipped: shouldSkipRetrieval(c.query),
+      gateSkipped: shouldSkipRetrievalFor(context),
       scopeMismatch: c.scopeMismatch,
     });
     opts.onProgress?.(out.length, cases.length);
