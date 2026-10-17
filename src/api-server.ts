@@ -10,7 +10,12 @@ import { createComponentResolver, loadConfig, loadDotEnv } from "./runtime-confi
 import { DurableMemoryCategorySchema } from "./memory-schema.js";
 import { persistCaseMemory, persistMemory, persistMemoryBatch, persistWorkflowPattern, promoteMemory } from "./capture-engine.js";
 import { buildSessionCheckpointResult } from "./session-engine.js";
-import { buildStoreHttpResponse } from "./store-receipts.js";
+import {
+  buildCaptureHttpResponse,
+  buildPromoteHttpResponse,
+  buildStoreHttpResponse,
+  buildStructuredWriteHttpResponse,
+} from "./store-receipts.js";
 import { SessionCheckpointStore } from "./session-store.js";
 import { mirrorCheckpointWithDeadline } from "./checkpoint-mirror.js";
 import { composeResumeContext } from "./context-composer.js";
@@ -258,20 +263,8 @@ async function handleCapture(request: Request): Promise<Response> {
   try {
     const { store, embedder } = getComponents();
     const stored = await persistMemoryBatch({ store, embedder, conflictStore }, body);
-    return jsonResponse({
-      stored: stored.length,
-      memories: stored.map((memory) => ({
-        id: memory.id,
-        text: memory.text,
-        category: memory.category,
-        scope: memory.resolvedScope,
-        source: memory.source,
-        storedAt: memory.storedAt,
-        disposition: memory.disposition,
-        canonicalKey: memory.canonicalKey,
-        conflictId: memory.conflictId,
-      })),
-    }, 201);
+    const response = buildCaptureHttpResponse(stored);
+    return jsonResponse(response.body, response.status);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return errorResponse(400, message);
@@ -284,18 +277,8 @@ async function handlePattern(request: Request): Promise<Response> {
   try {
     const { store, embedder } = getComponents();
     const stored = await persistWorkflowPattern({ store, embedder, conflictStore, auditLogger }, body);
-    return jsonResponse({
-      id: stored.id,
-      stored: stored.disposition !== "conflict",
-      disposition: stored.disposition,
-      category: stored.category,
-      title: stored.title,
-      scope: stored.resolvedScope,
-      tags: stored.tags,
-      storedAt: stored.storedAt,
-      canonicalKey: stored.canonicalKey,
-      conflictId: stored.conflictId,
-    }, 201);
+    const response = buildStructuredWriteHttpResponse(stored);
+    return jsonResponse(response.body, response.status);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return errorResponse(400, message);
@@ -308,18 +291,8 @@ async function handleCase(request: Request): Promise<Response> {
   try {
     const { store, embedder } = getComponents();
     const stored = await persistCaseMemory({ store, embedder, conflictStore, auditLogger }, body);
-    return jsonResponse({
-      id: stored.id,
-      stored: stored.disposition !== "conflict",
-      disposition: stored.disposition,
-      category: stored.category,
-      title: stored.title,
-      scope: stored.resolvedScope,
-      tags: stored.tags,
-      storedAt: stored.storedAt,
-      canonicalKey: stored.canonicalKey,
-      conflictId: stored.conflictId,
-    }, 201);
+    const response = buildStructuredWriteHttpResponse(stored);
+    return jsonResponse(response.body, response.status);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return errorResponse(400, message);
@@ -332,18 +305,8 @@ async function handlePromote(request: Request): Promise<Response> {
   try {
     const { store, embedder } = getComponents();
     const stored = await promoteMemory({ store, embedder, conflictStore, auditLogger }, body);
-    return jsonResponse({
-      id: stored.id,
-      stored: stored.disposition !== "conflict",
-      disposition: stored.disposition,
-      category: stored.category,
-      scope: stored.resolvedScope,
-      sourceMemoryId: stored.sourceMemoryId,
-      sourceCategory: stored.sourceCategory,
-      storedAt: stored.storedAt,
-      canonicalKey: stored.canonicalKey,
-      conflictId: stored.conflictId,
-    }, 201);
+    const response = buildPromoteHttpResponse(stored);
+    return jsonResponse(response.body, response.status);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return errorResponse(400, message);
