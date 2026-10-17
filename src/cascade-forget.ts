@@ -68,12 +68,15 @@ export async function cascadeForget(
     return { demotedCount: 0, demotedIds: [] };
   }
 
-  // Find related entries in the same scope
+  // Find related entries in the same scope. "exact": the default "family" match turns a
+  // colon-less scope into a prefix (`memory` → `memory%`), which would also demote
+  // `memory:pivot` / `memory-foo` rows when something in `memory` is forgotten.
   const candidates = await store.vectorSearch(
     forgottenEntry.vector,
     config.maxDemotePerForget * 2, // fetch extra, filter down
     config.similarityThreshold,
     [forgottenEntry.scope],
+    "exact",
   );
 
   const demotedIds: string[] = [];
