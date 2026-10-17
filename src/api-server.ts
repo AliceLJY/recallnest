@@ -13,6 +13,7 @@ import { buildSessionCheckpointResult } from "./session-engine.js";
 import { buildStoreHttpResponse } from "./store-receipts.js";
 import { SessionCheckpointStore } from "./session-store.js";
 import { mirrorCheckpointWithDeadline } from "./checkpoint-mirror.js";
+import { LockTimeoutError } from "./distill-lock.js";
 import { composeResumeContext } from "./context-composer.js";
 import { extractMemoryProvenance } from "./memory-boundaries.js";
 import { ConflictStatusSchema } from "./conflict-schema.js";
@@ -437,12 +438,25 @@ async function handleResolveConflict(request: Request): Promise<Response> {
   }
 }
 
-/** POST /v1/checkpoint — persist current session state in the checkpoint store */
-async function handleCheckpoint(request: Request): Promise<Response> {
+/**
+ * POST /v1/checkpoint — persist current session state in the checkpoint store.
+ * A body that fails validation is the client's fault (400); a save that fails is the
+ * server's (500), or 503 when another process held the save lock past the wait.
+ */
+export async function handleCheckpoint(
+  request: Request,
+  checkpoints: Pick<SessionCheckpointStore, "save"> = checkpointStore,
+): Promise<Response> {
   const body = await readJson(request);
+  let result: ReturnType<typeof buildSessionCheckpointResult>;
   try {
-    const result = buildSessionCheckpointResult(body);
-    const stored = await checkpointStore.save(result.record);
+    result = buildSessionCheckpointResult(body);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return errorResponse(400, message);
+  }
+  try {
+    const stored = await checkpoints.save(result.record);
     await saveManagedObservation(buildManagedCheckpointObservation({
       ...result,
       record: stored,
@@ -455,7 +469,7 @@ async function handleCheckpoint(request: Request): Promise<Response> {
     return jsonResponse(stored, 201);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return errorResponse(400, message);
+    return errorResponse(err instanceof LockTimeoutError ? 503 : 500, message);
   }
 }
 
@@ -645,58 +659,61 @@ async function handleHealth(): Promise<Response> {
 // Server
 // ============================================================================
 
-const port = clampInt(envConfig.apiPortRaw(), 4318, 1, 65535);
+// Only listen when run directly (`bun run src/api-server.ts`), so tests can import handlers.
+if (import.meta.main) {
+  const port = clampInt(envConfig.apiPortRaw(), 4318, 1, 65535);
 
-const server = Bun.serve({
-  port,
-  hostname: LOCAL_HTTP_HOSTNAME,
-  async fetch(request) {
-    const policy = await enforceLocalHttpRequestPolicy(request);
-    if (!policy.allowed) {
-      return errorResponse(policy.status, policy.message);
-    }
-
-    const url = new URL(request.url);
-    const { pathname } = url;
-    const method = request.method;
-
-    try {
-      // POST endpoints
-      if (method === "POST") {
-        if (pathname === "/v1/recall") return await handleRecall(request);
-        if (pathname === "/v1/auto-recall") return await handleAutoRecall(request);
-        if (pathname === "/v1/store") return await handleStore(request);
-        if (pathname === "/v1/capture") return await handleCapture(request);
-        if (pathname === "/v1/pattern") return await handlePattern(request);
-        if (pathname === "/v1/case") return await handleCase(request);
-        if (pathname === "/v1/promote") return await handlePromote(request);
-        if (pathname === "/v1/conflicts/resolve") return await handleResolveConflict(request);
-        if (pathname === "/v1/conflicts/escalate") return await handleEscalateConflicts(request);
-        if (pathname === "/v1/checkpoint") return await handleCheckpoint(request);
-        if (pathname === "/v1/workflow-observe") return await handleWorkflowObserve(request);
-        if (pathname === "/v1/resume") return await handleResume(request);
-        if (pathname === "/v1/search") return await handleSearch(request);
+  const server = Bun.serve({
+    port,
+    hostname: LOCAL_HTTP_HOSTNAME,
+    async fetch(request) {
+      const policy = await enforceLocalHttpRequestPolicy(request);
+      if (!policy.allowed) {
+        return errorResponse(policy.status, policy.message);
       }
 
-      // GET endpoints
-      if (method === "GET") {
-        if (pathname === "/v1/conflicts/audit") return await handleConflictAudit(request);
-        if (pathname === "/v1/conflicts") return await handleConflicts(request);
-        if (pathname === "/v1/checkpoint/latest") return await handleLatestCheckpoint(request);
-        if (pathname === "/v1/workflow-health") return await handleWorkflowHealth(request);
-        if (pathname === "/v1/workflow-evidence") return await handleWorkflowEvidence(request);
-        if (pathname === "/v1/stats") return await handleStats();
-        if (pathname === "/v1/lint") return await handleLint(url.searchParams);
-        if (pathname === "/v1/health") return await handleHealth();
+      const url = new URL(request.url);
+      const { pathname } = url;
+      const method = request.method;
+
+      try {
+        // POST endpoints
+        if (method === "POST") {
+          if (pathname === "/v1/recall") return await handleRecall(request);
+          if (pathname === "/v1/auto-recall") return await handleAutoRecall(request);
+          if (pathname === "/v1/store") return await handleStore(request);
+          if (pathname === "/v1/capture") return await handleCapture(request);
+          if (pathname === "/v1/pattern") return await handlePattern(request);
+          if (pathname === "/v1/case") return await handleCase(request);
+          if (pathname === "/v1/promote") return await handlePromote(request);
+          if (pathname === "/v1/conflicts/resolve") return await handleResolveConflict(request);
+          if (pathname === "/v1/conflicts/escalate") return await handleEscalateConflicts(request);
+          if (pathname === "/v1/checkpoint") return await handleCheckpoint(request);
+          if (pathname === "/v1/workflow-observe") return await handleWorkflowObserve(request);
+          if (pathname === "/v1/resume") return await handleResume(request);
+          if (pathname === "/v1/search") return await handleSearch(request);
+        }
+
+        // GET endpoints
+        if (method === "GET") {
+          if (pathname === "/v1/conflicts/audit") return await handleConflictAudit(request);
+          if (pathname === "/v1/conflicts") return await handleConflicts(request);
+          if (pathname === "/v1/checkpoint/latest") return await handleLatestCheckpoint(request);
+          if (pathname === "/v1/workflow-health") return await handleWorkflowHealth(request);
+          if (pathname === "/v1/workflow-evidence") return await handleWorkflowEvidence(request);
+          if (pathname === "/v1/stats") return await handleStats();
+          if (pathname === "/v1/lint") return await handleLint(url.searchParams);
+          if (pathname === "/v1/health") return await handleHealth();
+        }
+
+        return errorResponse(404, "Not Found");
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[API] ${method} ${pathname} error:`, message);
+        return errorResponse(500, `Internal error: ${message}`);
       }
+    },
+  });
 
-      return errorResponse(404, "Not Found");
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`[API] ${method} ${pathname} error:`, message);
-      return errorResponse(500, `Internal error: ${message}`);
-    }
-  },
-});
-
-console.log(`RecallNest API running at http://localhost:${server.port}`);
+  console.log(`RecallNest API running at http://localhost:${server.port}`);
+}
