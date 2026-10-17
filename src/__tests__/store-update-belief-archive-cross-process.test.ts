@@ -533,4 +533,55 @@ describe("update() 与信念归档在写锁内读最新行（跨进程）", () =
       expect(source).not.toContain("indexPinnedAsset(");
     }
   });
+  async function setupOutsideWindow() {
+    const targetId = deterministicId(SCOPE, KEY);
+    const seed = seedEntry(targetId);
+    const meta = JSON.parse(seed.metadata!) as Record<string, unknown>;
+    meta.evolution = { status: "active", version: 3, supersedes: "history-of-version-2", validFrom: Date.now() - 86_400_000 };
+    seed.metadata = JSON.stringify(meta);
+    const ctx = await setup(seed);
+    await sleep(5);
+    await ctx.a.storeBatch(Array.from({ length: 1005 }, (_, i) => ({
+      text: `filler row ${i} for pushing the target out of the canonical scan window`,
+      vector: [0, 0, 1],
+      category: "events" as const,
+      scope: "project:filler",
+      importance: 0.3,
+      metadata: "{}",
+    })));
+    // 前提自检：目标确实不在最近 1000 行里，否则测的不是窗口外
+    const window = await ctx.a.list(undefined, undefined, 1000, 0);
+    expect(window.some((e) => e.id === targetId)).toBe(false);
+    return { ...ctx, targetId, before: (await ctx.a.getById(targetId))! };
+  }
+
+  it("R7 确定性 id 分支：窗口外的 canonical 行已是同一段正文 → deduped，evolution 与行数都不变（不再 store()）", async () => {
+    const { a, targetId, before } = await setupOutsideWindow();
+    const countBefore = (await allRows(a)).length;
+    // 不传 precomputedMatches：真去扫，窗口里看不到它，只能走按确定性 id 直查那一支
+    const result = await writeDurableEntry(depsFor(a), revisionInput({ text: OLD_TEXT, metadata: metadataFor("preferences") }));
+    expect(result.disposition).toBe("deduped");
+    expect(result.entry.id).toBe(targetId);
+    const after = (await a.getById(targetId))!;
+    expect(after.metadata).toBe(before.metadata);
+    expect(after.timestamp).toBe(before.timestamp);
+    const evo = parseEvolution(after.metadata);
+    expect(evo.version).toBe(3);
+    expect(evo.supersedes).toBe("history-of-version-2");
+    expect((await allRows(a)).length).toBe(countBefore);
+  }, 60_000);
+
+  it("R7b 同上但带 promotedFrom：与 exact 命中一致，追加晋升来源、报 promoted，版本链不变、行数不变", async () => {
+    const { a, targetId } = await setupOutsideWindow();
+    const countBefore = (await allRows(a)).length;
+    const promotedMeta = JSON.parse(metadataFor("preferences")) as Record<string, unknown>;
+    promotedMeta.promotedFrom = { memoryId: "source-1", scope: "cc:session-1", category: "events" };
+    const result = await writeDurableEntry(depsFor(a), revisionInput({ text: OLD_TEXT, metadata: JSON.stringify(promotedMeta), promotedFrom: "source-1" }));
+    expect(result.disposition).toBe("promoted");
+    expect(result.entry.id).toBe(targetId);
+    const evo = parseEvolution((await a.getById(targetId))!.metadata);
+    expect(evo.version).toBe(3);
+    expect(evo.supersedes).toBe("history-of-version-2");
+    expect((await allRows(a)).length).toBe(countBefore);
+  }, 60_000);
 });

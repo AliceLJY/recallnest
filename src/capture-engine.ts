@@ -755,8 +755,17 @@ export async function writeDurableEntry(
   if (targetId && deps.store.getById) {
     const rowAtTargetId = await deps.store.getById(targetId);
     const normalizedIncomingText = normalizeMemoryText(params.text);
+    // 那一行已经是这段正文：与上面 exact 命中同样处理（promotedFrom 时追加晋升来源、报 promoted，否则 deduped），
+    // 不落到 store()——store() 用 params.metadata 整行覆盖，会抹掉它的 evolution（version / supersedes）。
+    // 扫描窗口外的 canonical 行只会走到这里，exact 分支看不见它（2026-10-17 owner review）。
+    const sameText = async (existing: MemoryEntry) => params.promotedFrom
+      ? { entry: await appendPromotionObservationToExistingEntry(deps.store, existing, params.metadata), disposition: "promoted" as const }
+      : { entry: existing, disposition: "deduped" as const };
+    if (rowAtTargetId && normalizeMemoryText(rowAtTargetId.text) === normalizedIncomingText) {
+      return await sameText(rowAtTargetId);
+    }
     const atomic = atomicBeliefDeps(deps);
-    if (rowAtTargetId && atomic && normalizeMemoryText(rowAtTargetId.text) !== normalizedIncomingText) {
+    if (rowAtTargetId && atomic) {
       // 归档与覆盖同一次持锁（2026-10-17）。写入的字段与默认值照下面 store() 的那一份：text 换了，
       // language / fts_text 不能沿用旧行的。原行在锁内重读时已不在（被 forget 等删掉）→ 不留历史行，
       // 落到下面的 store() 当新行写入——原先这里会把已删内容写成一条历史行；锁内重读发现正文已与新的相同 → deduped。
@@ -783,11 +792,10 @@ export async function writeDurableEntry(
         };
       }
       if (replaced.status === "unchanged") {
-        // 锁内重读发现那一行已经是这段正文（别的进程刚写过同文、带着它自己的版本链）：不再 store()——
-        // 那会用 params.metadata 整行覆盖，把 evolution（version / supersedes）抹掉。
-        return { entry: replaced.current, disposition: "deduped" };
+        // 锁内重读发现那一行已经是这段正文（别的进程刚写过同文、带着它自己的版本链）：同上，不再 store()
+        return await sameText(replaced.current);
       }
-    } else if (rowAtTargetId && normalizeMemoryText(rowAtTargetId.text) !== normalizedIncomingText) {
+    } else if (rowAtTargetId) {
       const now = Date.now();
       const previousEvo = parseEvolution(rowAtTargetId.metadata, rowAtTargetId.timestamp);
       const { historyId } = await archiveBeliefVersion(
