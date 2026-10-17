@@ -155,6 +155,7 @@ export function buildRetrievalContext(
     limit: base.limit,
     category: base.category,
     source: base.source,
+    trivialQueryGate: base.trivialQueryGate,
     includeArchived: base.includeArchived,
     trace: base.trace,
     graph: base.graph,

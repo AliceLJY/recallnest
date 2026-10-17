@@ -114,8 +114,10 @@ describe("retrieve() 分派与 store 惰性初始化的时序", () => {
       mode: "hybrid",
     });
 
-    // shouldSkipRetrieval 在分派之前提前 return，await ready() 不该被执行到。
-    await retriever.retrieve({ query: "ok", limit: 5 });
+    // shouldSkipRetrievalFor 在分派之前提前 return，await ready() 不该被执行到。
+    // 琐碎查询闸只管自动召回；显式查询只有空白会走这条分支。
+    await retriever.retrieve({ query: "ok", limit: 5, source: "auto-recall" });
+    await retriever.retrieve({ query: "   ", limit: 5 });
 
     expect(calls.ready).toBe(0);
     expect(calls.vector).toBe(0);

@@ -74,3 +74,26 @@ export function shouldSkipRetrieval(query: string, minLength?: number): boolean 
 
   return false;
 }
+
+/**
+ * 检索入口用的判定：这条检索要不要直接返回空。
+ *
+ * 上面那套规则是「一条聊天消息值不值得自动检索」的判定（省嵌入调用），只该管自动召回。
+ * 人主动发起的查询（MCP search_memory、CLI、HTTP、本地 UI）以 `git` / `docker` / `test` 开头、
+ * 纯数字或 `#22`、不含中文又短于 15 字的短语，都是正常的查法；被闸掉时返回的空结果和
+ * 「库里确实没有」看不出区别。所以：
+ * - `trivialQueryGate` 显式给了就按它；
+ * - 没给时只在 `source === "auto-recall"` 时开闸——`source` 同时管着三处强化写入，
+ *   有些人主动发起的检索（search_memory 的相关 scope 旁路、known-item eval）为了不写库也标成
+ *   auto-recall，它们用 `trivialQueryGate: false` 把闸关掉；
+ * - 空串与纯空白不管哪条路都跳过。
+ */
+export function shouldSkipRetrievalFor(context: {
+  query: string;
+  source?: "manual" | "auto-recall" | "cli";
+  trivialQueryGate?: boolean;
+}): boolean {
+  if (context.query.trim().length === 0) return true;
+  const gate = context.trivialQueryGate ?? context.source === "auto-recall";
+  return gate && shouldSkipRetrieval(context.query);
+}
