@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 
 import { metaDir } from "./compat.js";
+import { withWriteLock } from "./distill-lock.js";
 import type { SessionCheckpointRecord } from "./session-schema.js";
 import { SessionCheckpointRecordSchema } from "./session-schema.js";
 import { isFallbackSummary, normalizeCheckpointScope, type CheckpointQuality } from "./session-engine.js";
@@ -18,6 +19,9 @@ export function classifyCheckpointQuality(record: SessionCheckpointRecord): Chec
 export function checkpointFileName(record: Pick<SessionCheckpointRecord, "updatedAt" | "checkpointId">): string {
   return `${record.updatedAt.replace(/[:.]/g, "-")}-${record.checkpointId}.json`;
 }
+
+/** Named write lock held while a checkpoint file is published and older same-id files are removed. */
+export const CHECKPOINT_SAVE_LOCK_KEY = "checkpoint-save";
 
 export interface SessionCheckpointQuery {
   sessionId?: string;
@@ -86,6 +90,18 @@ export class SessionCheckpointStore {
   async save(record: SessionCheckpointRecord): Promise<SessionCheckpointRecord> {
     const parsed = SessionCheckpointRecordSchema.parse(record);
     const dir = this.dataDir;
+    // Publication and the same-id sweep run under one cross-process lock: without it two
+    // processes saving the same id could each rename their file in, then each delete the
+    // other's, leaving nothing. The lock lives in the checkpoint directory itself so every
+    // process writing that directory shares it, whatever its data dir; it ends in ".lock",
+    // so listRecent / gc never read it.
+    return withWriteLock(CHECKPOINT_SAVE_LOCK_KEY, async () => this.publish(dir, parsed), {
+      lockDir: dir,
+      expireMs: 60_000,
+    });
+  }
+
+  private publish(dir: string, parsed: SessionCheckpointRecord): SessionCheckpointRecord {
     const fileName = checkpointFileName(parsed);
     const path = join(dir, fileName);
     // Not ending in ".json", so listRecent / gc / the same-id sweep below never see it.
