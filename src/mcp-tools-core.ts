@@ -547,6 +547,8 @@ registerTool(
           includeArchived,
           topicTag,
           source: "auto-recall",
+          // 旁路标 auto-recall 只为不做强化写入；查询本身是人发起的，不过琐碎查询闸
+          trivialQueryGate: false,
           validAt: validAt ? new Date(validAt).getTime() : undefined,
           includeExpired: includeExpired ?? undefined,
         }, {
