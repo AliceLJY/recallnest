@@ -759,7 +759,7 @@ export async function writeDurableEntry(
     if (rowAtTargetId && atomic && normalizeMemoryText(rowAtTargetId.text) !== normalizedIncomingText) {
       // 归档与覆盖同一次持锁（2026-10-17）。写入的字段与默认值照下面 store() 的那一份：text 换了，
       // language / fts_text 不能沿用旧行的。原行在锁内重读时已不在（被 forget 等删掉）→ 不留历史行，
-      // 落到下面的 store() 当新行写入——原先这里会把已删内容写成一条历史行；锁内重读发现正文已与新的相同 → 同样落到 store()。
+      // 落到下面的 store() 当新行写入——原先这里会把已删内容写成一条历史行；锁内重读发现正文已与新的相同 → deduped。
       const replaced = await replaceBeliefVersion(
         atomic,
         rowAtTargetId,
@@ -781,6 +781,11 @@ export async function writeDurableEntry(
           disposition: params.promotedFrom ? "promoted" : "stored",
           supersededPrevious: true,
         };
+      }
+      if (replaced.status === "unchanged") {
+        // 锁内重读发现那一行已经是这段正文（别的进程刚写过同文、带着它自己的版本链）：不再 store()——
+        // 那会用 params.metadata 整行覆盖，把 evolution（version / supersedes）抹掉。
+        return { entry: replaced.current, disposition: "deduped" };
       }
     } else if (rowAtTargetId && normalizeMemoryText(rowAtTargetId.text) !== normalizedIncomingText) {
       const now = Date.now();
@@ -1230,10 +1235,13 @@ export async function persistMemory(
           if (decision.action === "MERGE") {
             const oldEntry = supersedeTargets[0].entry;
             const supersededMeta = buildSupersedeMetadata(oldEntry.metadata, deterministicId(resolvedScope, input.text));
-            await deps.store.update(oldEntry.id, { metadata: supersededMeta });
-            // HP-1: Track for bidirectional link
-            supersededOldId = oldEntry.id;
-            supersededReason = decision.reason;
+            const marked = await deps.store.update(oldEntry.id, { metadata: supersededMeta });
+            // HP-1: Track for bidirectional link — only when the old row was actually marked;
+            // update() returns null when it was deleted meanwhile, and the new row must not point at it.
+            if (marked) {
+              supersededOldId = oldEntry.id;
+              supersededReason = decision.reason;
+            }
           }
         }
         // CREATE or error → proceed normally (store new memory as-is)

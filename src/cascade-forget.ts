@@ -124,12 +124,13 @@ export async function cascadeForget(
       meta.tier = "working";
     }
 
-    await store.update(entry.id, {
+    const demoted = await store.update(entry.id, {
       importance: newImportance,
       metadata: JSON.stringify(meta),
     }, [forgottenEntry.scope]);
 
-    demotedIds.push(entry.id);
+    // update() 返回 null = 这一行在检索之后被删掉了，没有降权成，不计入
+    if (demoted) demotedIds.push(entry.id);
   }
 
   return { demotedCount: demotedIds.length, demotedIds };

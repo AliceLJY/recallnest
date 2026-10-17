@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,6 +8,9 @@ import { buildStructuredMetadata, writeDurableEntry, type DurableWriteInput, typ
 import { buildConflictCandidateRecord, resolveConflictCandidate } from "../conflict-engine.js";
 import { ConflictCandidateStore } from "../conflict-store.js";
 import { applyPreferenceMatch } from "../preference-matcher.js";
+import { pinMemory } from "../asset-sync.js";
+import { registerLanguageProcessor } from "../language-hook.js";
+import type { PinAsset } from "../memory-assets.js";
 import { withWriteLock } from "../distill-lock.js";
 import { parseEvolution } from "../memory-evolution.js";
 import { deterministicId, MemoryStore, type MemoryEntry } from "../store.js";
@@ -387,5 +390,147 @@ describe("update() 与信念归档在写锁内读最新行（跨进程）", () =
     const rows = await allRows(a);
     expect(rows.find((r) => r.id === ID)?.text).toBe(NEW_TEXT);
     expect(historyRows(rows).map((r) => r.text)).toEqual([OLD_TEXT]);
+  });
+  // ── owner review 之后的修复（2026-10-17）────────────────────────────────────────────
+
+  it("R1 确定性 id 分支：拿锁之前别的进程已写入同一段正文（带自己的版本链）→ deduped，版本链不被抹掉、不再 store()", async () => {
+    const targetId = deterministicId(SCOPE, KEY);
+    const { a, b } = await setup(seedEntry(targetId));
+    let pending: Promise<Awaited<ReturnType<typeof writeDurableEntry>>> | undefined;
+    await withWriteLock("store-write", async () => {
+      pending = writeDurableEntry(depsFor(a), revisionInput({ precomputedMatches: [] }));
+      await sleep(200); // A 已在锁外看到旧正文，正等锁
+      await b.getById(targetId);
+      const table = tableOf(b);
+      const [row] = await table.query().where(`id = '${targetId}'`).limit(1).toArray();
+      const meta = JSON.parse(String(row.metadata)) as Record<string, unknown>;
+      meta.evolution = { status: "active", version: 5, supersedes: "history-written-by-b", validFrom: Date.now() };
+      await table.mergeInsert("id").whenMatchedUpdateAll().execute([{ ...row, vector: Array.from(row.vector as Iterable<number>), text: NEW_TEXT, metadata: JSON.stringify(meta) }]);
+    });
+    const result = await pending!;
+    expect(result.disposition).toBe("deduped");
+    expect(result.entry.id).toBe(targetId);
+    const rows = await allRows(a);
+    expect(rows).toHaveLength(1);
+    const evo = parseEvolution(rows[0].metadata);
+    expect(evo.version).toBe(5);
+    expect(evo.supersedes).toBe("history-written-by-b");
+  });
+
+  it("R2 时间取在锁内：等锁期间别的进程刚完成一次替换 → 历史行 validFrom ≤ validUntil，原行 timestamp 不倒退", async () => {
+    const { a, b } = await setup();
+    const latest = (await a.list([SCOPE]))[0];
+    let bTimestamp = 0;
+    let pending: Promise<Awaited<ReturnType<typeof writeDurableEntry>>> | undefined;
+    await withWriteLock("store-write", async () => {
+      pending = writeDurableEntry(depsFor(a), revisionInput({ precomputedMatches: [latest] }));
+      await sleep(200); // A 已经开始（旧实现在这时就取了 now），正等锁
+      // B 在这期间完成一次替换：正文换新、timestamp 与 validFrom 取它提交的那一刻
+      await b.getById(ID);
+      const table = tableOf(b);
+      const [row] = await table.query().where(`id = '${ID}'`).limit(1).toArray();
+      bTimestamp = Date.now();
+      const meta = JSON.parse(String(row.metadata)) as Record<string, unknown>;
+      meta.evolution = { status: "active", version: 2, validFrom: bTimestamp };
+      await table.mergeInsert("id").whenMatchedUpdateAll().execute([{ ...row, vector: Array.from(row.vector as Iterable<number>), text: "B 刚替换进去的版本：回复只给结论。", timestamp: bTimestamp, metadata: JSON.stringify(meta) }]);
+    });
+    await pending;
+    const rows = await allRows(a);
+    const [history] = historyRows(rows);
+    const histEvo = parseEvolution(history.metadata);
+    expect(histEvo.validFrom).toBe(bTimestamp);
+    expect(histEvo.validFrom).toBeLessThanOrEqual(histEvo.validUntil!);
+    const canonical = (await a.getById(ID))!;
+    expect(canonical.timestamp).toBeGreaterThanOrEqual(bTimestamp);
+    expect(parseEvolution(canonical.metadata).validFrom).toBe(histEvo.validUntil!);
+    expect(canonical.timestamp).toBe(histEvo.validUntil!);
+  });
+
+  it("R2b 连续两次替换中间夹着时钟偏前的另一台机器：时间点不早于锁内行自己的 timestamp / validFrom", async () => {
+    const { a, b } = await setup();
+    const skewed = Date.now() + 60_000; // 另一台机器的时钟快了一分钟
+    await b.getById(ID);
+    const table = tableOf(b);
+    const [row] = await table.query().where(`id = '${ID}'`).limit(1).toArray();
+    const meta = JSON.parse(String(row.metadata)) as Record<string, unknown>;
+    meta.evolution = { status: "active", version: 2, validFrom: skewed };
+    await table.mergeInsert("id").whenMatchedUpdateAll().execute([{ ...row, vector: Array.from(row.vector as Iterable<number>), timestamp: skewed, metadata: JSON.stringify(meta) }]);
+
+    const first = await writeDurableEntry(depsFor(a), revisionInput({ precomputedMatches: [(await a.getById(ID))!] }));
+    expect(first.entry.timestamp).toBeGreaterThanOrEqual(skewed);
+    const second = await writeDurableEntry(depsFor(a), revisionInput({ text: "第三版：回复先给结论，再列风险，理由放最后。", precomputedMatches: [(await a.getById(ID))!] }));
+    expect(second.entry.timestamp).toBeGreaterThanOrEqual(first.entry.timestamp);
+    for (const h of historyRows(await allRows(a))) {
+      const evo = parseEvolution(h.metadata);
+      expect(evo.validFrom).toBeLessThanOrEqual(evo.validUntil!);
+    }
+  });
+
+  it("R4 历史行的 language / fts_text 按正文重算：旧行带着迁移占位（en / 原文）也不照抄", async () => {
+    const { a } = await setup(); // storeBatch 不传 language / fts_text → 落库为 "en" / 原文，与生产里的迁移占位相同
+    registerLanguageProcessor({
+      detectLanguage: (text) => (/[\u4e00-\u9fff]/.test(text) ? "zh" : "en"),
+      tokenizeForFts: (text, lang) => (lang === "zh" ? Array.from(text).join(" ") : text),
+    });
+    try {
+      const latest = (await a.list([SCOPE]))[0];
+      await writeDurableEntry(depsFor(a), revisionInput({ precomputedMatches: [latest] }));
+    } finally {
+      // language-hook 没有注销接口：换回与「未注册」等价的直通实现
+      registerLanguageProcessor({ detectLanguage: () => "en", tokenizeForFts: (text) => text });
+    }
+    const rows = await tableOf(a).query().select(["id", "text", "metadata", "language", "fts_text"]).toArray();
+    const history = rows.filter((r) => parseEvolution(String(r.metadata)).status === "superseded");
+    expect(history).toHaveLength(1);
+    expect(history[0].language).toBe("zh");
+    expect(history[0].fts_text).toBe(Array.from(OLD_TEXT).join(" "));
+  });
+
+  it("R5 原行在两次写之间消失、撤掉历史行又失败 → 记日志，仍返回 missing", async () => {
+    const { a, b } = await setup();
+    await a.getById(ID);
+    runBeforeWrite(a, 2, async () => { await b.delete(ID); });
+    (a as unknown as { table: { delete(where: string): Promise<void> } }).table.delete = async () => { throw new Error("disk full"); };
+    const result = await a.replaceWithArchivedVersion(ID, (current) => ({
+      history: { ...current, id: "cccccccc-1111-2222-3333-444444444444", metadata: "{}" },
+      updates: { text: NEW_TEXT },
+    }));
+    expect(result.status).toBe("missing");
+  });
+
+  it("R3 pin：等锁期间记忆被删 → 返回 null，不写 pin 文件、不建索引副本", async () => {
+    const { a, b } = await setup();
+    const entry = (await a.getById(ID))!;
+    const saved: PinAsset[] = [];
+    let pending: ReturnType<typeof pinMemory> | undefined;
+    await withWriteLock("store-write", async () => {
+      pending = pinMemory(a, { async embedPassage() { return [0, 0, 1]; } } as never, entry, undefined, {}, (asset) => { saved.push(asset); return "/dev/null"; });
+      await sleep(200);
+      await b.delete(ID);
+    });
+    expect(await pending!).toBeNull();
+    expect(saved).toHaveLength(0);
+    expect(await allRows(a)).toHaveLength(0);
+  });
+
+  it("R3b pin 正常路径：pin 按 update() 返回的行生成（importance 已提到 0.95），并建一条索引副本", async () => {
+    const { a } = await setup();
+    const entry = (await a.getById(ID))!;
+    const saved: PinAsset[] = [];
+    const pinned = await pinMemory(a, { async embedPassage() { return [0, 0, 1]; } } as never, entry, undefined, { title: "t" }, (asset) => { saved.push(asset); return "/dev/null"; });
+    expect(pinned?.entry.importance).toBeCloseTo(0.95);
+    expect(saved).toHaveLength(1);
+    expect(saved[0].source.memoryId).toBe(ID);
+    expect(saved[0].retrieval.score).toBeCloseTo(0.95);
+    expect(await allRows(a)).toHaveLength(2);
+  });
+
+  it("R3c pin 的三个入口（MCP / CLI / UI）都走 pinMemory，不再各自写 pin 文件", () => {
+    for (const file of ["mcp-tools-advanced.ts", "cli.ts", "ui-server.ts"]) {
+      const source = readFileSync(join(import.meta.dir, "..", file), "utf8");
+      expect(source).toContain("pinMemory(store, embedder, entry, scopeSelection.scopeFilter");
+      expect(source).not.toContain("savePinAsset(");
+      expect(source).not.toContain("indexPinnedAsset(");
+    }
   });
 });

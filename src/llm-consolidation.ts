@@ -141,8 +141,8 @@ export async function executeMergeDecisions(
 
     const canonical = groupEntries[0];
     for (const member of groupEntries.slice(1)) {
-      await createVersionGroup(store, canonical, member, scope);
-      mergeCount++;
+      // null: one of the two rows was deleted meanwhile — nothing was merged
+      if (await createVersionGroup(store, canonical, member, scope)) mergeCount++;
     }
   }
 

@@ -180,7 +180,9 @@ export async function fireReminder(
   prospective.firedAt = new Date().toISOString();
   meta.prospective = prospective;
 
-  await store.update(entryId, { metadata: JSON.stringify(meta) }, scopeFilter);
+  // 行在读到之后被删掉（update() 返回 null）就不算触发：不把一条已经不存在的提醒交给调用方
+  const marked = await store.update(entryId, { metadata: JSON.stringify(meta) }, scopeFilter);
+  if (!marked) return null;
 
   logInfo(`[INFO] Reminder fired: "${prospective.trigger}" → ${prospective.action}`);
 
@@ -298,10 +300,11 @@ export async function acceptPredictedReminder(
     (meta.boundary as Record<string, string>).authority = "user";
   }
 
-  await store.update(entryId, {
+  const promoted = await store.update(entryId, {
     metadata: JSON.stringify(meta),
     importance: 0.75, // Upgrade to explicit-level importance
   }, scopeFilter);
+  if (!promoted) return false; // 行已被删：没有接受成
 
   logInfo(`[INFO] Predicted reminder accepted and promoted: ${entryId}`);
   return true;
@@ -330,14 +333,14 @@ export async function demotePredictedReminder(
     prospective.status = "expired";
     prospective.confidence = newConfidence;
     meta.prospective = prospective;
-    await store.update(entryId, { metadata: JSON.stringify(meta) }, scopeFilter);
+    if (!await store.update(entryId, { metadata: JSON.stringify(meta) }, scopeFilter)) return false; // 行已被删
     logInfo(`[INFO] Predicted reminder demoted below threshold and expired: ${entryId}`);
   } else {
     // Still above threshold — just lower confidence
     prospective.confidence = newConfidence;
     prospective.lastSuggestedAt = new Date().toISOString();
     meta.prospective = prospective;
-    await store.update(entryId, { metadata: JSON.stringify(meta) }, scopeFilter);
+    if (!await store.update(entryId, { metadata: JSON.stringify(meta) }, scopeFilter)) return false; // 行已被删
     logInfo(`[INFO] Predicted reminder demoted: ${entryId} (new confidence: ${newConfidence})`);
   }
 

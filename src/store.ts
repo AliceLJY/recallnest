@@ -1229,8 +1229,9 @@ export class MemoryStore implements MemoryStorePort {
    * - plan 在锁内同步执行，只能做纯计算：取向量 / 调 embedder 这类慢操作由调用方在锁外先做好；
    *   plan 里也不能调用会再拿 store-write 的公有方法（锁不可重入，会等自己到超时）。
    * - plan 返回 null：不归档也不改原行，结果为 unchanged（带上锁内读到的行）。
+   * - 历史行按 plan 给的原样写入（language / fts_text 由 plan 负责，见 belief-history 的 replaceBeliefVersion）。
    * - 原行在重读时已不在，或在写历史行之后、更新原行之前被不拿锁的 delete() 删掉：撤掉本次写的历史行
-   *   （它在本次之前就已存在则不动），结果为 missing，库里不留下指向不存在原行的历史行。
+   *   （它在本次之前就已存在则不动），结果为 missing，库里不留下指向不存在原行的历史行；撤销本身失败只记日志，仍返回 missing。
    * - 更新原行抛错时同样撤掉本次写的历史行，再把错误抛出去。
    */
   async replaceWithArchivedVersion(
@@ -1251,12 +1252,8 @@ export class MemoryStore implements MemoryStorePort {
       const planned = plan(current);
       if (!planned) return { status: "unchanged", current };
 
-      const history: MemoryEntry = {
-        ...planned.history,
-        metadata: planned.history.metadata || "{}",
-        language: planned.history.language || "en",
-        fts_text: planned.history.fts_text || planned.history.text,
-      };
+      // 历史行原样写入：language / fts_text 由 plan 按正文算好，这里不再用 "en" / 原文顶替
+      const { history } = planned;
       if (history.id === fullId) {
         throw new Error(`History row id collided with canonical id ${fullId}`);
       }
@@ -1280,7 +1277,11 @@ export class MemoryStore implements MemoryStorePort {
         throw err;
       }
       if (numUpdatedRows === 0) {
-        await undoHistory();
+        try {
+          await undoHistory();
+        } catch (undoErr) {
+          console.error(`[replaceWithArchivedVersion] failed to remove history row ${history.id} after the canonical row vanished: ${undoErr instanceof Error ? undoErr.message : String(undoErr)}`);
+        }
         return { status: "missing" };
       }
       return { status: "replaced", entry: updated, history };

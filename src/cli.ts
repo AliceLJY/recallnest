@@ -16,11 +16,10 @@ import { homedir } from "node:os";
 
 import { metaDir } from "./compat.js";
 import { PACKAGE_VERSION } from "./version.js";
-import type { RetrievalResult } from "./retriever.js";
 import { applyRetrievalProfile, listRetrievalProfiles } from "./retrieval-profiles.js";
 import { distillResults, formatExplainResults, formatSearchResults, selectBriefSeedResults, summarizeResults } from "./memory-output.js";
-import { archiveDirtyBriefAsset, assetSummaryLine, buildBriefAsset, buildPinAsset, getExportsDir, listDirtyBriefAssets, listMemoryAssets, listPinAssets, pinSummaryLine, saveBriefAsset, savePinAsset, writeExportArtifact } from "./memory-assets.js";
-import { indexAsset, indexPinnedAsset } from "./asset-sync.js";
+import { archiveDirtyBriefAsset, assetSummaryLine, buildBriefAsset, getExportsDir, listDirtyBriefAssets, listMemoryAssets, listPinAssets, pinSummaryLine, saveBriefAsset, writeExportArtifact } from "./memory-assets.js";
+import { indexAsset, pinMemory } from "./asset-sync.js";
 import { createComponents, createStoreOnly, expandHome, loadConfig, loadDotEnv, resolveDataDir, resolveDbPath, type LocalMemoryConfig } from "./runtime-config.js";
 import { KGStore } from "./kg-store.js";
 import { extractTriggerCandidates, normalizeTriggerTexts } from "./trigger-store.js";
@@ -510,18 +509,6 @@ function collectRepeatedOption(value: string, previous: string[] = []): string[]
   return [...previous, value];
 }
 
-function entryToRetrievalResult(entry: Awaited<ReturnType<MemoryStore["get"]>>): RetrievalResult {
-  if (!entry) {
-    throw new Error("Memory entry not found.");
-  }
-  return {
-    entry,
-    score: entry.importance || 0.7,
-    sources: {
-      fused: { score: entry.importance || 0.7 },
-    },
-  };
-}
 
 // ─── search ──────────────────────────────────────────────────────────────────
 
@@ -605,17 +592,17 @@ program
       return;
     }
 
-    const pinnedImportance = Math.max(entry.importance || 0.7, 0.95);
-    await store.update(entry.id, { importance: pinnedImportance }, scopeSelection.scopeFilter);
-
-    const asset = buildPinAsset(entryToRetrievalResult(entry), {
+    const pinned = await pinMemory(store, embedder, entry, scopeSelection.scopeFilter, {
       title: options.title,
       summary: options.summary,
       query: options.query,
       profile: options.profile,
     });
-    const path = savePinAsset(asset);
-    await indexPinnedAsset(store, embedder, asset);
+    if (!pinned) {
+      console.log(`Memory not found: ${memoryId}`);
+      return;
+    }
+    const { asset, path } = pinned;
 
     console.log([
       `Pinned   : ${asset.id.slice(0, 8)}`,

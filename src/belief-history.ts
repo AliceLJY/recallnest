@@ -199,6 +199,17 @@ export type BeliefReplaceResult =
  *
  * `skip(current)` returning true leaves everything as it is (result "unchanged").
  * `buildUpdates` runs under the lock: it must be pure and synchronous.
+ *
+ * Time: unless `options.now` is given, the single timestamp used for the history row's
+ * validUntil, the canonical row's timestamp / validFrom (via ctx.now) and the returned
+ * validUntil is taken inside the lock, and never earlier than the re-read row's own
+ * timestamp or validFrom. Taking it before the lock (and before vector resolution) let a
+ * replacement that committed in between leave a history row with validFrom > validUntil and
+ * move the canonical timestamp backwards.
+ *
+ * language / fts_text of the history row are always recomputed from its text, as the old
+ * archive path did: the row re-read under the lock carries the "en" / raw-text placeholders
+ * legacy rows were migrated with, and copying those would mislabel Chinese history rows.
  */
 export async function replaceBeliefVersion(
   deps: BeliefReplaceDeps,
@@ -206,21 +217,23 @@ export async function replaceBeliefVersion(
   buildUpdates: (ctx: BeliefReplaceContext) => MemoryStoreUpdate,
   options: { now?: number; scopeFilter?: string[]; skip?: (current: MemoryEntry) => boolean } = {},
 ): Promise<BeliefReplaceResult> {
-  const now = options.now ?? Date.now();
   const fallbackVector = await resolveVector(deps.store, deps.embedder, expected);
 
+  let lockedNow = 0;
   const result = await deps.store.replaceWithArchivedVersion(expected.id, (current) => {
     if (options.skip?.(current)) return null;
+    const previousEvolution = parseEvolution(current.metadata, current.timestamp);
+    const now = options.now ?? Math.max(Date.now(), current.timestamp, previousEvolution.validFrom);
+    lockedNow = now;
     const vector = current.vector.length > 0
       ? current.vector
       : current.text === expected.text ? fallbackVector : [];
-    const history = buildBeliefHistoryRow(current, vector, now);
-    const previousEvolution = parseEvolution(current.metadata, current.timestamp);
+    const history = buildBeliefHistoryRow({ ...current, language: undefined, fts_text: undefined }, vector, now);
     return { history, updates: buildUpdates({ current, previousEvolution, historyId: history.id, now }) };
   }, options.scopeFilter);
 
   if (result.status === "replaced") {
-    return { status: "replaced", entry: result.entry, historyId: result.history.id, validUntil: now };
+    return { status: "replaced", entry: result.entry, historyId: result.history.id, validUntil: lockedNow };
   }
   return result;
 }
