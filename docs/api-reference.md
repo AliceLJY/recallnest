@@ -225,6 +225,14 @@ Store a new durable memory entry.
 
 If the same `canonicalKey` is already occupied by a different durable category, RecallNest returns `disposition = "conflict"` plus a `conflictId` instead of silently creating a second durable owner.
 
+`stored` is `true` (status `201`) only when the write landed new content: `disposition` is `stored`, `updated` or `promoted`. Otherwise the status is `200` and `stored` is `false`:
+
+| `disposition` | Meaning | `id` |
+|---|---|---|
+| `deduped` | The content already exists; no new row was written | the existing memory |
+| `conflict` | Canonical key owned by another category; parked in the conflict store | the existing owner |
+| `rejected` | Turned away by admission control; `rejectionReason` says why (`text_too_short`, `noise_detected`, `importance_too_low`, `rate_limited`) | a placeholder, no row exists |
+
 For slot-aware preferences, RecallNest now derives structured keys instead of collapsing everything into a broader same-topic key. Examples:
 
 - atomic brand-item preference: `我喜欢吃麦当劳的麦辣鸡翅` -> `preferences:brand-item:麦当劳:麦辣鸡翅`

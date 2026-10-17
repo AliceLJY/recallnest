@@ -15,6 +15,7 @@ import { DurableMemoryCategorySchema, StoreMemorySourceSchema, DebugFramingSchem
 import { buildRetrievalContext, resolveScopeSelection } from "./scope-policy.js";
 import { persistSkill, retrieveSkills } from "./skill-engine.js";
 import { SkillImplementationTypeSchema } from "./skill-schema.js";
+import { formatBatchStoreReceipt } from "./store-receipts.js";
 import type { ToolRegistryDeps } from "./mcp-tool-deps.js";
 
 /** The data/pins directory, as forget_memory uses it when nothing else is injected. */
@@ -879,17 +880,10 @@ registerTool(
       })),
     });
 
-    const counts = { new: 0, deduped: 0, updated: 0 };
-    for (const r of stored) {
-      if (r.disposition === "deduped") counts.deduped++;
-      else if (r.disposition === "updated") counts.updated++;
-      else counts.new++;
-    }
-
     return {
       content: [{
         type: "text" as const,
-        text: `Stored ${stored.length} memories (${counts.new} new, ${counts.deduped} deduped, ${counts.updated} updated)`,
+        text: formatBatchStoreReceipt(stored),
       }],
     };
   },
