@@ -220,6 +220,11 @@ export function lockPathForKey(key: string, lockDir?: string): string {
   return join(locksDir(lockDir), `${safe}-${hash}.lock`);
 }
 
+/** Thrown when a waiting lock is still held by another process at the deadline. */
+export class LockTimeoutError extends Error {
+  override name = "LockTimeoutError";
+}
+
 export interface WithLockOptions {
   /** Stale-lock reclaim window in ms (default 600_000 = 10min). */
   expireMs?: number;
@@ -270,7 +275,7 @@ export async function withLock<T>(
       }
     }
     if (!acquired) {
-      throw new Error(`lock '${key}' timed out after ${timeoutMs}ms (held by another process)`);
+      throw new LockTimeoutError(`lock '${key}' timed out after ${timeoutMs}ms (held by another process)`);
     }
   }
 
