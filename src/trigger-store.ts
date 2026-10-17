@@ -15,6 +15,7 @@
  * （jina-v5 的 retrieval.query），query↔query 的余弦比 query↔passage 稳定。
  */
 
+import { resolve } from "node:path";
 import type * as LanceDB from "@lancedb/lancedb";
 import { loadLanceDB, escapeSqlLiteral, scopeWhereClause } from "./store.js";
 import { matchesScopeFilter, type ScopeMatchMode } from "./scope-policy.js";
@@ -22,6 +23,7 @@ import { readConsistencyInterval as envReadConsistencyInterval } from "./env-con
 import { logWarn } from "./stderr-log.js";
 import { textOverlapScore, tokenize } from "./multi-vector.js";
 import { redactSecrets } from "./pii-detector.js";
+import { withWriteLock as withCrossProcessLock } from "./distill-lock.js";
 
 export const TRIGGER_TABLE_NAME = "memory_triggers";
 
@@ -70,6 +72,15 @@ export interface TriggerStoreConfig {
   dbPath: string;
   vectorDim: number;
   readConsistencyInterval?: number;
+  /** 跨进程写锁的锁文件目录；不传用 distill-lock 的默认目录（<dataDir>/locks）。测试指到临时目录。 */
+  lockDir?: string;
+}
+
+/**
+ * 侧表写锁的名字。按库目录区分：同一个库的所有进程共用一把，不同的库（测试的临时库）互不等待。
+ */
+export function triggerWriteLockKey(dbPath: string): string {
+  return `trigger-write:${resolve(dbPath)}`;
 }
 
 export interface TriggerStoreStats {
@@ -216,9 +227,22 @@ export class TriggerStore {
   }
 
   /**
-   * 覆盖式写入一条记忆的全部 trigger：先删旧行再加新行，同一 memory_id 永远只有一组。
+   * 覆盖式写入一条记忆的全部 trigger，同一 memory_id 永远只有一组。
    * `embed` 由调用方传入（应为 embedQuery 批量版），这里不持有 embedder。
    * 返回实际写入的条数；texts 规整后为空则只删不加、返回 0。
+   *
+   * 先嵌入、后动表（2026-10-17）：嵌入是网络调用，原先先删旧行再嵌入，嵌入一失败旧 trigger 就全没了。
+   * 现在嵌入失败或条数对不上时直接抛错，表一行不动。
+   *
+   * 动表在跨进程写锁里（`triggerWriteLockKey`，distill-lock 的 withWriteLock）：进程内的写锁管不到
+   * 别的 MCP / CLI 进程。两个进程同时给一条还没有 trigger 的记忆首写，按 id 合并时双方都只是插入、
+   * 不改已有行，Lance 不判冲突，会写出两组（2026-10-17 复审）。嵌入在跨进程锁外面做，锁只罩住读表与一次提交；
+   * 进程内的写锁仍罩住嵌入，同一进程里后发起的重写一定后落表。
+   *
+   * 换新是一次 mergeInsert 提交，合并键是 (id, created_at)：新行的 created_at 在锁内取成比这条记忆
+   * 现有各行都大，所以没有一行旧行对得上，新行全部插入，这条记忆的旧行全部经
+   * whenNotMatchedBySourceDelete（限定本 memory_id）在同一个提交里删掉。只按 id 合并时，旧竞态留下的
+   * 两行同 id 会同时对上一条新行、两行都被更新而不是删掉，重复行永远修不掉（2026-10-17 复审）。
    */
   async upsertForMemory(
     memoryId: string,
@@ -229,23 +253,36 @@ export class TriggerStore {
     const cleaned = normalizeTriggerTexts(texts);
     return this.withWriteLock(async () => {
       await this.ensureInitialized();
-      await this.table!.delete(`memory_id = '${escapeSqlLiteral(memoryId)}'`);
-      if (cleaned.length === 0) return 0;
+      const where = `memory_id = '${escapeSqlLiteral(memoryId)}'`;
+      if (cleaned.length === 0) {
+        await this.withSharedLock(async (table) => { await table.delete(where); });
+        return 0;
+      }
       const vectors = await embed(cleaned);
       if (vectors.length !== cleaned.length) {
         throw new Error(`TriggerStore: embed returned ${vectors.length} vectors for ${cleaned.length} texts`);
       }
-      const now = Date.now();
-      const rows: TriggerRow[] = cleaned.map((text, i) => ({
-        id: `${memoryId}#${i}`,
-        memory_id: memoryId,
-        scope,
-        text,
-        vector: vectors[i],
-        created_at: now,
-      }));
-      await this.table!.add(rows);
-      return rows.length;
+      return this.withSharedLock(async (table) => {
+        const existing = await table.query().where(where).select(["created_at"]).toArray();
+        let createdAt = Date.now();
+        for (const row of existing) {
+          const prev = Number((row as Record<string, unknown>).created_at);
+          if (Number.isFinite(prev) && prev >= createdAt) createdAt = prev + 1;
+        }
+        const rows: TriggerRow[] = cleaned.map((text, i) => ({
+          id: `${memoryId}#${i}`,
+          memory_id: memoryId,
+          scope,
+          text,
+          vector: vectors[i],
+          created_at: createdAt,
+        }));
+        await table.mergeInsert(["id", "created_at"])
+          .whenNotMatchedInsertAll()
+          .whenNotMatchedBySourceDelete({ where })
+          .execute(rows);
+        return rows.length;
+      });
     });
   }
 
@@ -253,19 +290,35 @@ export class TriggerStore {
    * 删掉一条记忆的全部 trigger 行，返回删了几行。
    * forget 引擎在删主行之前调它（2026-10-05 之前这个方法没有任何调用方，
    * 记忆删掉后它的问法原文和向量留在侧表里）。
-   * 返回的是删除前一刻数到的行数。写锁只管本进程，别的进程若恰在「数」和「删」之间给同一条
-   * 记忆加了行：数到的不是 0 时，那些行会被一起删掉（删除按条件），只是不计入返回值；数到的是 0
-   * 时这里根本不发删除，那些行会留下。forget 引擎删完主行后会再数一次（countForMemory），
-   * 留下的行在那里报成残留。
+   * 「数」和「删」都在跨进程写锁里，别的进程经 upsertForMemory 写这条记忆时插不进中间；
+   * 返回值就是删掉的行数。forget 引擎删完主行后会再数一次（countForMemory）。
    * 侧表还不存在时，这里和 countForMemory 都会像写入路径一样把它建出来（空表）。
    */
   async deleteForMemory(memoryId: string): Promise<number> {
     return this.withWriteLock(async () => {
       await this.ensureInitialized();
       const where = `memory_id = '${escapeSqlLiteral(memoryId)}'`;
-      const rows = await this.table!.countRows(where);
-      if (rows > 0) await this.table!.delete(where);
-      return rows;
+      return this.withSharedLock(async (table) => {
+        const rows = await table.countRows(where);
+        if (rows > 0) await table.delete(where);
+        return rows;
+      });
+    });
+  }
+
+  /**
+   * 持跨进程写锁跑一段写表操作。拿到锁之后先把表句柄切到最新版本：
+   * 句柄可能停在等锁之前看到的版本，锁内的读（现有行的 created_at、删前计数）要看到别的进程刚提交的行。
+   */
+  private withSharedLock<T>(fn: (table: LanceDB.Table) => Promise<T>): Promise<T> {
+    return withCrossProcessLock(triggerWriteLockKey(this.config.dbPath), async () => {
+      const table = this.table!;
+      await table.checkoutLatest();
+      return fn(table);
+    }, {
+      expireMs: 30_000,
+      waitTimeoutMs: 30_000,
+      ...(this.config.lockDir ? { lockDir: this.config.lockDir } : {}),
     });
   }
 
