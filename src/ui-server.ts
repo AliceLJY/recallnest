@@ -13,6 +13,7 @@ import { createComponentResolver, loadConfig, loadDotEnv } from "./runtime-confi
 import { buildRetrievalContext, resolveScopeSelection } from "./scope-policy.js";
 import { enforceLocalHttpRequestPolicy, LOCAL_HTTP_HOSTNAME } from "./http-request-policy.js";
 import * as envConfig from "./env-config.js";
+import { HTTP_WRITE_IDLE_TIMEOUT_S } from "./store-write-budget.js";
 const config = (loadDotEnv(), loadConfig());
 const getComponents = createComponentResolver(config);
 
@@ -181,6 +182,9 @@ async function handleSearch(mode: "search" | "explain" | "distill", body: Record
 
 const server = Bun.serve({
   port: readLimit(envConfig.uiPortRaw(), 4317, 1, 65535),
+  // Writes can wait up to 30 s for store-write before they start; Bun's 10 s default would drop
+  // the connection while the handler still commits.
+  idleTimeout: HTTP_WRITE_IDLE_TIMEOUT_S,
   hostname: LOCAL_HTTP_HOSTNAME,
   async fetch(request) {
     try {

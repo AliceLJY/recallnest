@@ -10,7 +10,7 @@ A local-first memory system backed by LanceDB that turns scattered conversation 
 
 [![GitHub](https://img.shields.io/github/stars/AliceLJY/recallnest?style=social)](https://github.com/AliceLJY/recallnest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Runtime](https://img.shields.io/badge/Runtime-Bun_|_Node.js_22+-f9f1e1?logo=bun)](https://bun.sh)
+[![Runtime](https://img.shields.io/badge/Runtime-Bun-f9f1e1?logo=bun)](https://bun.sh)
 [![LanceDB](https://img.shields.io/badge/LanceDB-Vector+FTS-orange)](https://lancedb.com)
 [![MCP](https://img.shields.io/badge/MCP-44_tools-blue)](https://modelcontextprotocol.io)
 [![CI](https://github.com/AliceLJY/recallnest/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLJY/recallnest/actions/workflows/ci.yml)
@@ -235,7 +235,7 @@ npm install -g recallnest      # install globally
 recallnest doctor
 ```
 
-Works with Node.js 22+ (via tsx) or Bun. No git clone needed.
+Requires [Bun](https://bun.sh): RecallNest does not run on Node.js. The npm launcher only hands off to Bun, and exits with install instructions if `bun` is not on your PATH. No git clone needed.
 
 ### Option C: Manual setup
 

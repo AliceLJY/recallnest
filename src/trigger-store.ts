@@ -311,6 +311,7 @@ export class TriggerStore {
    * 句柄可能停在等锁之前看到的版本，锁内的读（现有行的 created_at、删前计数）要看到别的进程刚提交的行。
    */
   private withSharedLock<T>(fn: (table: LanceDB.Table) => Promise<T>): Promise<T> {
+    // lock-wait: no store-write inside — fn only touches the memory_triggers side table.
     return withCrossProcessLock(triggerWriteLockKey(this.config.dbPath), async () => {
       const table = this.table!;
       await table.checkoutLatest();

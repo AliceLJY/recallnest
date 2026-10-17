@@ -68,15 +68,15 @@ describe("POST /v1/checkpoint status codes", () => {
     expect(payload.error).toContain("lock 'checkpoint-save' timed out");
   });
 
-  it("a real wait on the checkpoint save lock times out with LockTimeoutError, message unchanged", async () => {
+  it("a real wait on the checkpoint save lock times out with LockTimeoutError, same message prefix", async () => {
     const dir = tempDir();
-    const opts = { lockDir: dir, expireMs: 60_000 };
+    const opts = { lockDir: dir, maxHoldMs: 60_000 };
     const inner = withWriteLock(CHECKPOINT_SAVE_LOCK_KEY, async () => {
       await withWriteLock(CHECKPOINT_SAVE_LOCK_KEY, async () => undefined, { ...opts, waitTimeoutMs: 150, pollMs: 25 });
     }, opts);
     const err = await inner.then(() => null, (e: unknown) => e);
     expect(err).toBeInstanceOf(LockTimeoutError);
-    expect((err as Error).message).toBe(`lock '${CHECKPOINT_SAVE_LOCK_KEY}' timed out after 150ms (held by another process)`);
+    expect((err as Error).message).toStartWith(`lock '${CHECKPOINT_SAVE_LOCK_KEY}' timed out after 150ms (held by `);
   });
 
   it("still answers 400 for a body that fails validation, without touching the store", async () => {

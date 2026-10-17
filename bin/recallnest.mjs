@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 /**
- * RecallNest CLI launcher — cross-runtime compatible
+ * RecallNest CLI launcher.
  *
- * Priority: bun (native TS, fastest) → node + tsx (fallback)
+ * RecallNest runs on Bun only: its cross-process lock calls flock(2) through bun:ffi
+ * (src/flock.ts), which Node cannot load. This launcher is plain JavaScript so that `npx` /
+ * a global npm install can start it under any runtime; it only ever hands off to Bun, and
+ * without Bun it exits with instructions instead of trying another runtime.
  */
 import { spawn, execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync } from "node:fs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const cli = join(__dirname, "..", "src", "cli.ts");
@@ -22,41 +24,22 @@ function hasBun() {
   }
 }
 
-function run(command, commandArgs) {
-  const child = spawn(command, commandArgs, { stdio: "inherit" });
-  child.on("close", (code) => process.exit(code || 0));
-  child.on("error", (err) => {
-    console.error(`Failed to start ${command}: ${err.message}`);
-    process.exit(1);
-  });
-}
+if (!hasBun()) {
+  console.error(`
+  RecallNest requires Bun (https://bun.sh) — it does not run on Node.js.
 
-if (hasBun()) {
-  // Native bun — fastest path
-  run("bun", ["run", cli, ...args]);
-} else {
-  // Fallback: node + tsx
-  const tsxBin = join(__dirname, "..", "node_modules", ".bin", "tsx");
-  if (existsSync(tsxBin)) {
-    run(tsxBin, [cli, ...args]);
-  } else {
-    // tsx not found in local node_modules, try global
-    try {
-      execFileSync("tsx", ["--version"], { stdio: "ignore" });
-      run("tsx", [cli, ...args]);
-    } catch {
-      console.error(`
-  RecallNest requires either Bun or tsx to run TypeScript.
+  Install Bun:
+    curl -fsSL https://bun.sh/install | bash      # macOS / Linux
+    brew install oven-sh/bun/bun                  # or with Homebrew
 
-  Option A (recommended):
-    curl -fsSL https://bun.sh/install | bash
-
-  Option B:
-    npm install -g tsx
-
-  Then retry your command.
+  Then open a new shell (so \`bun\` is on PATH) and retry your command.
 `);
-      process.exit(1);
-    }
-  }
+  process.exit(1);
 }
+
+const child = spawn("bun", ["run", cli, ...args], { stdio: "inherit" });
+child.on("close", (code) => process.exit(code || 0));
+child.on("error", (err) => {
+  console.error(`Failed to start bun: ${err.message}`);
+  process.exit(1);
+});
