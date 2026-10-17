@@ -1,7 +1,9 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { basename, join, resolve } from "node:path";
 
 import { metaDir } from "./compat.js";
+import { withWriteLock } from "./distill-lock.js";
 import type { SessionCheckpointRecord } from "./session-schema.js";
 import { SessionCheckpointRecordSchema } from "./session-schema.js";
 import { isFallbackSummary, normalizeCheckpointScope, type CheckpointQuality } from "./session-engine.js";
@@ -17,6 +19,9 @@ export function classifyCheckpointQuality(record: SessionCheckpointRecord): Chec
 export function checkpointFileName(record: Pick<SessionCheckpointRecord, "updatedAt" | "checkpointId">): string {
   return `${record.updatedAt.replace(/[:.]/g, "-")}-${record.checkpointId}.json`;
 }
+
+/** Named write lock held while a checkpoint file is published and older same-id files are removed. */
+export const CHECKPOINT_SAVE_LOCK_KEY = "checkpoint-save";
 
 export interface SessionCheckpointQuery {
   sessionId?: string;
@@ -77,18 +82,56 @@ export class SessionCheckpointStore {
     return ensureDir(this.dir);
   }
 
+  /**
+   * Write the new version to a temp file, rename it into place, and only then remove
+   * older files with the same checkpointId. Any failure throws, so a failed save never
+   * deletes the previous version and is never reported as a success.
+   */
   async save(record: SessionCheckpointRecord): Promise<SessionCheckpointRecord> {
     const parsed = SessionCheckpointRecordSchema.parse(record);
-    const path = join(this.dataDir, checkpointFileName(parsed));
+    const dir = this.dataDir;
+    // Publication and the same-id sweep run under one cross-process lock: without it two
+    // processes saving the same id could each rename their file in, then each delete the
+    // other's, leaving nothing. The lock lives in the checkpoint directory itself so every
+    // process writing that directory shares it, whatever its data dir; it ends in ".lock",
+    // so listRecent / gc never read it.
+    return withWriteLock(CHECKPOINT_SAVE_LOCK_KEY, async () => this.publish(dir, parsed), {
+      lockDir: dir,
+      expireMs: 60_000,
+    });
+  }
+
+  private publish(dir: string, parsed: SessionCheckpointRecord): SessionCheckpointRecord {
+    const fileName = checkpointFileName(parsed);
+    const path = join(dir, fileName);
+    // Not ending in ".json", so listRecent / gc / the same-id sweep below never see it.
+    const tmpPath = join(dir, `.${fileName}.${process.pid}-${randomUUID()}.tmp`);
     try {
-      const suffix = `-${parsed.checkpointId}.json`;
-      for (const name of readdirSync(this.dataDir).filter((item) => item.endsWith(suffix))) {
-        const existingPath = join(this.dataDir, name);
-        if (existingPath !== path) unlinkSync(existingPath);
-      }
-      writeFileSync(path, JSON.stringify(parsed, null, 2) + "\n");
+      writeFileSync(tmpPath, JSON.stringify(parsed, null, 2) + "\n");
+      renameSync(tmpPath, path);
     } catch (err) {
-      console.error("[recallnest] Failed to save session checkpoint:", err instanceof Error ? err.message : String(err));
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        // The temp file may never have been created.
+      }
+      throw new Error(`Failed to save session checkpoint ${parsed.checkpointId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    const suffix = `-${parsed.checkpointId}.json`;
+    const stale = readdirSync(dir).filter((name) => name.endsWith(suffix) && name !== fileName);
+    const cleanupErrors: string[] = [];
+    for (const name of stale) {
+      try {
+        unlinkSync(join(dir, name));
+      } catch (err) {
+        cleanupErrors.push(`${name}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      throw new Error(
+        `Saved session checkpoint ${parsed.checkpointId} to ${fileName}, but could not remove older versions (retrying the save is safe): ${cleanupErrors.join("; ")}`,
+      );
     }
     return parsed;
   }
