@@ -314,6 +314,8 @@ Each memory item supports:
 
 Each item may also carry `disposition = "conflict"` and a `conflictId` when batch input reuses an existing `canonicalKey` under a different durable category.
 
+Top-level `stored` is the number of items that actually landed in the table (`disposition` is `stored`, `updated` or `promoted`), not the number of items sent. Every item keeps its own `disposition` (same values as [`/v1/store`](#store)); a `rejected` item also carries `rejectionReason`. The status is `201` when at least one item was written, `200` when none was.
+
 ---
 
 ## Pattern (Structured Workflow Capture)
@@ -364,6 +366,7 @@ Store a reusable workflow as durable `patterns` memory.
 {
   "id": "f0e1d2c3-...",
   "stored": true,
+  "disposition": "stored",
   "category": "patterns",
   "title": "Cross-window continuity handoff",
   "scope": "memory:agent",
@@ -371,6 +374,8 @@ Store a reusable workflow as durable `patterns` memory.
   "storedAt": "2026-03-16T08:10:00.000Z"
 }
 ```
+
+`stored` and the status follow the same rule as [`/v1/store`](#store): `true` with `201` only when `disposition` is `stored`, `updated` or `promoted`. Writing an identical pattern again returns `200`, `stored: false`, `disposition: "deduped"` and the existing memory's `id`; a canonical-key clash with another category returns `200`, `stored: false`, `disposition: "conflict"` plus `conflictId`.
 
 ---
 
@@ -417,6 +422,8 @@ Store a reusable problem-solution case as durable `cases` memory.
 | `source` | string | no | `"agent"` | One of: `manual`, `agent`, `api` |
 | `tags` | string[] | no | `[]` | Optional tags; `case` and `solution` are auto-added |
 | `canonicalKey` | string | no | derived from title | Optional stable key for dedupe/update semantics |
+
+**Response:** same shape and the same `stored` / status rule as [`/v1/pattern`](#pattern-structured-workflow-capture), with `category: "cases"` and `case` / `solution` in `tags`.
 
 ---
 
@@ -468,6 +475,8 @@ Promote an evidence memory into durable memory.
   "canonicalKey": "user-reply-style"
 }
 ```
+
+`disposition` is `promoted` when the evidence landed in durable memory, including when it was folded into an existing durable entry with the same text; that is `201` with `stored: true`. A canonical-key clash returns `200`, `stored: false`, `disposition: "conflict"` plus `conflictId`.
 
 When a promotion would overwrite an existing durable memory with the same `canonicalKey`, RecallNest now creates an open conflict candidate instead of silently applying `latest-wins`.
 
