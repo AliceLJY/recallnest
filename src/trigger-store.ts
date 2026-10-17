@@ -216,9 +216,17 @@ export class TriggerStore {
   }
 
   /**
-   * 覆盖式写入一条记忆的全部 trigger：先删旧行再加新行，同一 memory_id 永远只有一组。
+   * 覆盖式写入一条记忆的全部 trigger，同一 memory_id 永远只有一组。
    * `embed` 由调用方传入（应为 embedQuery 批量版），这里不持有 embedder。
    * 返回实际写入的条数；texts 规整后为空则只删不加、返回 0。
+   *
+   * 先嵌入、后动表（2026-10-17）：嵌入是网络调用，原先先删旧行再嵌入，嵌入一失败旧 trigger 就全没了。
+   * 现在嵌入失败或条数对不上时直接抛错，表一行不动。
+   * 换新用一次 mergeInsert 完成：按 id 覆盖或插入新行，同一个提交里删掉这条记忆其余的旧行
+   * （whenNotMatchedBySourceDelete 限定在本 memory_id）。原先的「delete + add」是两次提交、写锁又只管
+   * 本进程，两个进程同时重写同一条记忆会各删一遍、各加一遍，写出两组行；按 id 合并后，
+   * 无论两次提交谁先谁后，表里都只剩其中一次写入的那一组。
+   * 嵌入放在写锁里面：同一进程里先后两次重写，后发起的那次一定后落表。
    */
   async upsertForMemory(
     memoryId: string,
@@ -229,8 +237,11 @@ export class TriggerStore {
     const cleaned = normalizeTriggerTexts(texts);
     return this.withWriteLock(async () => {
       await this.ensureInitialized();
-      await this.table!.delete(`memory_id = '${escapeSqlLiteral(memoryId)}'`);
-      if (cleaned.length === 0) return 0;
+      const where = `memory_id = '${escapeSqlLiteral(memoryId)}'`;
+      if (cleaned.length === 0) {
+        await this.table!.delete(where);
+        return 0;
+      }
       const vectors = await embed(cleaned);
       if (vectors.length !== cleaned.length) {
         throw new Error(`TriggerStore: embed returned ${vectors.length} vectors for ${cleaned.length} texts`);
@@ -244,7 +255,11 @@ export class TriggerStore {
         vector: vectors[i],
         created_at: now,
       }));
-      await this.table!.add(rows);
+      await this.table!.mergeInsert("id")
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .whenNotMatchedBySourceDelete({ where })
+        .execute(rows);
       return rows.length;
     });
   }
