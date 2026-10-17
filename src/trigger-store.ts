@@ -21,6 +21,7 @@ import { matchesScopeFilter, type ScopeMatchMode } from "./scope-policy.js";
 import { readConsistencyInterval as envReadConsistencyInterval } from "./env-config.js";
 import { logWarn } from "./stderr-log.js";
 import { textOverlapScore, tokenize } from "./multi-vector.js";
+import { redactSecrets } from "./pii-detector.js";
 
 export const TRIGGER_TABLE_NAME = "memory_triggers";
 
@@ -76,14 +77,18 @@ export interface TriggerStoreStats {
   memories: number;
 }
 
-/** 规整 trigger 文本：去空白、去重（不分大小写）、丢太短太长的、封顶 6 条。 */
+/**
+ * 规整 trigger 文本：脱敏、去空白、去重（不分大小写）、丢太短太长的、封顶 6 条。
+ * 脱敏放在这里（2026-10-17）：trigger 原文会进 metadata.triggers、侧表和外部嵌入接口，
+ * 写入、回填、侧表重建都经过这一个函数。
+ */
 export function normalizeTriggerTexts(texts: readonly string[] | undefined | null): string[] {
   if (!texts || texts.length === 0) return [];
   const seen = new Set<string>();
   const out: string[] = [];
   for (const raw of texts) {
     if (typeof raw !== "string") continue;
-    const text = raw.replace(/\s+/g, " ").trim().replace(/[。．.！!？?；;，,、]+$/u, "").trim();
+    const text = redactSecrets(raw, { keepIdentifiers: true }).text.replace(/\s+/g, " ").trim().replace(/[。．.！!？?；;，,、]+$/u, "").trim();
     if (text.length < MIN_TRIGGER_LENGTH || text.length > MAX_TRIGGER_LENGTH) continue;
     const key = text.toLowerCase();
     if (seen.has(key)) continue;
@@ -102,8 +107,11 @@ export function normalizeTriggerTexts(texts: readonly string[] | undefined | nul
  * 只认正文里已经写下的话，不生成、不改写——生成是另一条线（qwen-turbo，按 T-Mem 三条禁令），
  * 且要等批量提炼那批的忠实度有结论再做。
  */
-export function extractTriggerCandidates(text: string): string[] {
-  if (!text) return [];
+export function extractTriggerCandidates(source: string): string[] {
+  if (!source) return [];
+  // 先对整段原文脱敏再拆：按 `/` 拆会把 `https://user:密码@host` 拆成不带 scheme 的
+  // `user:密码@host`，规整时的脱敏就认不出来了（回填会把它嵌入、写进侧表与 metadata）。
+  const text = redactSecrets(source, { keepIdentifiers: true }).text;
   const lead = /(她以后[^。\n]{0,6}问[起法]?|她(?:大概|可能|应该|以后)?会(?:这么|这样|怎么|这样子)?(?:问|说|提)(?:起)?|检索锚点|以后[^。\n]{0,8}问起|下次[^。\n]{0,6}(?:会|再)[^。\n]{0,4}(?:问|提))/gu;
   // 取**最后一次**出现：这句纪律写在正文末尾（09-22 实测 98% 在最后 30%），
   // 正文中段提到「她以后会怎么问」多半是在讨论这条纪律本身（如本项目自己的记忆），不是问法。
