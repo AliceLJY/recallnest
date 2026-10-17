@@ -202,8 +202,11 @@ export type BeliefReplaceResult =
  *
  * Time: unless `options.now` is given, the single timestamp used for the history row's
  * validUntil, the canonical row's timestamp / validFrom (via ctx.now) and the returned
- * validUntil is taken inside the lock, and never earlier than the re-read row's own
- * timestamp or validFrom. Taking it before the lock (and before vector resolution) let a
+ * validUntil is taken inside the lock, and is strictly later than the re-read row's own
+ * timestamp and validFrom. Strictly: history ids hash (canonical id, timestamp, text), so a
+ * revision time that repeats (canonical timestamp in the future because another machine's
+ * clock is fast) would let A → B → A → C reuse version 1's history id, overwrite it and close
+ * an A↔B backward-link cycle. Taking it before the lock (and before vector resolution) let a
  * replacement that committed in between leave a history row with validFrom > validUntil and
  * move the canonical timestamp backwards.
  *
@@ -223,7 +226,7 @@ export async function replaceBeliefVersion(
   const result = await deps.store.replaceWithArchivedVersion(expected.id, (current) => {
     if (options.skip?.(current)) return null;
     const previousEvolution = parseEvolution(current.metadata, current.timestamp);
-    const now = options.now ?? Math.max(Date.now(), current.timestamp, previousEvolution.validFrom);
+    const now = options.now ?? Math.max(Date.now(), current.timestamp + 1, previousEvolution.validFrom + 1);
     lockedNow = now;
     const vector = current.vector.length > 0
       ? current.vector

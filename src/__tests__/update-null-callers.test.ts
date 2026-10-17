@@ -37,6 +37,15 @@ function storeWithVanished(rows: MemoryEntry[], vanished: Set<string>) {
     async getById(id: string) {
       return data.get(id) ?? null;
     },
+    /** 与 MemoryStore.patchMetadata 同义：以「此刻」库里的 metadata 为底座应用 patchFn */
+    async patchMetadata(id: string, patchFn: (meta: Record<string, unknown>) => Record<string, unknown>) {
+      if (vanished.has(id)) return null;
+      const row = data.get(id);
+      if (!row) return null;
+      row.metadata = JSON.stringify(patchFn(JSON.parse(row.metadata ?? "{}") as Record<string, unknown>));
+      updates.push({ id, metadata: row.metadata });
+      return row;
+    },
     async update(id: string, upd: { metadata?: string; importance?: number }) {
       if (vanished.has(id)) return null;
       const row = data.get(id);
@@ -107,6 +116,51 @@ describe("createVersionGroup：任一行已被删 → 不成组", () => {
     expect(canonMeta.version_rank).toBeUndefined();
     expect(canonMeta.version_created).toBeUndefined();
     expect(canonMeta.confidence).toBe(1);
+  });
+
+  it("member 已被删、撤回新组时 canonical 已被别的写方改过 metadata → 只撤三个组字段，别人的改动保留", async () => {
+    const canonical = entry("canon", { confidence: 1 });
+    const member = entry("member", { confidence: 0.5 });
+    const store = storeWithVanished([canonical, member], new Set(["member"]));
+    // 别的写方的提交恰好落在「canonical 打上组标记」与「撤回」之间
+    const originalUpdate = store.update.bind(store);
+    let interleaved = false;
+    store.update = async (id, upd) => {
+      const result = await originalUpdate(id, upd);
+      if (id === "canon" && result && !interleaved) {
+        interleaved = true;
+        const meta = JSON.parse(result.metadata!) as Record<string, unknown>;
+        meta.note = "written by another process";
+        result.metadata = JSON.stringify(meta);
+      }
+      return result;
+    };
+    expect(await createVersionGroup(store as never, canonical, member, "project:test")).toBeNull();
+    const canonMeta = JSON.parse(store.data.get("canon")!.metadata!) as Record<string, unknown>;
+    expect(canonMeta.note).toBe("written by another process");
+    expect(canonMeta.version_group).toBeUndefined();
+    expect(canonMeta.version_rank).toBeUndefined();
+    expect(canonMeta.version_created).toBeUndefined();
+  });
+
+  it("member 已被删、撤回前别的写方已把 canonical 并进另一个组 → 不动那个组", async () => {
+    const canonical = entry("canon", { confidence: 1 });
+    const member = entry("member", { confidence: 0.5 });
+    const store = storeWithVanished([canonical, member], new Set(["member"]));
+    const originalUpdate = store.update.bind(store);
+    let interleaved = false;
+    store.update = async (id, upd) => {
+      const result = await originalUpdate(id, upd);
+      if (id === "canon" && result && !interleaved) {
+        interleaved = true;
+        const meta = JSON.parse(result.metadata!) as Record<string, unknown>;
+        meta.version_group = "group-set-by-another-process";
+        result.metadata = JSON.stringify(meta);
+      }
+      return result;
+    };
+    expect(await createVersionGroup(store as never, canonical, member, "project:test")).toBeNull();
+    expect(JSON.parse(store.data.get("canon")!.metadata!).version_group).toBe("group-set-by-another-process");
   });
 
   it("member 已被删、canonical 原本就在组里：返回 null，canonical 的组不动", async () => {

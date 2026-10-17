@@ -584,4 +584,120 @@ describe("update() 与信念归档在写锁内读最新行（跨进程）", () =
     expect(evo.supersedes).toBe("history-of-version-2");
     expect((await allRows(a)).length).toBe(countBefore);
   }, 60_000);
+  // ── re-review 之后的修复（2026-10-17）────────────────────────────────────────────
+
+  /** 绕过 store 直接改那一行（别的进程 / 别的机器的提交） */
+  async function rewriteRow(store: MemoryStore, id: string, patch: (row: Record<string, unknown>, meta: Record<string, unknown>) => Record<string, unknown>): Promise<void> {
+    await store.getById(id);
+    const table = tableOf(store);
+    const [row] = await table.query().where(`id = '${id}'`).limit(1).toArray();
+    const meta = JSON.parse(String(row.metadata)) as Record<string, unknown>;
+    await table.mergeInsert("id").whenMatchedUpdateAll().execute([{ ...patch(row, meta), vector: Array.from(row.vector as Iterable<number>) }]);
+  }
+
+  it("A1 修订时间严格递增：原行 timestamp 在未来（别的机器时钟快）时 A→B→A→C 得到 3 条不同的历史行、没有环", async () => {
+    const { a } = await setup();
+    const future = Date.now() + 60_000;
+    await rewriteRow(a, ID, (row, meta) => {
+      meta.evolution = { status: "active", version: 1, validFrom: future };
+      return { ...row, timestamp: future, metadata: JSON.stringify(meta) };
+    });
+    const TEXT_B = "第二版：回复先列风险，再给结论，理由放最后，越短越好。";
+    const TEXT_C = "第四版：回复只给结论和下一步，风险另起一段，不写理由。";
+    const timestamps: number[] = [future];
+    for (const text of [TEXT_B, OLD_TEXT, TEXT_C]) {
+      const latest = (await a.getById(ID))!;
+      const result = await writeDurableEntry(depsFor(a), revisionInput({ text, precomputedMatches: [latest] }));
+      expect(result.disposition).toBe("updated");
+      timestamps.push(result.entry.timestamp);
+    }
+    for (let i = 1; i < timestamps.length; i++) expect(timestamps[i]).toBeGreaterThan(timestamps[i - 1]);
+
+    const rows = await allRows(a);
+    const history = historyRows(rows);
+    expect(history).toHaveLength(3);
+    expect(new Set(history.map((h) => h.id)).size).toBe(3);
+    // 从原行沿 supersedes 往回走：C → 第 3 版（A）→ 第 2 版（B）→ 第 1 版（A），不重复、到头为止
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const visited: string[] = [];
+    let cursor = parseEvolution(byId.get(ID)!.metadata).supersedes ?? null;
+    while (cursor) {
+      expect(visited).not.toContain(cursor);
+      visited.push(cursor);
+      cursor = parseEvolution(byId.get(cursor)!.metadata).supersedes ?? null;
+    }
+    expect(visited.map((id) => byId.get(id)!.text)).toEqual([OLD_TEXT, TEXT_B, OLD_TEXT]);
+    for (const h of history) {
+      const evo = parseEvolution(h.metadata);
+      expect(evo.validFrom).toBeLessThan(evo.validUntil!);
+    }
+  });
+
+  for (const status of ["archived", "consolidated"] as const) {
+    it(`B1 确定性 id 分支：扫描窗口内 ${status} 的同文行 → 不去重，设回 active 并留一条历史行`, async () => {
+      const targetId = deterministicId(SCOPE, KEY);
+      const { a } = await setup(seedEntry(targetId));
+      await rewriteRow(a, targetId, (row, meta) => {
+        meta.evolution = { ...(meta.evolution as Record<string, unknown>), status };
+        return { ...row, metadata: JSON.stringify(meta) };
+      });
+      // 不传 precomputedMatches：真去扫，它就在窗口里，但 findCanonicalMatches 只收活跃行
+      const result = await writeDurableEntry(depsFor(a), revisionInput({ text: OLD_TEXT }));
+      expect(result.disposition).toBe("stored");
+      expect(result.supersededPrevious).toBe(true);
+      const canonical = (await a.getById(targetId))!;
+      expect(canonical.text).toBe(OLD_TEXT);
+      expect(parseEvolution(canonical.metadata).status).toBe("active");
+      const history = historyRows(await allRows(a));
+      expect(history).toHaveLength(1);
+      expect(history[0].text).toBe(OLD_TEXT);
+      expect(parseEvolution(canonical.metadata).supersedes).toBe(history[0].id);
+    });
+  }
+
+  it("B2 确定性 id 分支：archived 的同文行 + promotedFrom → 报 promoted，并设回 active、留历史行", async () => {
+    const targetId = deterministicId(SCOPE, KEY);
+    const { a } = await setup(seedEntry(targetId));
+    await rewriteRow(a, targetId, (row, meta) => {
+      meta.evolution = { ...(meta.evolution as Record<string, unknown>), status: "archived" };
+      return { ...row, metadata: JSON.stringify(meta) };
+    });
+    const result = await writeDurableEntry(depsFor(a), revisionInput({ text: OLD_TEXT, promotedFrom: "source-1", precomputedMatches: [] }));
+    expect(result.disposition).toBe("promoted");
+    expect(parseEvolution((await a.getById(targetId))!.metadata).status).toBe("active");
+    expect(historyRows(await allRows(a))).toHaveLength(1);
+  });
+
+  it("B3 活跃的同文行照旧去重：扫描窗口内（exact）与确定性 id 直查两条路都 deduped、不多出行", async () => {
+    const targetId = deterministicId(SCOPE, KEY);
+    const { a } = await setup(seedEntry(targetId));
+    const before = (await a.getById(targetId))!;
+    const viaScan = await writeDurableEntry(depsFor(a), revisionInput({ text: OLD_TEXT }));
+    expect(viaScan.disposition).toBe("deduped");
+    const viaId = await writeDurableEntry(depsFor(a), revisionInput({ text: OLD_TEXT, precomputedMatches: [] }));
+    expect(viaId.disposition).toBe("deduped");
+    expect((await a.getById(targetId))!.metadata).toBe(before.metadata);
+    expect(await allRows(a)).toHaveLength(1);
+  });
+
+  it("B4 锁内重读：等锁期间别的进程把它改成同文但 archived → 不按 unchanged 去重，替换并设回 active", async () => {
+    const targetId = deterministicId(SCOPE, KEY);
+    const { a, b } = await setup(seedEntry(targetId));
+    let pending: Promise<Awaited<ReturnType<typeof writeDurableEntry>>> | undefined;
+    await withWriteLock("store-write", async () => {
+      pending = writeDurableEntry(depsFor(a), revisionInput({ precomputedMatches: [] })); // A 在锁外看到的是旧正文
+      await sleep(200);
+      await rewriteRow(b, targetId, (row, meta) => {
+        meta.evolution = { ...(meta.evolution as Record<string, unknown>), status: "archived" };
+        return { ...row, text: NEW_TEXT, metadata: JSON.stringify(meta) };
+      });
+    });
+    const result = await pending!;
+    expect(result.disposition).toBe("stored");
+    expect(result.supersededPrevious).toBe(true);
+    const canonical = (await a.getById(targetId))!;
+    expect(canonical.text).toBe(NEW_TEXT);
+    expect(parseEvolution(canonical.metadata).status).toBe("active");
+    expect(historyRows(await allRows(a)).map((h) => h.text)).toEqual([NEW_TEXT]);
+  });
 });

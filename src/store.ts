@@ -1233,6 +1233,10 @@ export class MemoryStore implements MemoryStorePort {
    * - 原行在重读时已不在，或在写历史行之后、更新原行之前被不拿锁的 delete() 删掉：撤掉本次写的历史行
    *   （它在本次之前就已存在则不动），结果为 missing，库里不留下指向不存在原行的历史行；撤销本身失败只记日志，仍返回 missing。
    * - 更新原行抛错时同样撤掉本次写的历史行，再把错误抛出去。
+   *
+   * 已知局限：历史行 id 在本次之前就已存在时，这里照样整行覆盖它，失败时也不还原（undoHistory 只删本次新建的）。
+   * 历史行 id 按内容寻址（原行 id、timestamp、正文），所以只有同一版本先前写到一半（历史行写了、原行没更新）
+   * 之后重试才会撞上，覆盖进去的也是同一版本的内容。
    */
   async replaceWithArchivedVersion(
     fullId: string,

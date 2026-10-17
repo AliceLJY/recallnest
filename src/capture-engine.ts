@@ -755,13 +755,18 @@ export async function writeDurableEntry(
   if (targetId && deps.store.getById) {
     const rowAtTargetId = await deps.store.getById(targetId);
     const normalizedIncomingText = normalizeMemoryText(params.text);
-    // 那一行已经是这段正文：与上面 exact 命中同样处理（promotedFrom 时追加晋升来源、报 promoted，否则 deduped），
+    // 那一行活跃、且已经是这段正文：与上面 exact 命中同样处理（promotedFrom 时追加晋升来源、报 promoted，否则 deduped），
     // 不落到 store()——store() 用 params.metadata 整行覆盖，会抹掉它的 evolution（version / supersedes）。
     // 扫描窗口外的 canonical 行只会走到这里，exact 分支看不见它（2026-10-17 owner review）。
+    // 不活跃的同文行（auto-gc / 对账原地 archived、consolidated，id 不变）不去重：findCanonicalMatches 把它们滤掉了才会
+    // 走到这里，去重会让它照旧不活跃、默认召回看不见。它和异文一样走下面的替换——留历史行、原行设回 active
+    // （promotedFrom 也一样：appendPromotionObservationToExistingEntry 不会把它重新激活）。
     const sameText = async (existing: MemoryEntry) => params.promotedFrom
       ? { entry: await appendPromotionObservationToExistingEntry(deps.store, existing, params.metadata), disposition: "promoted" as const }
       : { entry: existing, disposition: "deduped" as const };
-    if (rowAtTargetId && normalizeMemoryText(rowAtTargetId.text) === normalizedIncomingText) {
+    const isLiveSameText = (row: MemoryEntry) =>
+      isActiveMemory(row.metadata) && normalizeMemoryText(row.text) === normalizedIncomingText;
+    if (rowAtTargetId && isLiveSameText(rowAtTargetId)) {
       return await sameText(rowAtTargetId);
     }
     const atomic = atomicBeliefDeps(deps);
@@ -782,7 +787,7 @@ export async function writeDurableEntry(
           language: params.language || "en",
           fts_text: params.fts_text || params.text,
         }),
-        { skip: (current) => normalizeMemoryText(current.text) === normalizedIncomingText },
+        { skip: isLiveSameText },
       );
       if (replaced.status === "replaced") {
         return {
@@ -792,7 +797,7 @@ export async function writeDurableEntry(
         };
       }
       if (replaced.status === "unchanged") {
-        // 锁内重读发现那一行已经是这段正文（别的进程刚写过同文、带着它自己的版本链）：同上，不再 store()
+        // 锁内重读发现那一行活跃、且已经是这段正文（别的进程刚写过同文、带着它自己的版本链）：同上，不再 store()
         return await sameText(replaced.current);
       }
     } else if (rowAtTargetId) {

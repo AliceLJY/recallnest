@@ -120,7 +120,7 @@ export function computeVersionGroupPatch(
  * @returns The version_group ID, or null when either row was deleted before it could be tagged
  */
 export async function createVersionGroup(
-  store: Pick<MemoryStorePort, "update">,
+  store: Pick<MemoryStorePort, "update" | "patchMetadata">,
   canonical: MemoryEntry,
   member: MemoryEntry,
   scope: string,
@@ -151,8 +151,11 @@ export async function createVersionGroup(
   if (!memberUpdated) {
     // Member vanished: a group created just now would be left with the canonical alone —
     // take the three group keys back off it. A pre-existing group keeps its other members.
+    // Rolled back through the locked read-modify-write: it re-reads the canonical's current
+    // metadata and clears the three keys only while the group is still the one set here, so
+    // another writer's metadata committed since is kept (the stale canonMeta snapshot is not).
     if (!existingGroup) {
-      await store.update(canonical.id, { metadata: JSON.stringify(clearVersionGroupMetadata(canonMeta, groupId)) }, [scope]);
+      await store.patchMetadata(canonical.id, (meta) => clearVersionGroupMetadata(meta, groupId), [scope]);
     }
     return null;
   }
