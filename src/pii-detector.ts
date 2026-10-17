@@ -48,6 +48,32 @@ interface PIIRule {
    *  true (scan still warns regardless). Keeps snowflake IDs / order numbers
    *  from being destructively rewritten. */
   validate?: (match: string) => boolean;
+  /** With `{ keepIdentifiers: true }`, leave matches this returns true for
+   *  intact — for fields that hold names (keys, tags, triggers), not prose. */
+  isIdentifier?: (match: string) => boolean;
+}
+
+export interface RedactOptions {
+  /**
+   * Skip matches that are ordinary dotted identifiers (`workflow.database.recovery`)
+   * rather than credentials. Off by default: memory text keeps the original rule
+   * set byte for byte, so deterministic ids of already-stored rows still match.
+   */
+  keepIdentifiers?: boolean;
+}
+
+/**
+ * A dot-separated name whose parts are plain words: lowercase, camelCase,
+ * PascalCase or all-caps letters, joined by `_`/`-`, plus short version-style
+ * numbers (`v2`, `2026`). Opaque token segments mix letters and digits or
+ * flip case mid-run, so they fail this.
+ */
+function isOrdinaryDottedIdentifier(match: string): boolean {
+  return match.split(".").every((segment) => {
+    const pieces = segment.split(/[_-]+/).filter(Boolean);
+    return pieces.length > 0 && pieces.every((piece) =>
+      /^(?:[A-Z]?[a-z]+(?:[A-Z][a-z]+)*|[A-Z]+|v?\d{1,4})$/.test(piece));
+  });
 }
 
 /** GB 11643 checksum (ISO 7064 MOD 11-2) for 18-digit Chinese national IDs. */
@@ -157,6 +183,7 @@ const PII_RULES: PIIRule[] = [
     severity: "high",
     pattern: /\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
     redact: true,
+    isIdentifier: isOrdinaryDottedIdentifier,
   },
   {
     type: "bearer_token",
@@ -265,7 +292,7 @@ export function scanForPII(text: string): PIIScanResult {
  * Replacement is `[REDACTED:<type>]`; assignment-style rules keep the key
  * name (`password=[REDACTED:password]`) so the memory stays readable.
  */
-export function redactSecrets(text: string): RedactResult {
+export function redactSecrets(text: string, options: RedactOptions = {}): RedactResult {
   let out = text;
   let redacted = 0;
 
@@ -275,6 +302,9 @@ export function redactSecrets(text: string): RedactResult {
     out = out.replace(rule.pattern, (match) => {
       if (rule.validate && !rule.validate(match)) {
         return match; // checksum failed → leave intact (detection-only)
+      }
+      if (options.keepIdentifiers && rule.isIdentifier?.(match)) {
+        return match;
       }
       redacted++;
       if (rule.replacement) return rule.replacement(match);
