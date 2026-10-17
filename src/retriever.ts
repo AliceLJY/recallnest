@@ -8,7 +8,7 @@ import type { Embedder } from "./embedder.js";
 import { filterNoise } from "./noise-filter.js";
 import * as envConfig from "./env-config.js";
 import { extractErrorSignatures } from "./error-signature.js";
-import { shouldSkipRetrieval } from "./adaptive-retrieval.js";
+import { shouldSkipRetrievalFor } from "./adaptive-retrieval.js";
 import { expandQueryWithAliases } from "./aliases.js";
 import { expandQuery } from "./query-expander.js";
 import { detectLang, tokenizeFts } from "./language-hook.js";
@@ -180,6 +180,12 @@ export interface RetrievalContext {
    *  calls to prevent auto-recall from strengthening noise memories.
    *  Defaults to "manual" when unset (backward-compatible). */
   source?: "manual" | "auto-recall" | "cli";
+  /**
+   * Whether the trivial-query gate (shouldSkipRetrieval: greetings, command-like prefixes, short
+   * non-CJK phrases …) applies. Default: only when source is "auto-recall". Explicit searches that
+   * use source "auto-recall" just to avoid reinforcement writes pass false.
+   */
+  trivialQueryGate?: boolean;
   /** When false (default), archived records are excluded from results. */
   includeArchived?: boolean;
   /** Optional trace collector for per-stage pipeline observability. */
@@ -865,8 +871,9 @@ export class MemoryRetriever {
     const excluded = resolveExcludedScopes(context);
     const excludeScopes = excluded.length > 0 ? excluded : undefined;
 
-    // Adaptive retrieval: skip trivial queries to save embedding API calls
-    if (shouldSkipRetrieval(rawQuery)) {
+    // Adaptive retrieval: skip trivial queries to save embedding API calls — auto-recall only;
+    // explicit queries skip just empty / whitespace (see shouldSkipRetrievalFor).
+    if (shouldSkipRetrievalFor(context)) {
       return [];
     }
 
