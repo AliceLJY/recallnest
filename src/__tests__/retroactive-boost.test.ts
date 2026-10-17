@@ -220,4 +220,21 @@ describe("retroactive-boost (STC)", () => {
     expect(result.triggered).toBe(true);
     expect(result.boostedCount).toBe(0);
   });
+
+  it("does not count an entry whose update() returned null (row deleted after the search)", async () => {
+    const vanished = makeEntry("gone-1", "Singapore weather info", {
+      importance: 0.3,
+      timestamp: Date.now() - 30 * 86_400_000,
+    });
+    // vectorSearch still returns it, but the store no longer holds the row → update() returns null
+    const store = createMockStore([], [{ entry: vanished, score: 0.85 }]);
+    const newEntry = makeEntry("new-1", "I'm moving to Singapore", {
+      importance: 0.9,
+      vector: [1, 0, 0],
+    });
+
+    const result = await retroactiveBoost(store, newEntry);
+    expect(result.boostedCount).toBe(0);
+    expect(result.boostedIds).toEqual([]);
+  });
 });

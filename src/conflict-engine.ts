@@ -8,9 +8,14 @@ import {
   normalizeCanonicalKey,
   parseMetadataObject,
 } from "./memory-boundaries.js";
-import type { MemoryStore } from "./store.js";
-import { archiveBeliefVersion, buildSupersedingBeliefMetadata } from "./belief-history.js";
-import { parseEvolution } from "./memory-evolution.js";
+import type { MemoryEntry, MemoryStore } from "./store.js";
+import {
+  archiveBeliefVersion,
+  BeliefTargetMissingError,
+  buildSupersedingBeliefMetadata,
+  replaceBeliefVersion,
+} from "./belief-history.js";
+import { parseEvolution, type EvolutionMetadata } from "./memory-evolution.js";
 import {
   type ConflictCandidateInput,
   ConflictCandidateInputSchema,
@@ -98,7 +103,8 @@ function buildMergedConflictMetadata(
 
 export interface ResolveConflictDeps {
   // `store`/`upsert` are needed to archive the belief being replaced before overwriting it.
-  store: Pick<MemoryStore, "getById" | "update" | "store"> & Partial<Pick<MemoryStore, "upsert">>;
+  // replaceWithArchivedVersion (real MemoryStore) archives and overwrites under one store-write lock.
+  store: Pick<MemoryStore, "getById" | "update" | "store"> & Partial<Pick<MemoryStore, "upsert" | "replaceWithArchivedVersion">>;
   embedder: Pick<Embedder, "embedPassage">;
   conflictStore: Pick<ConflictCandidateStore, "getById" | "replace">;
 }
@@ -151,28 +157,50 @@ export async function resolveConflictCandidate(
     // Conflict resolution is the most deliberate belief change there is — accepting the
     // incoming version or merging both used to overwrite the existing row in place, losing
     // precisely the "before" side of the decision. Archive it first.
-    const resolvedAtMs = Date.now();
-    const previousEvo = parseEvolution(existing.metadata, existing.timestamp);
-    const { historyId } = await archiveBeliefVersion(
-      { store: deps.store, embedder: deps.embedder },
-      existing,
-      { now: resolvedAtMs },
-    );
-
-    const updated = await deps.store.update(existing.id, {
+    //
+    // With a full MemoryStore the archive and the overwrite share one store-write lock and the
+    // row is re-read inside it (2026-10-17): if it was deleted after the lookup above, nothing
+    // is written and this throws BeliefTargetMissingError — previously the history row was
+    // already committed when update() came back empty.
+    const resolution = input.resolution;
+    const buildUpdates = (current: MemoryEntry, previousEvo: EvolutionMetadata, historyId: string, resolvedAtMs: number) => ({
       text: nextText,
       vector,
-      importance: nextImportance,
+      importance: resolution === "merge" ? Math.max(current.importance, record.incoming.importance) : nextImportance,
       category: nextCategory,
       metadata: buildSupersedingBeliefMetadata(
         nextMetadata,
         previousEvo,
         historyId,
         resolvedAtMs,
-        `conflict:${input.resolution}`,
+        `conflict:${resolution}`,
       ),
       timestamp: resolvedAtMs,
     });
+
+    let updated: MemoryEntry | null;
+    const replace = deps.store.replaceWithArchivedVersion;
+    if (replace) {
+      const result = await replaceBeliefVersion(
+        {
+          store: { replaceWithArchivedVersion: replace.bind(deps.store), getById: deps.store.getById.bind(deps.store) },
+          embedder: deps.embedder,
+        },
+        existing,
+        ({ current, previousEvolution, historyId, now }) => buildUpdates(current, previousEvolution, historyId, now),
+      );
+      if (result.status !== "replaced") throw new BeliefTargetMissingError(existing.id);
+      updated = result.entry;
+    } else {
+      const resolvedAtMs = Date.now();
+      const previousEvo = parseEvolution(existing.metadata, existing.timestamp);
+      const { historyId } = await archiveBeliefVersion(
+        { store: deps.store, embedder: deps.embedder },
+        existing,
+        { now: resolvedAtMs },
+      );
+      updated = await deps.store.update(existing.id, buildUpdates(existing, previousEvo, historyId, resolvedAtMs));
+    }
     if (!updated) {
       throw new Error(`Failed to update durable memory ${existing.id}`);
     }

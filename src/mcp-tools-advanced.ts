@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { indexAsset, indexPinnedAsset } from "./asset-sync.js";
+import { indexAsset, pinMemory } from "./asset-sync.js";
 import { createAuditLogger } from "./audit-log.js";
 import { persistCaseMemory, persistMemoryBatch, persistWorkflowPattern, promoteMemory } from "./capture-engine.js";
 import { autoCapture } from "./capture-heuristic.js";
@@ -8,7 +8,7 @@ import { runDataCheckup, formatCheckupReport } from "./data-checkup.js";
 import { runDream, formatDreamResult } from "./dream-pipeline.js";
 import { forgetMemory, summarizeVerification, type ForgetPinArchive, type ForgetResult } from "./forget-engine.js";
 import { exportMemoryGraph, formatGraphExportResult } from "./graph-export.js";
-import { archivePinAssetsForMemory, assetSummaryLine, buildBriefAsset, buildPinAsset, findPinAssetsForMemory, listMemoryAssets, listPinAssets, saveBriefAsset, savePinAsset, writeExportArtifact } from "./memory-assets.js";
+import { archivePinAssetsForMemory, assetSummaryLine, buildBriefAsset, findPinAssetsForMemory, listMemoryAssets, listPinAssets, saveBriefAsset, writeExportArtifact } from "./memory-assets.js";
 import { runMemoryLint, formatMemoryLintReport } from "./memory-lint.js";
 import { distillResults, formatExplainResults, selectBriefSeedResults, summarizeResults } from "./memory-output.js";
 import { DurableMemoryCategorySchema, StoreMemorySourceSchema, DebugFramingSchema } from "./memory-schema.js";
@@ -16,21 +16,6 @@ import { buildRetrievalContext, resolveScopeSelection } from "./scope-policy.js"
 import { persistSkill, retrieveSkills } from "./skill-engine.js";
 import { SkillImplementationTypeSchema } from "./skill-schema.js";
 import type { ToolRegistryDeps } from "./mcp-tool-deps.js";
-import type { RetrievalResult } from "./retriever.js";
-import type { MemoryStore } from "./store.js";
-
-function entryToRetrievalResult(entry: Awaited<ReturnType<MemoryStore["get"]>>): RetrievalResult {
-  if (!entry) {
-    throw new Error("Memory entry not found.");
-  }
-  return {
-    entry,
-    score: entry.importance || 0.7,
-    sources: {
-      fused: { score: entry.importance || 0.7 },
-    },
-  };
-}
 
 /** The data/pins directory, as forget_memory uses it when nothing else is injected. */
 const defaultForgetPins: ForgetPinArchive = {
@@ -444,15 +429,16 @@ registerTool(
       return { content: [{ type: "text" as const, text: `Memory not found: ${memory_id}` }] };
     }
 
-    await store.update(entry.id, { importance: Math.max(entry.importance || 0.7, 0.95) }, scopeSelection.scopeFilter);
-    const asset = buildPinAsset(entryToRetrievalResult(entry), {
+    const pinned = await pinMemory(store, embedder, entry, scopeSelection.scopeFilter, {
       title,
       summary,
       query,
       profile: profileName || "default",
     });
-    const path = savePinAsset(asset);
-    await indexPinnedAsset(store, embedder, asset);
+    if (!pinned) {
+      return { content: [{ type: "text" as const, text: `Memory not found: ${memory_id}` }] };
+    }
+    const { asset, path } = pinned;
 
     return {
       content: [{

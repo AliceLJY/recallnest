@@ -142,12 +142,13 @@ export async function retroactiveBoost(
       meta.tier = "working";
     }
 
-    await store.update(entry.id, {
+    const boosted = await store.update(entry.id, {
       importance: newImportance,
       metadata: JSON.stringify(meta),
     }, [newEntry.scope]);
 
-    boostedIds.push(entry.id);
+    // update() 返回 null = 这一行在检索之后被删掉了，没有提权成，不计入
+    if (boosted) boostedIds.push(entry.id);
   }
 
   return {

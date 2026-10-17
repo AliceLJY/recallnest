@@ -1,6 +1,7 @@
 import type { Embedder } from "./embedder.js";
-import type { MemoryStore } from "./store.js";
-import type { BriefAsset, MemoryAsset, PinAsset } from "./memory-assets.js";
+import type { MemoryEntry, MemoryStore } from "./store.js";
+import { buildPinAsset, savePinAsset, type BriefAsset, type MemoryAsset, type PinAsset } from "./memory-assets.js";
+import type { RetrievalProfileName } from "./retrieval-profiles.js";
 
 function buildPinnedAssetText(asset: PinAsset): string {
   const tags = asset.tags.join(", ");
@@ -77,3 +78,26 @@ export async function indexAsset(
 }
 
 export const indexPinnedAsset = indexAsset;
+
+/**
+ * pin_memory（MCP 工具、CLI `pin`、本地 UI `/api/pin` 共用）：先把这条记忆的 importance 提到至少 0.95，
+ * update() 返回 null（行在查到之后被删掉了）就返回 null——不写 pin 文件、不建索引副本，由调用方报 not found；
+ * 写成功才用 update() 返回的那一行生成 pin。2026-10-17 起 update() 不再把被删的行插回来，
+ * 原先这里不看返回值，会给一条已经不存在的记忆留下 pin 文件和索引副本。
+ */
+export async function pinMemory(
+  store: MemoryStore,
+  embedder: Embedder,
+  entry: MemoryEntry,
+  scopeFilter: string[] | undefined,
+  options: { title?: string; summary?: string; query?: string; profile?: RetrievalProfileName },
+  save: (asset: PinAsset) => string = savePinAsset,
+): Promise<{ asset: PinAsset; path: string; entry: MemoryEntry } | null> {
+  const updated = await store.update(entry.id, { importance: Math.max(entry.importance || 0.7, 0.95) }, scopeFilter);
+  if (!updated) return null;
+  const score = updated.importance || 0.7;
+  const asset = buildPinAsset({ entry: updated, score, sources: { fused: { score } } }, options);
+  const path = save(asset);
+  await indexAsset(store, embedder, asset);
+  return { asset, path, entry: updated };
+}
