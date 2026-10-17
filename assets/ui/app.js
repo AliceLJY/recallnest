@@ -808,7 +808,12 @@ async function cleanDirtyBriefs() {
     await loadPins();
     await loadStats();
     renderMainSurface();
-    statusLine.textContent = data.count > 0 ? 'Dirty briefs archived.' : 'No dirty briefs found.';
+    const unreadable = (data.readErrors || []).length;
+    if (unreadable > 0) {
+      statusLine.textContent = `${data.count > 0 ? 'Dirty briefs archived; ' : ''}${unreadable} brief file(s) could not be read.`;
+    } else {
+      statusLine.textContent = data.count > 0 ? 'Dirty briefs archived.' : 'No dirty briefs found.';
+    }
   } catch (error) {
     resultOutput.textContent = String(error.message || error);
     statusLine.textContent = 'Dirty brief cleanup failed.';
