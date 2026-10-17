@@ -8,7 +8,7 @@ import type { RetrievalResult } from "./retriever.js";
 import type { MemoryStore } from "./store.js";
 import { distillResults, formatExplainResults, formatSearchResults, selectBriefSeedResults, summarizeResults } from "./memory-output.js";
 import { extractMemoryProvenance } from "./memory-boundaries.js";
-import { archiveDirtyBriefAsset, assetSummaryLine, buildBriefAsset, buildPinAsset, listDirtyBriefAssets, listExportArtifacts, listMemoryAssets, saveBriefAsset, savePinAsset, writeExportArtifact } from "./memory-assets.js";
+import { archiveDirtyBriefAsset, assetSummaryLine, buildBriefAsset, buildPinAsset, formatDirtyBriefEmptyMessage, formatDirtyBriefReadErrors, listExportArtifacts, scanDirtyBriefAssets, listMemoryAssets, saveBriefAsset, savePinAsset, writeExportArtifact } from "./memory-assets.js";
 import { indexAsset, indexPinnedAsset } from "./asset-sync.js";
 import { createComponentResolver, loadConfig, loadDotEnv } from "./runtime-config.js";
 import { buildRetrievalContext, resolveScopeSelection } from "./scope-policy.js";
@@ -306,13 +306,16 @@ const server = Bun.serve({
       }
 
       if (request.method === "GET" && url.pathname === "/api/dirty-briefs") {
-        const rows = listDirtyBriefAssets();
+        const scan = scanDirtyBriefAssets();
+        const rows = scan.items;
+        const readErrors = formatDirtyBriefReadErrors(scan.readErrors);
         const output = rows.length === 0
-          ? "No dirty briefs found."
-          : rows.map((row) => `${row.id.slice(0, 8)}  ${row.title}  [${row.scope}]  ${row.reasons.join("; ")}`).join("\n");
+          ? formatDirtyBriefEmptyMessage(scan)
+          : rows.map((row) => `${row.id.slice(0, 8)}  ${row.title}  [${row.scope}]  ${row.reasons.join("; ")}`).join("\n") + (readErrors ? `\n\n${readErrors}` : "");
         return Response.json({
           output,
           count: rows.length,
+          readErrors: scan.readErrors,
           items: rows.map((row) => ({
             id: row.id,
             shortId: row.id.slice(0, 8),
@@ -382,9 +385,11 @@ const server = Bun.serve({
       }
 
       if (request.method === "POST" && url.pathname === "/api/clean-dirty-briefs") {
-        const rows = listDirtyBriefAssets();
+        const scan = scanDirtyBriefAssets();
+        const rows = scan.items;
+        const readErrors = formatDirtyBriefReadErrors(scan.readErrors);
         if (rows.length === 0) {
-          return Response.json({ output: "No dirty briefs found.", count: 0, archived: 0, deleted: 0 });
+          return Response.json({ output: formatDirtyBriefEmptyMessage(scan), count: 0, archived: 0, deleted: 0, readErrors: scan.readErrors });
         }
 
         let archived = 0;
@@ -396,10 +401,11 @@ const server = Bun.serve({
         }
 
         return Response.json({
-          output: `Dirty briefs: ${rows.length}\nArchived: ${archived}\nIndex rows deleted: ${deleted}`,
+          output: `Dirty briefs: ${rows.length}\nArchived: ${archived}\nIndex rows deleted: ${deleted}` + (readErrors ? `\n\n${readErrors}` : ""),
           count: rows.length,
           archived,
           deleted,
+          readErrors: scan.readErrors,
         });
       }
 

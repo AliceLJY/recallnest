@@ -19,7 +19,7 @@ import { PACKAGE_VERSION } from "./version.js";
 import type { RetrievalResult } from "./retriever.js";
 import { applyRetrievalProfile, listRetrievalProfiles } from "./retrieval-profiles.js";
 import { distillResults, formatExplainResults, formatSearchResults, selectBriefSeedResults, summarizeResults } from "./memory-output.js";
-import { archiveDirtyBriefAsset, assetSummaryLine, buildBriefAsset, buildPinAsset, getExportsDir, listDirtyBriefAssets, listMemoryAssets, listPinAssets, pinSummaryLine, saveBriefAsset, savePinAsset, writeExportArtifact } from "./memory-assets.js";
+import { archiveDirtyBriefAsset, assetSummaryLine, buildBriefAsset, buildPinAsset, formatDirtyBriefEmptyMessage, formatDirtyBriefReadErrors, getExportsDir, listMemoryAssets, scanDirtyBriefAssets, listPinAssets, pinSummaryLine, saveBriefAsset, savePinAsset, writeExportArtifact } from "./memory-assets.js";
 import { indexAsset, indexPinnedAsset } from "./asset-sync.js";
 import { createComponents, createStoreOnly, expandHome, loadConfig, loadDotEnv, resolveDataDir, resolveDbPath, type LocalMemoryConfig } from "./runtime-config.js";
 import { KGStore } from "./kg-store.js";
@@ -708,9 +708,11 @@ program
   .description("归档旧规则生成的脏 brief，并从索引删除对应 asset scope")
   .option("--apply", "执行清理；默认只预览")
   .action(async (options) => {
-    const dirty = listDirtyBriefAssets();
+    const scan = scanDirtyBriefAssets();
+    const dirty = scan.items;
+    const readErrors = formatDirtyBriefReadErrors(scan.readErrors);
     if (dirty.length === 0) {
-      console.log("No dirty briefs found.");
+      console.log(formatDirtyBriefEmptyMessage(scan));
       return;
     }
 
@@ -720,6 +722,7 @@ program
         console.log(`${item.id.slice(0, 8)}  ${item.title}  [${item.scope}]  ${item.reasons.join("; ")}`);
       }
       console.log("\nRun with --apply to archive files and delete their indexed asset scopes.");
+      if (readErrors) console.log(`\n${readErrors}`);
       return;
     }
 
@@ -739,6 +742,7 @@ program
       `Archived    : ${archived}`,
       `Index rows  : ${deleted}`,
     ].join("\n"));
+    if (readErrors) console.log(`\n${readErrors}`);
   });
 
 program

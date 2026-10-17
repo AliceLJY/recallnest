@@ -7,7 +7,7 @@ import { CONFLICT_ATTENTION_LEVELS, summarizeConflictLifecycle } from "./conflic
 import { formatConflictAudit, formatConflictClusters, formatConflictEscalation, formatConflictList, formatConflictRecord, formatConflictResolution } from "./conflict-output.js";
 import { ConflictStatusSchema } from "./conflict-schema.js";
 import { ConsolidationEngine, formatConsolidationResult } from "./consolidation-engine.js";
-import { archiveDirtyBriefAsset, listDirtyBriefAssets } from "./memory-assets.js";
+import { archiveDirtyBriefAsset, formatDirtyBriefEmptyMessage, formatDirtyBriefReadErrors, scanDirtyBriefAssets } from "./memory-assets.js";
 import {
   scanMemoryPromotions,
   scanSynthesisPromotions,
@@ -266,15 +266,18 @@ registerTool(
   "List memory briefs generated before current cleanup rules that may need re-indexing. Read-only. Use when auditing brief quality or before running clean_dirty_briefs.",
   {},
   async () => {
-    const rows = listDirtyBriefAssets();
+    const scan = scanDirtyBriefAssets();
+    const rows = scan.items;
     if (rows.length === 0) {
-      return { content: [{ type: "text" as const, text: "No dirty briefs found." }] };
+      return { content: [{ type: "text" as const, text: formatDirtyBriefEmptyMessage(scan) }] };
     }
     const lines = [
       "Brief ID  Title  Scope  Reasons",
       "--------  -----  -----  ----------------------------------------",
       ...rows.map(row => `${row.id.slice(0, 8)}  ${row.title}  [${row.scope}]  ${row.reasons.join("; ")}`),
     ];
+    const readErrors = formatDirtyBriefReadErrors(scan.readErrors);
+    if (readErrors) lines.push("", readErrors);
     return { content: [{ type: "text" as const, text: lines.join("\n") }] };
   }
 );
@@ -287,9 +290,12 @@ registerTool(
   },
   async ({ apply }) => {
     const { store } = getComponents();
-    const rows = listDirtyBriefAssets();
+    const scan = scanDirtyBriefAssets();
+    const rows = scan.items;
+    const readErrors = formatDirtyBriefReadErrors(scan.readErrors);
+    const readErrorsTail = readErrors ? `\n\n${readErrors}` : "";
     if (rows.length === 0) {
-      return { content: [{ type: "text" as const, text: "No dirty briefs found." }] };
+      return { content: [{ type: "text" as const, text: formatDirtyBriefEmptyMessage(scan) }] };
     }
 
     if (!apply) {
@@ -297,7 +303,7 @@ registerTool(
       return {
         content: [{
           type: "text" as const,
-          text: `Dirty briefs detected: ${rows.length}\n\n${preview}\n\nCall clean_dirty_briefs with apply=true to archive them.`,
+          text: `Dirty briefs detected: ${rows.length}\n\n${preview}\n\nCall clean_dirty_briefs with apply=true to archive them.${readErrorsTail}`,
         }],
       };
     }
@@ -321,7 +327,7 @@ registerTool(
     return {
       content: [{
         type: "text" as const,
-        text: `Dirty briefs: ${rows.length}\nArchived: ${archived}\nIndex rows deleted: ${deleted}`,
+        text: `Dirty briefs: ${rows.length}\nArchived: ${archived}\nIndex rows deleted: ${deleted}${readErrorsTail}`,
       }],
     };
   }
