@@ -319,7 +319,12 @@ export function archivePinAssetsForMemory(
   return moved;
 }
 
-function listJsonRecords<T extends MemoryAsset>(dir: string, limit = 20): Array<T & { path: string }> {
+export interface AssetReadError {
+  path: string;
+  reason: string;
+}
+
+function readJsonRecords<T extends MemoryAsset>(dir: string, limit = 20): { items: Array<T & { path: string }>; readErrors: AssetReadError[] } {
   ensureDir(dir);
   const files = readdirSync(dir)
     .filter(name => name.endsWith(".json"))
@@ -328,15 +333,21 @@ function listJsonRecords<T extends MemoryAsset>(dir: string, limit = 20): Array<
     .slice(0, limit);
 
   const items: Array<T & { path: string }> = [];
+  const readErrors: AssetReadError[] = [];
   for (const path of files) {
     try {
       const parsed = JSON.parse(readFileSync(path, "utf-8")) as T;
       items.push({ ...parsed, path });
-    } catch {
-      // Skip corrupt records.
+    } catch (err) {
+      readErrors.push({ path, reason: err instanceof Error ? err.message : String(err) });
     }
   }
-  return items;
+  return { items, readErrors };
+}
+
+function listJsonRecords<T extends MemoryAsset>(dir: string, limit = 20): Array<T & { path: string }> {
+  // 读不了的文件在这里照旧跳过；要知道有哪些读不了，用 readJsonRecords。
+  return readJsonRecords<T>(dir, limit).items;
 }
 
 export function listBriefAssets(limit = 20): Array<BriefAsset & { path: string }> {
@@ -363,8 +374,14 @@ function detectDirtyBriefReasons(asset: BriefAsset): string[] {
   return reasons;
 }
 
-export function listDirtyBriefAssets(limit = 200): DirtyBriefAssetRecord[] {
-  return listBriefAssets(limit)
+export interface DirtyBriefScan {
+  items: DirtyBriefAssetRecord[];
+  /** 读取或解析失败的文件：没有判定、不会被归档，原样留在资产目录里。 */
+  readErrors: AssetReadError[];
+}
+
+function toDirtyBriefRecords(assets: Array<BriefAsset & { path: string }>): DirtyBriefAssetRecord[] {
+  return assets
     .map((asset) => {
       const reasons = detectDirtyBriefReasons(asset);
       return {
@@ -376,8 +393,39 @@ export function listDirtyBriefAssets(limit = 200): DirtyBriefAssetRecord[] {
     .filter((asset) => asset.reasons.length > 0);
 }
 
-export function archiveDirtyBriefAsset(asset: DirtyBriefAssetRecord): string {
-  const dir = getDirtyBriefArchiveDir();
+export function scanDirtyBriefAssets(limit = 200, assetsDir?: string): DirtyBriefScan {
+  const { items, readErrors } = readJsonRecords<BriefAsset>(assetsDir ?? getAssetsDir(), limit);
+  return { items: toDirtyBriefRecords(items), readErrors };
+}
+
+export function listDirtyBriefAssets(limit = 200): DirtyBriefAssetRecord[] {
+  return scanDirtyBriefAssets(limit).items;
+}
+
+/**
+ * 脏 brief 扫描结果里「没有要清的」那句话。有文件读不了时不说「没有」，
+ * 免得把坏文件藏起来：真干净才回 "No dirty briefs found."。
+ */
+export function formatDirtyBriefEmptyMessage(scan: DirtyBriefScan): string {
+  if (scan.readErrors.length === 0) return "No dirty briefs found.";
+  return [
+    "No dirty briefs among readable files, but the scan is incomplete.",
+    formatDirtyBriefReadErrors(scan.readErrors),
+  ].join("\n");
+}
+
+/** 读不了的文件清单；没有读取失败时返回空串。 */
+export function formatDirtyBriefReadErrors(readErrors: AssetReadError[]): string {
+  if (readErrors.length === 0) return "";
+  const noun = readErrors.length === 1 ? "file" : "files";
+  return [
+    `${readErrors.length} brief ${noun} could not be read (left in place, not archived):`,
+    ...readErrors.map((item) => `  ${item.path} — ${item.reason}`),
+  ].join("\n");
+}
+
+export function archiveDirtyBriefAsset(asset: DirtyBriefAssetRecord, archiveDir?: string): string {
+  const dir = archiveDir ? ensureDir(archiveDir) : getDirtyBriefArchiveDir();
   const targetPath = join(dir, basename(asset.path));
   renameSync(asset.path, targetPath);
   return targetPath;
