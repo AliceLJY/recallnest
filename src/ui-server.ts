@@ -5,11 +5,10 @@ import { join, resolve, sep } from "node:path";
 
 import { metaDir } from "./compat.js";
 import type { RetrievalResult } from "./retriever.js";
-import type { MemoryStore } from "./store.js";
 import { distillResults, formatExplainResults, formatSearchResults, selectBriefSeedResults, summarizeResults } from "./memory-output.js";
 import { extractMemoryProvenance } from "./memory-boundaries.js";
-import { archiveDirtyBriefAsset, assetSummaryLine, buildBriefAsset, buildPinAsset, formatDirtyBriefEmptyMessage, formatDirtyBriefReadErrors, listExportArtifacts, scanDirtyBriefAssets, listMemoryAssets, saveBriefAsset, savePinAsset, writeExportArtifact } from "./memory-assets.js";
-import { indexAsset, indexPinnedAsset } from "./asset-sync.js";
+import { archiveDirtyBriefAsset, assetSummaryLine, buildBriefAsset, formatDirtyBriefEmptyMessage, formatDirtyBriefReadErrors, listExportArtifacts, scanDirtyBriefAssets, listMemoryAssets, saveBriefAsset, writeExportArtifact } from "./memory-assets.js";
+import { indexAsset, pinMemory } from "./asset-sync.js";
 import { createComponentResolver, loadConfig, loadDotEnv } from "./runtime-config.js";
 import { buildRetrievalContext, resolveScopeSelection } from "./scope-policy.js";
 import { enforceLocalHttpRequestPolicy, LOCAL_HTTP_HOSTNAME } from "./http-request-policy.js";
@@ -26,14 +25,6 @@ class UiHttpError extends Error {
   }
 }
 
-function entryToRetrievalResult(entry: Awaited<ReturnType<MemoryStore["get"]>>): RetrievalResult {
-  if (!entry) throw new Error("Memory entry not found.");
-  return {
-    entry,
-    score: entry.importance || 0.7,
-    sources: { fused: { score: entry.importance || 0.7 } },
-  };
-}
 
 async function readJson(request: Request) {
   try {
@@ -339,15 +330,14 @@ const server = Bun.serve({
         });
         const entry = await store.get(memoryId, scopeSelection.scopeFilter);
         if (!entry) return textResponse(`Memory not found: ${memoryId}`, { status: 404 });
-        await store.update(entry.id, { importance: Math.max(entry.importance || 0.7, 0.95) }, scopeSelection.scopeFilter);
-        const asset = buildPinAsset(entryToRetrievalResult(entry), {
+        const pinned = await pinMemory(store, embedder, entry, scopeSelection.scopeFilter, {
           title: readOptionalString(body.title),
           summary: readOptionalString(body.summary),
           query: readOptionalString(body.query),
           profile: readOptionalString(body.profile) as any || "default",
         });
-        const path = savePinAsset(asset);
-        await indexPinnedAsset(store, embedder, asset);
+        if (!pinned) return textResponse(`Memory not found: ${memoryId}`, { status: 404 });
+        const { asset, path } = pinned;
         return Response.json({
           output: `Pinned ${asset.id.slice(0, 8)}\nMemory: ${entry.id.slice(0, 8)} (${entry.scope})\nPath: ${path}`,
           assetId: asset.id,

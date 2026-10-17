@@ -207,4 +207,19 @@ describe("cascade-forget", () => {
     expect(meta.cascade_forget[0].from).toBe(0.6);
     expect(typeof meta.cascade_forget[0].to).toBe("number");
   });
+
+  it("does not count an entry whose update() returned null (row deleted after the search)", async () => {
+    const vanished = makeEntry("gone-1", "deleted by another process", { importance: 0.6 });
+    // vectorSearch still returns it, but the store no longer holds the row → update() returns null
+    const store = createMockStore([], [{ entry: vanished, score: 0.95 }]);
+
+    const result = await cascadeForget(store, {
+      id: "forgotten-1",
+      vector: [1, 0, 0],
+      scope: "project:test",
+    });
+
+    expect(result.demotedCount).toBe(0);
+    expect(result.demotedIds).toEqual([]);
+  });
 });

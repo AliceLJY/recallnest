@@ -117,14 +117,14 @@ export function computeVersionGroupPatch(
  * @param canonical  The stronger entry (higher canonicalScore)
  * @param member     The weaker entry
  * @param scope      Scope filter for updates
- * @returns The version_group ID
+ * @returns The version_group ID, or null when either row was deleted before it could be tagged
  */
 export async function createVersionGroup(
-  store: Pick<MemoryStorePort, "update">,
+  store: Pick<MemoryStorePort, "update" | "patchMetadata">,
   canonical: MemoryEntry,
   member: MemoryEntry,
   scope: string,
-): Promise<string> {
+): Promise<string | null> {
   // Check if canonical already has a version_group
   const canonMeta = parseMetadata(canonical.metadata);
   const existingGroup = typeof canonMeta.version_group === "string" ? canonMeta.version_group : null;
@@ -136,7 +136,10 @@ export async function createVersionGroup(
   canonMeta.version_group = groupId;
   canonMeta.version_rank = canonRank;
   if (!canonMeta.version_created) canonMeta.version_created = now;
-  await store.update(canonical.id, { metadata: JSON.stringify(canonMeta) }, [scope]);
+  // update() returns null when the row was deleted after it was read: a group needs both
+  // rows, so a vanished canonical stops here and the member is left untouched.
+  const canonUpdated = await store.update(canonical.id, { metadata: JSON.stringify(canonMeta) }, [scope]);
+  if (!canonUpdated) return null;
 
   // Update member
   const memberMeta = parseMetadata(member.metadata);
@@ -144,7 +147,18 @@ export async function createVersionGroup(
   memberMeta.version_group = groupId;
   memberMeta.version_rank = memberRank;
   memberMeta.version_created = now;
-  await store.update(member.id, { metadata: JSON.stringify(memberMeta) }, [scope]);
+  const memberUpdated = await store.update(member.id, { metadata: JSON.stringify(memberMeta) }, [scope]);
+  if (!memberUpdated) {
+    // Member vanished: a group created just now would be left with the canonical alone —
+    // take the three group keys back off it. A pre-existing group keeps its other members.
+    // Rolled back through the locked read-modify-write: it re-reads the canonical's current
+    // metadata and clears the three keys only while the group is still the one set here, so
+    // another writer's metadata committed since is kept (the stale canonMeta snapshot is not).
+    if (!existingGroup) {
+      await store.patchMetadata(canonical.id, (meta) => clearVersionGroupMetadata(meta, groupId), [scope]);
+    }
+    return null;
+  }
 
   logInfo(
     `[INFO] Version group ${groupId.slice(0, 8)}: ` +
