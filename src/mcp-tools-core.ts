@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { persistMemory } from "./capture-engine.js";
+import { formatStoreMemoryReceipt } from "./store-receipts.js";
 import { composeLightResumeContext, composeResumeContext } from "./context-composer.js";
 import { renderMemories } from "./context-renderer.js";
 import { formatSearchResults, formatBriefResults, formatFullResults, formatCollapsedResults } from "./memory-output.js";
@@ -142,20 +143,7 @@ registerTool(
     return {
       content: [{
         type: "text" as const,
-        text: [
-          `Stored memory ${stored.id.slice(0, 8)}`,
-          `Disposition: ${stored.disposition}`,
-          ...(stored.rejectionReason ? [`Rejection reason: ${stored.rejectionReason}`] : []),
-          `Category: ${stored.category}`,
-          `Scope: ${stored.resolvedScope}`,
-          `Canonical key: ${stored.canonicalKey}`,
-          ...(stored.conflictId ? [`Conflict: ${stored.conflictId.slice(0, 8)}`] : []),
-          `Stored at: ${stored.storedAt}`,
-          ...(triggers && triggers.length > 0 ? [`Triggers: ${triggers.length}`] : []),
-          ...((stored.resolvedScope || scope).startsWith("memory:pivot") && (!triggers || triggers.length === 0)
-            ? ["⚠️ pivot 记忆缺 triggers：§5.3 要求带 2–5 句「她以后会怎么问」。同 canonicalKey 再存一次并带 triggers 字段即可补上（deduped 也会写入口）。"]
-            : []),
-        ].join("\n"),
+        text: formatStoreMemoryReceipt(stored, { requestedTriggers: triggers?.length ?? 0, scope }),
       }],
     };
   }

@@ -78,6 +78,10 @@ def store_memory(text: str, category: str = "events") -> str:
         },
     )
     r.raise_for_status()
+    data = r.json()
+    if not data.get("stored"):
+        reason = data.get("rejectionReason") or data.get("id")
+        return f"Memory not stored ({data.get('disposition')}: {reason})."
     return "Memory stored successfully."
 
 
