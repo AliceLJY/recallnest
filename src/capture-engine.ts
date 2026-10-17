@@ -6,8 +6,14 @@ import { extractErrorSignatures } from "./error-signature.js";
 import { verifyWrite } from "./write-verifier.js";
 // batchInternalDedup is available in ingest.ts for large-batch scenarios;
 // persistMemoryBatch relies on per-item conflict detection (A-2) instead.
-import { defaultEvolution, buildSupersedeMetadata, buildSupersedeMetadataForNew, buildPendingReviewMetadata, isActiveMemory, parseEvolution, patchEvolution } from "./memory-evolution.js";
-import { archiveBeliefVersion, buildSupersedingBeliefMetadata } from "./belief-history.js";
+import { defaultEvolution, buildSupersedeMetadata, buildSupersedeMetadataForNew, buildPendingReviewMetadata, isActiveMemory, parseEvolution, patchEvolution, type EvolutionMetadata } from "./memory-evolution.js";
+import {
+  archiveBeliefVersion,
+  BeliefTargetMissingError,
+  buildSupersedingBeliefMetadata,
+  replaceBeliefVersion,
+  type BeliefReplaceDeps,
+} from "./belief-history.js";
 import { detectTopicTag, injectTopicTag } from "./topic-tag.js";
 import { assignDefaultConfidence, type ConfidenceMetadata } from "./confidence-tracker.js";
 import { parseDependsOnInput } from "./freshness.js";
@@ -66,7 +72,7 @@ import { checkAdmission, type ScopeRateLimiter, type AdmissionConfig } from "./a
 import { resolveNoisePrototypeBank, type NoisePrototypeBank } from "./noise-prototype-bank.js";
 import { tagNarrativeIfEnabled } from "./narrative-tagger.js";
 
-type StoreDeps = Pick<MemoryStore, "store"> & Partial<Pick<MemoryStore, "list" | "update" | "getById" | "get" | "vectorSearch" | "upsert">>;
+type StoreDeps = Pick<MemoryStore, "store"> & Partial<Pick<MemoryStore, "list" | "update" | "getById" | "get" | "vectorSearch" | "upsert" | "replaceWithArchivedVersion">>;
 type ConflictStoreDeps = Pick<ConflictCandidateStore, "save" | "replace" | "getOpenByFingerprint" | "getLatestByFingerprint">;
 
 export interface PersistMemoryDeps {
@@ -516,27 +522,36 @@ async function resolveSameKeyRevision(
   return { matches, target: qualifies ? row : null };
 }
 
+/** store 能在一次持锁里归档并覆盖（真实 MemoryStore）时给出 replaceBeliefVersion 的依赖；窄 store（测试替身）返回 null */
+function atomicBeliefDeps(deps: PersistMemoryDeps): BeliefReplaceDeps | null {
+  const { store } = deps;
+  const replace = store.replaceWithArchivedVersion;
+  if (!replace) return null;
+  return {
+    store: {
+      replaceWithArchivedVersion: replace.bind(store),
+      ...(store.getById ? { getById: store.getById.bind(store) } : {}),
+    },
+    embedder: deps.embedder,
+  };
+}
+
 /**
  * latest-wins 的原位替换：先把旧版本归档成 superseded 历史行，再把新文本写回同一 id。
  * 原地覆盖曾经连旧文本带向量一起删掉，「上个月我信的是什么」因此无从回答。
+ *
+ * 2026-10-17：store 有 replaceWithArchivedVersion（真实 MemoryStore）时，重读原行、写历史行、覆盖原行在同一次
+ * store-write 持锁里完成。原行在找到它之后被别的进程删掉（forget 等）→ 什么都不写，抛 BeliefTargetMissingError；
+ * 原先会先留下一条指向不存在原行的历史行，再报 `Failed to update canonical memory`。
+ * 只有 update 的窄 store（测试替身）退回原来的两次写。
  */
 async function replaceBeliefInPlace(
   deps: PersistMemoryDeps,
   latest: MemoryEntry,
   params: DurableWriteInput,
 ): Promise<{ entry: MemoryEntry; disposition: "updated" | "promoted"; supersededPrevious: true }> {
-  if (!deps.store.update) {
-    throw new Error(`store.update is required to replace canonical memory ${latest.id}`);
-  }
-  const now = Date.now();
-  const previousEvo = parseEvolution(latest.metadata, latest.timestamp);
-  const { historyId } = await archiveBeliefVersion(
-    { store: deps.store, embedder: deps.embedder },
-    latest,
-    { now },
-  );
-
-  const updated = await deps.store.update(latest.id, {
+  const disposition = params.promotedFrom ? "promoted" : "updated";
+  const buildUpdates = (previousEvo: EvolutionMetadata, historyId: string, now: number) => ({
     text: params.text,
     vector: params.vector,
     importance: params.importance,
@@ -548,14 +563,34 @@ async function replaceBeliefInPlace(
     ...(params.language ? { language: params.language } : {}),
     ...(params.fts_text ? { fts_text: params.fts_text } : {}),
   });
+
+  const atomic = atomicBeliefDeps(deps);
+  if (atomic) {
+    const result = await replaceBeliefVersion(
+      atomic,
+      latest,
+      ({ previousEvolution, historyId, now }) => buildUpdates(previousEvolution, historyId, now),
+    );
+    if (result.status !== "replaced") throw new BeliefTargetMissingError(latest.id);
+    return { entry: result.entry, disposition, supersededPrevious: true };
+  }
+
+  if (!deps.store.update) {
+    throw new Error(`store.update is required to replace canonical memory ${latest.id}`);
+  }
+  const now = Date.now();
+  const previousEvo = parseEvolution(latest.metadata, latest.timestamp);
+  const { historyId } = await archiveBeliefVersion(
+    { store: deps.store, embedder: deps.embedder },
+    latest,
+    { now },
+  );
+
+  const updated = await deps.store.update(latest.id, buildUpdates(previousEvo, historyId, now));
   if (!updated) {
     throw new Error(`Failed to update canonical memory ${latest.id}`);
   }
-  return {
-    entry: updated,
-    disposition: params.promotedFrom ? "promoted" : "updated",
-    supersededPrevious: true,
-  };
+  return { entry: updated, disposition, supersededPrevious: true };
 }
 
 export async function writeDurableEntry(
@@ -719,7 +754,35 @@ export async function writeDurableEntry(
 
   if (targetId && deps.store.getById) {
     const rowAtTargetId = await deps.store.getById(targetId);
-    if (rowAtTargetId && normalizeMemoryText(rowAtTargetId.text) !== normalizeMemoryText(params.text)) {
+    const normalizedIncomingText = normalizeMemoryText(params.text);
+    const atomic = atomicBeliefDeps(deps);
+    if (rowAtTargetId && atomic && normalizeMemoryText(rowAtTargetId.text) !== normalizedIncomingText) {
+      // 归档与覆盖同一次持锁（2026-10-17）。写入的字段与默认值照下面 store() 的那一份：text 换了，
+      // language / fts_text 不能沿用旧行的。原行在锁内重读时已不在（被 forget 等删掉）→ 不留历史行，
+      // 落到下面的 store() 当新行写入——原先这里会把已删内容写成一条历史行；锁内重读发现正文已与新的相同 → 同样落到 store()。
+      const replaced = await replaceBeliefVersion(
+        atomic,
+        rowAtTargetId,
+        ({ previousEvolution, historyId, now }) => ({
+          text: params.text,
+          vector: params.vector,
+          category: params.category,
+          importance: params.importance,
+          metadata: buildSupersedingBeliefMetadata(params.metadata, previousEvolution, historyId, now),
+          timestamp: now,
+          language: params.language || "en",
+          fts_text: params.fts_text || params.text,
+        }),
+        { skip: (current) => normalizeMemoryText(current.text) === normalizedIncomingText },
+      );
+      if (replaced.status === "replaced") {
+        return {
+          entry: replaced.entry,
+          disposition: params.promotedFrom ? "promoted" : "stored",
+          supersededPrevious: true,
+        };
+      }
+    } else if (rowAtTargetId && normalizeMemoryText(rowAtTargetId.text) !== normalizedIncomingText) {
       const now = Date.now();
       const previousEvo = parseEvolution(rowAtTargetId.metadata, rowAtTargetId.timestamp);
       const { historyId } = await archiveBeliefVersion(

@@ -57,6 +57,19 @@ export interface MemorySearchResult {
   score: number;
 }
 
+/** replaceWithArchivedVersion 的 plan 在锁内给出的：要新写的历史行，以及对原行的改动 */
+export interface ArchivedReplacePlan {
+  history: MemoryEntry;
+  updates: MemoryStoreUpdate;
+}
+
+export type ArchivedReplaceResult =
+  /** 原行已不在（重读时没找到，或写回时已被删掉）：库里什么都没留下 */
+  | { status: "missing" }
+  /** plan 返回 null：什么都没写，current 是锁内读到的行 */
+  | { status: "unchanged"; current: MemoryEntry }
+  | { status: "replaced"; entry: MemoryEntry; history: MemoryEntry };
+
 export interface StoreConfig {
   dbPath: string;
   vectorDim: number;
@@ -1178,47 +1191,108 @@ export class MemoryStore implements MemoryStorePort {
       throw new Error(`Invalid memory ID format: ${id}`);
     }
 
-    let rows: any[];
+    // 前缀先在锁外解析成完整 id（全表扫，不放进锁里拉长持锁时间）；读整行与写回都在锁内按完整 id 做。
+    let fullId: string;
     if (isFullId) {
-      const safeId = escapeSqlLiteral(id);
-      rows = await this.table!.query().where(`id = '${safeId}'`).limit(1).toArray();
+      fullId = id;
     } else {
-      // Prefix match
-      const all = await this.table!.query().select(["id", "text", "vector", "category", "scope", "importance", "timestamp", "metadata", "language", "fts_text"]).toArray();
-      rows = all.filter((r: any) => (r.id as string).startsWith(id));
-      if (rows.length > 1) {
-        throw new Error(`Ambiguous prefix "${id}" matches ${rows.length} memories. Use a longer prefix or full ID.`);
+      const all = await this.table!.query().select(["id"]).toArray();
+      const matches = all.filter((r) => (r.id as string).startsWith(id));
+      if (matches.length > 1) {
+        throw new Error(`Ambiguous prefix "${id}" matches ${matches.length} memories. Use a longer prefix or full ID.`);
       }
+      if (matches.length === 0) return null;
+      fullId = matches[0].id as string;
     }
 
-    if (rows.length === 0) return null;
+    // 写路径一律包在 store-write 锁里（2026-08-14 起；巩固的批量元数据改动现在走 patchMetadataBatch，不再经这里）。
+    // 2026-10-17：读也挪进锁内、写回只更新已存在的行。原先锁外读整行、锁内 upsert，别的进程在这两步之间
+    // 删掉这一行（forget 等，delete() 不拿写锁），会被按读到的旧样子插回来；在这两步之间改的元数据也会被旧读数盖掉。
+    return withWriteLock("store-write", async () => {
+      const rows = await this.table!.query().where(`id = '${escapeSqlLiteral(fullId)}'`).limit(1).toArray();
+      if (rows.length === 0) return null;
+      const row = rows[0] as Record<string, unknown>;
+      if (!matchesScopeFilter((row.scope as string | undefined) ?? "", scopeFilter)) {
+        throw new Error(`Memory ${id} is outside accessible scopes`);
+      }
+      const updated = this.buildUpdatedEntry(row, updates);
+      // 只更新已存在的行：锁内读完之后被不拿锁的 delete() 删掉的行不插回来
+      const res = await this.table!.mergeInsert("id").whenMatchedUpdateAll().execute([updated]);
+      return res.numUpdatedRows > 0 ? updated : null;
+    }, { expireMs: 30_000 });
+  }
 
-    const row = rows[0];
-    const rowScope = (row.scope as string | undefined) ?? "";
+  /**
+   * 在同一次 store-write 持锁里：按完整 id 重读原行 → 不在就什么都不写 → 在就交给 plan 拿最新行算出
+   * 历史行与对原行的改动，先写历史行、再只更新原行（2026-10-17，信念归档与覆盖不再是锁外两次写）。
+   *
+   * - plan 在锁内同步执行，只能做纯计算：取向量 / 调 embedder 这类慢操作由调用方在锁外先做好；
+   *   plan 里也不能调用会再拿 store-write 的公有方法（锁不可重入，会等自己到超时）。
+   * - plan 返回 null：不归档也不改原行，结果为 unchanged（带上锁内读到的行）。
+   * - 原行在重读时已不在，或在写历史行之后、更新原行之前被不拿锁的 delete() 删掉：撤掉本次写的历史行
+   *   （它在本次之前就已存在则不动），结果为 missing，库里不留下指向不存在原行的历史行。
+   * - 更新原行抛错时同样撤掉本次写的历史行，再把错误抛出去。
+   */
+  async replaceWithArchivedVersion(
+    fullId: string,
+    plan: (current: MemoryEntry) => ArchivedReplacePlan | null,
+    scopeFilter?: string[],
+  ): Promise<ArchivedReplaceResult> {
+    await this.ensureInitialized();
 
-    // Check scope permissions
-    if (!matchesScopeFilter(rowScope, scopeFilter)) {
-      throw new Error(`Memory ${id} is outside accessible scopes`);
-    }
+    const result = await withWriteLock("store-write", async (): Promise<ArchivedReplaceResult> => {
+      const rows = await this.table!.query().where(`id = '${escapeSqlLiteral(fullId)}'`).limit(1).toArray();
+      if (rows.length === 0) return { status: "missing" };
+      const row = rows[0] as Record<string, unknown>;
+      if (!matchesScopeFilter((row.scope as string | undefined) ?? "", scopeFilter)) {
+        throw new Error(`Memory ${fullId} is outside accessible scopes`);
+      }
+      const current = this.buildUpdatedEntry(row, {});
+      const planned = plan(current);
+      if (!planned) return { status: "unchanged", current };
 
-    const updated = this.buildUpdatedEntry(row as Record<string, unknown>, updates);
+      const history: MemoryEntry = {
+        ...planned.history,
+        metadata: planned.history.metadata || "{}",
+        language: planned.history.language || "en",
+        fts_text: planned.history.fts_text || planned.history.text,
+      };
+      if (history.id === fullId) {
+        throw new Error(`History row id collided with canonical id ${fullId}`);
+      }
+      const updated = this.buildUpdatedEntry(row, planned.updates);
+      const safeHistoryId = escapeSqlLiteral(history.id);
+      const historyExisted = (await this.table!.query().select(["id"]).where(`id = '${safeHistoryId}'`).limit(1).toArray()).length > 0;
+      const undoHistory = async (): Promise<void> => {
+        if (!historyExisted) await this.table!.delete(`id = '${safeHistoryId}'`);
+      };
 
-    // Atomic upsert via mergeInsert — replaces the previous delete+add two-step,
-    // which could lose the row entirely on a crash between steps and exposed a
-    // window where concurrent reads saw the id momentarily vanish.
-    //
-    // 2026-08-14: 包进 store-write 锁与 upsert/storeBatch 对齐 —— 此前 update 是唯一
-    // 裸奔的写路径（dream 的 3a/3b/auto-gc 全走它），与其他进程的 mergeInsert 并发时
-    // 靠 LanceDB 乐观重试硬扛，是 commit conflict 的隐性源之一。
-    await withWriteLock("store-write", async () => {
-      await this.table!
-        .mergeInsert("id")
-        .whenMatchedUpdateAll()
-        .whenNotMatchedInsertAll()
-        .execute([updated]);
+      await this.table!.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute([history]);
+      let numUpdatedRows: number;
+      try {
+        numUpdatedRows = (await this.table!.mergeInsert("id").whenMatchedUpdateAll().execute([updated])).numUpdatedRows;
+      } catch (err) {
+        try {
+          await undoHistory();
+        } catch (undoErr) {
+          console.error(`[replaceWithArchivedVersion] failed to remove history row ${history.id} after the canonical update failed: ${undoErr instanceof Error ? undoErr.message : String(undoErr)}`);
+        }
+        throw err;
+      }
+      if (numUpdatedRows === 0) {
+        await undoHistory();
+        return { status: "missing" };
+      }
+      return { status: "replaced", entry: updated, history };
     }, { expireMs: 30_000 });
 
-    return updated;
+    if (result.status === "replaced") {
+      // 与 upsert() 一致：历史行算一次写入，驱动 dream 激活。尽力而为，不阻塞写入。
+      try {
+        await incrementWriteCount(result.history.scope, 1, { statsPath: this.activityStatsPath() });
+      } catch { /* activity tracking is best-effort */ }
+    }
+    return result;
   }
 
   /** 由库里的一行加上改动拼出写回的整行，保留原 timestamp / language（update 与 patchMetadata 共用） */
