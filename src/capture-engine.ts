@@ -104,6 +104,13 @@ export interface PersistMemoryDeps {
   embedQueryBatch?: (texts: string[]) => Promise<number[][]>;
 }
 
+/**
+ * persistMemory 的结果：记录本身加上这次实际挂到宿主上的 trigger 条数。
+ * 记录里的 `triggers` 是调用方传入的问法；有没有写进侧表只看 `triggersWritten`
+ * （rejected / conflict / 偏好判重或合并时都是 0），回执按它报数。
+ */
+export type PersistedMemoryRecord = StoredMemoryRecord & { triggersWritten: number };
+
 export interface TriggerStoreDeps {
   upsertForMemory(
     memoryId: string,
@@ -179,6 +186,93 @@ function mergeTags(...groups: string[][]): string[] {
     }
   }
   return merged.slice(0, 8);
+}
+
+// F-3b 覆盖结构化字段（2026-10-17）：原先只有拼好的正文过 redactSecrets，case / pattern 的
+// metadata、tags、显式 canonicalKey、trigger 都是原始入参，密钥原样进库、进外部嵌入接口。
+// scope 与 source 不动：scope 是路由键，source 是枚举。
+// 这些字段里放的是名字（key、标签、问法），`workflow.database.recovery` 这类点分标识符照原样留下；
+// 正文仍走默认规则，逐字节不变（已存行的确定性 id 靠它对得上）。
+const FIELD_REDACTION = { keepIdentifiers: true } as const;
+
+function redactField(value: string): string {
+  return redactSecrets(value, FIELD_REDACTION).text;
+}
+
+/** 只在字段存在时给出覆盖项，没传的可选字段不多出一个值为 undefined 的键。 */
+function redactOptional<K extends string>(key: K, value: string | undefined): Partial<Record<K, string>> {
+  return value === undefined ? {} : ({ [key]: redactField(value) } as Partial<Record<K, string>>);
+}
+
+/** 逐项脱敏后按不分大小写去重：两个不同的密钥脱敏后是同一个占位。 */
+function redactList(values: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    const redacted = redactField(value);
+    const key = redacted.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(redacted);
+  }
+  return out;
+}
+
+/**
+ * 显式 canonicalKey 里有密钥就整个丢掉、退回按正文生成的默认 key，而不是换成占位：
+ * 两条不相干的记忆脱敏后会撞成同一个 key，同 key 修订会把其中一条原位改写掉。
+ * 必须在 normalizeCanonicalKey 之前做——规整会把 `ghp_` 改成 `ghp-`，之后就认不出了。
+ */
+function withoutSecretCanonicalKey<T extends { canonicalKey?: string }>(input: T): T {
+  if (input.canonicalKey === undefined || redactSecrets(input.canonicalKey, FIELD_REDACTION).redacted === 0) return input;
+  const { canonicalKey: _dropped, ...rest } = input;
+  return rest as T;
+}
+
+function redactStoreMemoryFields(input: StoreMemoryInput): StoreMemoryInput {
+  return withoutSecretCanonicalKey({
+    ...input,
+    tags: redactList(input.tags),
+    ...redactOptional("topicTag", input.topicTag),
+    ...(input.triggers ? { triggers: input.triggers.map(redactField) } : {}),
+  });
+}
+
+function redactWorkflowPatternInput(input: WorkflowPatternInput): WorkflowPatternInput {
+  return withoutSecretCanonicalKey({
+    ...input,
+    title: redactField(input.title),
+    trigger: redactField(input.trigger),
+    steps: input.steps.map(redactField),
+    ...redactOptional("outcome", input.outcome),
+    tools: redactList(input.tools),
+    tags: redactList(input.tags),
+  });
+}
+
+function redactCaseMemoryInput(input: CaseMemoryInput): CaseMemoryInput {
+  const { debugFraming } = input;
+  return withoutSecretCanonicalKey({
+    ...input,
+    title: redactField(input.title),
+    problem: redactField(input.problem),
+    ...redactOptional("context", input.context),
+    solutionSteps: input.solutionSteps.map(redactField),
+    ...redactOptional("outcome", input.outcome),
+    tools: redactList(input.tools),
+    tags: redactList(input.tags),
+    ...(debugFraming
+      ? {
+          debugFraming: {
+            ...debugFraming,
+            ...redactOptional("whyPriorFixFailed", debugFraming.whyPriorFixFailed),
+            ...redactOptional("defense", debugFraming.defense),
+            ...redactOptional("systematicExtension", debugFraming.systematicExtension),
+            ...redactOptional("knowledgeFix", debugFraming.knowledgeFix),
+          },
+        }
+      : {}),
+  });
 }
 
 export function buildStructuredMetadata(params: {
@@ -990,6 +1084,7 @@ function buildPromotionMetadata(
  * T-Mem triggers（2026-09-22）：宿主写完再写入口。deduped（同文本已存在）也写——老条目补 trigger
  * 正是回填的常态，此时顺手把文本副本补进旧行 metadata（侧表可由它重建）。失败只 warn：入口丢一次
  * 比记忆丢一条便宜。
+ * 返回侧表实际写入的条数（没有侧表、没有 trigger、写入失败都是 0），回执按它报数。
  */
 async function writeTriggersForEntry(
   deps: PersistMemoryDeps,
@@ -997,12 +1092,13 @@ async function writeTriggersForEntry(
   resolvedScope: string,
   triggerTexts: string[],
   backfillMetadata: boolean,
-): Promise<void> {
-  if (!deps.triggerStore || triggerTexts.length === 0) return;
+): Promise<number> {
+  if (!deps.triggerStore || triggerTexts.length === 0) return 0;
+  let written = 0;
   try {
     const embedBatch = deps.embedQueryBatch
       ?? (async (texts: string[]) => Promise.all(texts.map((t) => deps.embedder.embedPassage(t))));
-    await deps.triggerStore.upsertForMemory(entry.id, entry.scope || resolvedScope, triggerTexts, embedBatch);
+    written = await deps.triggerStore.upsertForMemory(entry.id, entry.scope || resolvedScope, triggerTexts, embedBatch);
     if (backfillMetadata && deps.store.update) {
       const parsedMeta: Record<string, unknown> = JSON.parse(entry.metadata || "{}");
       const prev = Array.isArray(parsedMeta.triggers) ? (parsedMeta.triggers as unknown[]).join("\u0000") : "";
@@ -1011,8 +1107,11 @@ async function writeTriggersForEntry(
         await deps.store.update(entry.id, { metadata: JSON.stringify(parsedMeta) });
       }
     }
+    return written;
   } catch (err) {
     console.error(`[recallnest] trigger write failed for ${entry.id} (memory stored, trigger 入口未写):`, err instanceof Error ? err.message : String(err));
+    // 侧表已写、只是 metadata 副本没回填时，written 仍是侧表里的条数
+    return written;
   }
 }
 
@@ -1036,7 +1135,7 @@ export function shouldDeriveImplicitPreference(category: string, text: string): 
 export async function persistMemory(
   deps: PersistMemoryDeps,
   rawInput: unknown,
-): Promise<StoredMemoryRecord> {
+): Promise<PersistedMemoryRecord> {
   let input = StoreMemoryInputSchema.parse(rawInput);
 
   // F-3b: Scan THEN redact, before the text reaches any external surface —
@@ -1044,9 +1143,8 @@ export async function persistMemory(
   // Scan first so the piiWarning below still reflects what the raw text held.
   const piiScan = scanForPII(input.text);
   const redaction = redactSecrets(input.text);
-  if (redaction.redacted > 0) {
-    input = { ...input, text: redaction.text };
-  }
+  // tags / 显式 canonicalKey / topicTag / triggers 同样会进 metadata、侧表与外部嵌入接口
+  input = redactStoreMemoryFields({ ...input, text: redaction.text });
 
   // F3: Extract temporal validity params before Zod strips them
   const rawObj = rawInput as Record<string, unknown> | null;
@@ -1135,6 +1233,7 @@ export async function persistMemory(
       storedAt: new Date().toISOString(),
       disposition: "rejected" as const,
       ...(admission.reason ? { rejectionReason: admission.reason } : {}),
+      triggersWritten: 0,
     };
   }
 
@@ -1171,8 +1270,8 @@ export async function persistMemory(
   // 从不触发 F2 干扰预警；放到后面，一次 deduped 写入会把别的行标成 pending_review（实施后 Codex 审查，
   // 真实临时库复现）。triggers 回填照做。
   if (revisionTarget && normalizeMemoryText(revisionTarget.text) === normalizeMemoryText(input.text)) {
-    await writeTriggersForEntry(deps, revisionTarget, resolvedScope, normalizeTriggerTexts(input.triggers), true);
-    return toStoredRecord(input, revisionTarget, "deduped", canonicalKey);
+    const triggersWritten = await writeTriggersForEntry(deps, revisionTarget, resolvedScope, normalizeTriggerTexts(input.triggers), true);
+    return { ...toStoredRecord(input, revisionTarget, "deduped", canonicalKey), triggersWritten };
   }
 
   // Tier 3.6: For preferences, check if similar preference already exists.
@@ -1197,6 +1296,8 @@ export async function persistMemory(
         { embedder: deps.embedder },
       );
       if (applied.handled) {
+        // skip 时 entry 是被命中的那一行（回执报它的 id）；这条分支不写 trigger，triggersWritten 记 0。
+        // 兜底的 "skipped" 只给不带 matchedEntry 的手工 skip 结果，matchPreference 自己产出的都带。
         const entry = applied.entry ?? {
           id: "skipped",
           text: input.text,
@@ -1207,12 +1308,15 @@ export async function persistMemory(
           timestamp: Date.now(),
           metadata: "{}",
         };
-        return toStoredRecord(
-          input,
-          entry,
-          matchResult.action === "merge" ? "updated" : "deduped",
-          canonicalKey,
-        );
+        return {
+          ...toStoredRecord(
+            input,
+            entry,
+            matchResult.action === "merge" ? "updated" : "deduped",
+            canonicalKey,
+          ),
+          triggersWritten: 0,
+        };
       }
     }
   }
@@ -1376,9 +1480,9 @@ export async function persistMemory(
   });
 
   // T-Mem triggers：conflict 时宿主没变、不写；其余见 writeTriggersForEntry。
-  if (disposition !== "conflict") {
-    await writeTriggersForEntry(deps, entry, resolvedScope, normalizeTriggerTexts(input.triggers), disposition === "deduped");
-  }
+  const triggersWritten = disposition === "conflict"
+    ? 0
+    : await writeTriggersForEntry(deps, entry, resolvedScope, normalizeTriggerTexts(input.triggers), disposition === "deduped");
 
   // Tier 4.1: Async KG triple extraction (non-blocking)
   // HP-ethics: Skip KG extraction for ephemeral/private memories — they must not leave graph traces
@@ -1474,17 +1578,18 @@ export async function persistMemory(
     }).catch(() => {}); // Dual-write must never block the primary write
   }
 
-  return toStoredRecord(input, entry, disposition, canonicalKey, conflictId);
+  return { ...toStoredRecord(input, entry, disposition, canonicalKey, conflictId), triggersWritten };
 }
 
 export async function persistWorkflowPattern(
   deps: PersistMemoryDeps,
   rawInput: unknown,
 ): Promise<StoredWorkflowPatternRecord> {
-  const input = WorkflowPatternInputSchema.parse(rawInput);
+  // F-3b: scrub every field before embedding/storage — the structured fields land in
+  // metadata verbatim (this path bypasses persistMemory)
+  const input = redactWorkflowPatternInput(WorkflowPatternInputSchema.parse(rawInput));
   const resolvedScope = resolveScope(input);
   const tags = mergeTags(input.tags, ["workflow", "pattern"]);
-  // F-3b: scrub before embedding/storage (this path bypasses persistMemory)
   const text = redactSecrets(buildWorkflowPatternText(input)).text;
   const vector = await deps.embedder.embedPassage(text);
   const language = detectLang(text);
@@ -1526,10 +1631,11 @@ export async function persistCaseMemory(
   deps: PersistMemoryDeps,
   rawInput: unknown,
 ): Promise<StoredCaseMemoryRecord> {
-  const input = CaseMemoryInputSchema.parse(rawInput);
+  // F-3b: scrub every field before embedding/storage — the structured fields land in
+  // metadata verbatim (this path bypasses persistMemory)
+  const input = redactCaseMemoryInput(CaseMemoryInputSchema.parse(rawInput));
   const resolvedScope = resolveScope(input);
   const tags = mergeTags(input.tags, ["case", "solution"]);
-  // F-3b: scrub before embedding/storage (this path bypasses persistMemory)
   const text = redactSecrets(buildCaseMemoryText(input)).text;
   const vector = await deps.embedder.embedPassage(text);
   const language = detectLang(text);
@@ -1571,7 +1677,9 @@ export async function promoteMemory(
   deps: PersistMemoryDeps,
   rawInput: unknown,
 ): Promise<StoredPromotedMemoryRecord> {
-  const input = PromoteMemoryInputSchema.parse(rawInput);
+  const parsedInput = PromoteMemoryInputSchema.parse(rawInput);
+  // F-3b: tags and an explicit canonicalKey go into metadata as given
+  const input = withoutSecretCanonicalKey({ ...parsedInput, tags: redactList(parsedInput.tags) });
   const sourceEntry = deps.store.get
     ? await deps.store.get(input.memoryId)
     : deps.store.getById
@@ -1639,7 +1747,7 @@ export async function promoteMemory(
 export async function persistMemoryBatch(
   deps: PersistMemoryDeps,
   rawInput: unknown,
-): Promise<StoredMemoryRecord[]> {
+): Promise<PersistedMemoryRecord[]> {
   const input = CaptureMemoryInputSchema.parse(rawInput);
   const normalizedItems = input.memories.map((memory) =>
     StoreMemoryInputSchema.parse({
@@ -1658,7 +1766,7 @@ export async function persistMemoryBatch(
   // persistMemoryBatch (typically <10 items), per-item conflict detection (A-2)
   // in persistMemory handles dedup adequately without double-embedding cost.
 
-  const persisted: StoredMemoryRecord[] = [];
+  const persisted: PersistedMemoryRecord[] = [];
   for (const memory of normalizedItems) {
     persisted.push(await persistMemory(deps, memory));
   }

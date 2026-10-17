@@ -46,6 +46,8 @@ export interface PreferenceMatchResult {
   mergeTargetId?: string;
   /** Merged text (when action=merge, LLM-generated) */
   mergedText?: string;
+  /** The existing preference the incoming one duplicates (when action=skip) — reported back to the caller */
+  matchedEntry?: MemoryEntry;
   /** Reason for the decision */
   reason: string;
 }
@@ -96,7 +98,7 @@ export async function matchPreference(
   if (!llm) {
     const topScore = prefMatches[0].score;
     if (topScore >= 0.92) {
-      return { action: "skip", reason: "high-similarity-no-llm" };
+      return { action: "skip", reason: "high-similarity-no-llm", matchedEntry: prefMatches[0].entry };
     }
     return { action: "create", reason: "moderate-similarity-no-llm" };
   }
@@ -110,6 +112,7 @@ export async function matchPreference(
       return {
         action: "skip",
         reason: `llm-skip: ${decision.reason}`,
+        matchedEntry: topMatch.entry,
       };
     }
 
@@ -144,7 +147,7 @@ export async function applyPreferenceMatch(
 ): Promise<{ handled: boolean; entry?: MemoryEntry }> {
   if (result.action === "skip") {
     logInfo(`[INFO] Preference skipped (duplicate): ${result.reason}`);
-    return { handled: true };
+    return result.matchedEntry ? { handled: true, entry: result.matchedEntry } : { handled: true };
   }
 
   if (result.action === "merge" && result.mergeTargetId && result.mergedText) {

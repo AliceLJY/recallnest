@@ -113,6 +113,8 @@ async function handleTool(
       }),
     });
     if (!res.ok) return `Error: ${res.status} ${await res.text()}`;
+    const data = await res.json() as { stored: boolean; disposition: string; id: string; rejectionReason?: string };
+    if (!data.stored) return `Memory not stored (${data.disposition}: ${data.rejectionReason ?? data.id}).`;
     return "Memory stored successfully.";
   }
 
