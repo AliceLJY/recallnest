@@ -1,11 +1,23 @@
 /**
- * CC-6: Distill gate — PID-based lock file + session gate.
- * Lock file mtime serves as lastDistillAt timestamp (no separate field).
+ * CC-6: Distill gate + P0-1 named cross-process locks.
  *
- * - acquireLock(): write `<pid>:<token>:<expireMs>`, check existing lock PID liveness + the
- *   holder's own expiry against mtime; reclaim a stale lock via compare-and-delete
- * - releaseLock(): delete lock file if it still holds our body (mtime naturally updates to now on success)
- * - refreshLock(): heartbeat — bump mtime of a lock we still hold
+ * Mutual exclusion is a kernel advisory lock: flock(2) on a descriptor that stays open for as long
+ * as the lock is held (src/flock.ts). The kernel drops it when the holder closes the descriptor,
+ * exits, or is SIGKILLed, so there is no stale-lock reclaim, no PID or expiry check deciding that a
+ * live holder may be pushed out, no marker files and no heartbeat. The lock file still carries
+ * `<pid>:<token>:flock:<acquiredAtMs>:<maxHoldMs>` for diagnostics (inspectLock, timeout messages,
+ * the stuck-holder warning); nothing decides ownership from its content.
+ *
+ * ROLLOUT — the previous versions of this file (PID + mtime in the lock file, reclaimed by
+ * unlink-and-recreate) do not take the flock, so old and new processes do not exclude each other.
+ * Upgrade by stopping EVERY RecallNest process that shares the data directory (all mcp-server
+ * instances, the HTTP API, launchd jobs: incremental-ingest, dream, gc, memory-reconcile, …), then
+ * starting the new ones. As a guard for a missed old process: a lock file in the old format whose
+ * PID is alive is treated as held and is never taken over (see acquireLock); if it was left by a
+ * process that is gone and its PID has been reused, a warning names the file to delete.
+ *
+ * - acquireLock(): open + non-blocking flock, write the diagnostic body
+ * - releaseLock(): unlink (while still locked) + close; never touches a lock this process does not hold
  * - rollbackLock(previousMtime): on failure, rewind lock mtime so next run retries
  * - shouldDistill(checkpointCount): session gate — checkpoint count < 3 → skip
  * - getLastDistillTime(): read lock file mtime, return 0 if absent
@@ -19,14 +31,16 @@ import {
   statSync,
   utimesSync,
   existsSync,
-  openSync,
   fstatSync,
   closeSync,
-  linkSync,
+  ftruncateSync,
+  writeSync,
 } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
 import * as envConfig from "./env-config.js";
+import { openLockFile, tryLockExclusive, unlockFd } from "./flock.js";
+import { logWarn } from "./stderr-log.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -35,7 +49,11 @@ import * as envConfig from "./env-config.js";
 export interface DistillLockConfig {
   /** Path to the lock file (default: data/distill.lock) */
   lockPath: string;
-  /** Lock expiry in ms (default: 3600000 = 1h) */
+  /**
+   * How long this holder expects to keep the lock (default: 3600000 = 1h). Recorded in the lock
+   * file; holding it longer only raises the stuck-holder warning. It never lets another process
+   * take the lock: only the kernel releases a flock.
+   */
   expireMs: number;
   /** Minimum checkpoint count before distill is allowed (default: 3) */
   minCheckpoints: number;
@@ -64,143 +82,107 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-// P2: in-process record of the ownership body we wrote into each lock file we hold.
-// releaseLock only removes a lock whose on-disk body still matches — so if our lock
-// expired mid-run and another process legitimately reclaimed it, our finally-release
-// won't delete the new owner's lock (which would break mutual exclusion).
-const heldTokens = new Map<string, string>();
-
-/** Parse the PID prefix from a lock file body (`<pid>` legacy, `<pid>:<token>` or `<pid>:<token>:<ttlMs>`). */
+/** Parse the PID prefix from a lock file body (`<pid>` legacy, `<pid>:<token>…`). */
 function parsePid(content: string): number {
   return parseInt((content.split(":")[0] ?? "").trim(), 10);
 }
 
-/**
- * The holder's own expiry, written as the third field when it took the lock. Waiters judge
- * staleness by this, not by whatever expireMs they themselves passed: a long holder (30 min)
- * must not be reclaimed by a writer that only waits 30 s. Legacy bodies without the field → null.
- */
-function parseTtl(content: string): number | null {
-  const field = content.trim().split(":")[2];
-  if (field === undefined) return null;
-  const ttl = Number(field);
-  return !Number.isNaN(ttl) && ttl > 0 ? ttl : null;
+const FLOCK_TAG = "flock";
+
+/** What this process holds: the open, flocked descriptor, its inode, and the body we wrote. */
+interface HeldLock {
+  fd: number;
+  dev: number;
+  ino: number;
+  body: string;
+}
+
+// Locks held by this process, by path. releaseLock only acts on an entry here, so a release can
+// never remove a lock some other process (or another call in this process) holds.
+const heldLocks = new Map<string, HeldLock>();
+
+interface HolderInfo {
+  pid: number;
+  token: string;
+  acquiredAt: number;
+  maxHoldMs: number;
+}
+
+/** Parse a body written by this version; null for the legacy format or garbage. */
+function parseFlockBody(content: string): HolderInfo | null {
+  const [pid, token, tag, acquiredAt, maxHoldMs] = content.trim().split(":");
+  if (tag !== FLOCK_TAG || pid === undefined || token === undefined) return null;
+  const info = { pid: parseInt(pid, 10), token, acquiredAt: Number(acquiredAt), maxHoldMs: Number(maxHoldMs) };
+  return Number.isNaN(info.pid) || Number.isNaN(info.acquiredAt) || Number.isNaN(info.maxHoldMs) ? null : info;
+}
+
+const warnedOnce = new Set<string>();
+
+function warnOnce(key: string, message: string): void {
+  if (warnedOnce.has(key)) return;
+  warnedOnce.add(key);
+  logWarn(message);
 }
 
 /**
- * A lock file with no parsable pid is reclaimable only after this long. This code never makes
- * one (createExclusive links the body into place), but a process still running the previous
- * version creates the file with an O_EXCL open and writes the body afterwards; judging that
- * brand-new, still-empty lock as garbage would delete it and hand out a second lock.
+ * A body from a pre-flock version naming a live PID. Such a process does not take the flock, so
+ * holding the flock proves nothing about it: refuse rather than take a lock it may be inside.
  */
-const UNPARSABLE_LOCK_GRACE_MS = 5_000;
-
-/** Dead holder, or the lock file has not been created/refreshed within the holder's expiry. */
-function isReclaimable(content: string, mtimeMs: number, fallbackExpireMs: number): boolean {
+function heldByLegacyProcess(lockPath: string, content: string, expectedHoldMs: number): boolean {
+  if (content.trim() === "" || parseFlockBody(content) !== null) return false;
   const pid = parsePid(content);
-  if (isNaN(pid)) return Date.now() - mtimeMs > UNPARSABLE_LOCK_GRACE_MS;
-  if (!isPidAlive(pid)) return true;
-  return Date.now() - mtimeMs > (parseTtl(content) ?? fallbackExpireMs);
+  if (isNaN(pid) || !isPidAlive(pid)) return false;
+  let ageMs = 0;
+  try {
+    ageMs = Date.now() - statSync(lockPath).mtimeMs;
+  } catch {
+    /* gone: report age 0 */
+  }
+  if (ageMs > expectedHoldMs) {
+    warnOnce(`legacy|${lockPath}|${content}`,
+      `[distill-lock] ${lockPath} is in the pre-flock format and names live pid ${pid} ` +
+      `(${Math.round(ageMs / 1000)} s old); treating it as held. If no RecallNest process from ` +
+      `before the flock upgrade is still running, that pid has been reused: delete the file.`);
+  }
+  return true;
 }
 
-/** Read body and mtime from one open file descriptor, so both describe the same file. */
-function readLockFile(lockPath: string): { content: string; mtimeMs: number } | null {
-  let fd: number;
+/** "pid 123, held 45 s (max hold 30 s)" for messages; null when the file says nothing useful. */
+function describeHolder(lockPath: string): string | null {
+  let content: string;
   try {
-    fd = openSync(lockPath, "r");
+    content = readFileSync(lockPath, "utf-8");
   } catch {
     return null;
   }
+  const info = parseFlockBody(content);
+  if (info === null) {
+    const pid = parsePid(content);
+    return isNaN(pid) ? null : `pid ${pid} (pre-flock lock file)`;
+  }
+  const heldMs = Date.now() - info.acquiredAt;
+  return `pid ${info.pid}, held ${Math.round(heldMs / 1000)} s (max hold ${Math.round(info.maxHoldMs / 1000)} s)`;
+}
+
+/**
+ * Waiter-side stuck-holder warning: the holder's own watchdog cannot fire if its event loop is
+ * blocked, so whoever is waiting also says so, once per holder.
+ */
+function warnIfHolderOverdue(key: string, lockPath: string): void {
+  let content: string;
   try {
-    return { content: readFileSync(fd, "utf-8"), mtimeMs: fstatSync(fd).mtimeMs };
+    content = readFileSync(lockPath, "utf-8");
   } catch {
-    return null;
-  } finally {
-    closeSync(fd);
+    return;
   }
-}
-
-/**
- * Create `path` holding `content`, failing (false) if it already exists. The content is written
- * to a private temp file first and hard-linked into place, so `path` never exists empty: with a
- * plain O_EXCL open the file appears before its body is written, and a process reading it in
- * that gap sees no pid and judges the brand-new lock reclaimable.
- */
-function createExclusive(path: string, content: string): boolean {
-  const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`;
-  writeFileSync(tmp, content, { encoding: "utf-8", flag: "wx" });
-  try {
-    linkSync(tmp, path);
-    return true;
-  } catch (err) {
-    if ((err as { code?: unknown }).code === "EEXIST") return false;
-    throw err;
-  } finally {
-    try {
-      unlinkSync(tmp);
-    } catch {
-      /* already gone */
-    }
-  }
-}
-
-/**
- * A marker file older than this whose creator may still be alive is treated as orphaned anyway
- * (pid reuse). Markers are held only across a few synchronous syscalls, never across an await,
- * so a live process can sit inside one this long only if it is frozen.
- */
-const CAS_MARKER_STALE_MS = 60_000;
-/** Each level only comes into play after a process died inside the level below. */
-const CAS_MAX_DEPTH = 3;
-
-/**
- * Delete `path` only if its content is still exactly `expected`. Returns true if this call deleted it.
- *
- * unlink has no compare-and-swap, so a plain read-check-unlink lets A delete the lock B created a
- * moment ago (B reclaimed first, A then unlinks B's fresh lock and creates its own: two holders).
- * Here every removal of a file with content C happens only while holding the O_EXCL marker
- * `<path>.cas-<hash(C)>`, and the content is re-read under it. Lock bodies carry a random token,
- * so once C is gone it never comes back: a late process that wins the marker after C was replaced
- * sees different content and leaves the file alone. That also makes it safe to drop the marker
- * right after the delete.
- *
- * A marker whose creator died before dropping it would otherwise pin C forever; it is removed the
- * same way, one level up (`<marker>.cas-<hash(marker body)>`).
- */
-function compareAndDelete(path: string, expected: string, depth = 0): boolean {
-  const markerPath = `${path}.cas-${createHash("sha256").update(expected).digest("hex").slice(0, 16)}`;
-  if (!createExclusive(markerPath, `${process.pid}:${randomUUID()}`)) {
-    // Another process is removing this exact content right now — or died while doing so.
-    if (depth >= CAS_MAX_DEPTH) return false;
-    const marker = readLockFile(markerPath);
-    if (marker === null) return compareAndDelete(path, expected, depth + 1); // just dropped: retry
-    const pid = parsePid(marker.content);
-    const orphaned = isNaN(pid) || !isPidAlive(pid) || Date.now() - marker.mtimeMs > CAS_MARKER_STALE_MS;
-    if (!orphaned) return false;
-    compareAndDelete(markerPath, marker.content, depth + 1);
-    return compareAndDelete(path, expected, depth + 1);
-  }
-  try {
-    let current: string;
-    try {
-      current = readFileSync(path, "utf-8");
-    } catch {
-      return false;
-    }
-    if (current !== expected) return false;
-    try {
-      unlinkSync(path);
-    } catch {
-      return false;
-    }
-    return true;
-  } finally {
-    try {
-      unlinkSync(markerPath);
-    } catch {
-      /* already gone */
-    }
-  }
+  const info = parseFlockBody(content);
+  if (info === null) return;
+  const heldMs = Date.now() - info.acquiredAt;
+  if (heldMs <= info.maxHoldMs) return;
+  warnOnce(`overdue|${lockPath}|${info.token}`,
+    `[distill-lock] lock '${key}' has been held by pid ${info.pid} for ${Math.round(heldMs / 1000)} s, ` +
+    `past its max hold of ${Math.round(info.maxHoldMs / 1000)} s. Writers waiting on it will time out ` +
+    `until that process finishes or is restarted.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,88 +190,66 @@ function compareAndDelete(path: string, expected: string, depth = 0): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * Try to acquire the distill lock.
- * Returns true if lock was acquired, false if another live process holds it.
- * `expireMs` is written into the lock file as this holder's expiry; when judging someone
- * else's lock, the expiry in their file wins and `expireMs` is only the fallback for
- * legacy lock files that carry none.
+ * Try to acquire the lock without waiting.
+ * Returns true if acquired, false if another holder (another process, or another call in this
+ * process) has it, or if a live pre-flock process is named in the lock file.
  */
 export function acquireLock(cfg?: Partial<DistillLockConfig>): boolean {
   const { lockPath, expireMs } = resolveConfig(cfg);
+  if (heldLocks.has(lockPath)) return false;
   mkdirSync(dirname(lockPath), { recursive: true });
 
-  // Fast path: atomic exclusive create. link() fails with EEXIST like an O_EXCL open, so
-  // only one of N processes creating the same lock succeeds.
-  // This closes the check-then-write TOCTOU the previous existsSync+writeFileSync
-  // form had (two processes could both see "no lock" then both write); the P0-1
-  // store-write lock relies on acquisition being truly exclusive.
-  if (tryExclusiveCreate(lockPath, expireMs)) return true;
+  // A releaser unlinks the file while it still holds the flock; a process that opened the path
+  // before that unlink can get the flock on the orphaned inode afterwards. So after locking,
+  // check that the path still names our inode, and start over if not.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const fd = openLockFile(lockPath);
+    let keep = false;
+    try {
+      if (!tryLockExclusive(fd)) return false;
+      const ours = fstatSync(fd);
+      let onDisk: ReturnType<typeof statSync>;
+      try {
+        onDisk = statSync(lockPath);
+      } catch {
+        continue; // unlinked after we opened it
+      }
+      if (onDisk.ino !== ours.ino || onDisk.dev !== ours.dev) continue;
 
-  // Lock file exists — decide whether it is reclaimable (dead holder or expired).
-  const existing = readLockFile(lockPath);
-  if (existing === null) {
-    // Holder released between our failed create and this read — retry the create.
-    return tryExclusiveCreate(lockPath, expireMs);
-  }
-  if (!isReclaimable(existing.content, existing.mtimeMs, expireMs)) {
-    return false; // held by a live process, not expired
-  }
+      if (heldByLegacyProcess(lockPath, readFileSync(fd, "utf-8"), expireMs)) return false;
 
-  // Reclaim a stale lock: remove exactly the content we judged stale (never a lock some
-  // competing reclaimer has just created in its place), then re-create atomically. Whether
-  // or not we were the one to remove it, the exclusive create decides who holds the lock now.
-  compareAndDelete(lockPath, existing.content);
-  return tryExclusiveCreate(lockPath, expireMs);
+      const body = `${process.pid}:${randomUUID()}:${FLOCK_TAG}:${Date.now()}:${expireMs}`;
+      ftruncateSync(fd, 0);
+      writeSync(fd, body, 0);
+      heldLocks.set(lockPath, { fd, dev: ours.dev, ino: ours.ino, body });
+      keep = true;
+      return true;
+    } finally {
+      if (!keep) closeSync(fd);
+    }
+  }
+  return false;
 }
 
 /**
- * Atomic exclusive create of the lock file (see createExclusive). Writes a unique ownership body
- * (`<pid>:<uuid>:<expireMs>`) and records it so releaseLock can verify we still own the
- * lock. false on EEXIST.
- */
-function tryExclusiveCreate(lockPath: string, expireMs: number): boolean {
-  const body = `${process.pid}:${randomUUID()}:${expireMs}`;
-  if (!createExclusive(lockPath, body)) return false;
-  heldTokens.set(lockPath, body);
-  return true;
-}
-
-/**
- * Refresh the mtime of a lock we still hold, so waiters keep seeing it as unexpired.
- * No-op (returns false) once the lock is gone or has been reclaimed by another owner.
- */
-export function refreshLock(cfg?: Partial<DistillLockConfig>): boolean {
-  const { lockPath } = resolveConfig(cfg);
-  const ours = heldTokens.get(lockPath);
-  if (ours === undefined) return false;
-  try {
-    if (readFileSync(lockPath, "utf-8") !== ours) return false;
-    const now = new Date();
-    utimesSync(lockPath, now, now);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Release the distill lock. If we hold a known ownership token for this path, only
- * remove the file when its on-disk token still matches ours — otherwise our lock was
- * expired and reclaimed by another process, and deleting would evict the new owner.
- * When we hold no token (e.g. a direct caller/test-written lock) fall back to removing.
+ * Release a lock this process holds: remove the file while still holding the flock (so a waiter
+ * that opened it earlier sees the inode is gone and retries), then close the descriptor, which
+ * drops the flock. A lock this process does not hold is left alone — never unlinked blind.
  */
 export function releaseLock(cfg?: Partial<DistillLockConfig>): void {
   const { lockPath } = resolveConfig(cfg);
-  const ourToken = heldTokens.get(lockPath);
-  heldTokens.delete(lockPath);
-  if (!existsSync(lockPath)) return;
-  if (ourToken !== undefined) {
-    // Same compare-and-delete as reclaim: a plain read-then-unlink could remove the lock a
-    // reclaimer created in the gap. If it no longer holds our body we were reclaimed — leave it.
-    compareAndDelete(lockPath, ourToken);
-    return;
+  const held = heldLocks.get(lockPath);
+  if (held === undefined) return;
+  heldLocks.delete(lockPath);
+  try {
+    const onDisk = statSync(lockPath);
+    if (onDisk.ino === held.ino && onDisk.dev === held.dev) unlinkSync(lockPath);
+  } catch {
+    /* already gone */
+  } finally {
+    unlockFd(held.fd);
+    closeSync(held.fd);
   }
-  unlinkSync(lockPath);
 }
 
 /**
@@ -337,11 +297,6 @@ export function locksDir(lockDir?: string): string {
 }
 
 /**
- * Resolve a lock key (e.g. "store-write", "dream-<scope>", "gc-global") to a safe
- * lock-file path. The key is sanitized for the filesystem and suffixed with a short
- * hash of the raw key so distinct keys never collide after sanitization/truncation.
- */
-/**
  * 只读查看一把命名锁：在不在、持有者进程活没活、锁文件多久没更新。不改任何东西。
  * 记忆文件对账用它区分「dream / GC 正常在跑」和「某个进程占着锁很久没动静」（后者要报警，不然对账会一直静默跳过）。
  */
@@ -356,6 +311,11 @@ export function inspectLock(key: string, lockDir?: string): { exists: boolean; p
   }
 }
 
+/**
+ * Resolve a lock key (e.g. "store-write", "dream-<scope>", "gc-global") to a safe
+ * lock-file path. The key is sanitized for the filesystem and suffixed with a short
+ * hash of the raw key so distinct keys never collide after sanitization/truncation.
+ */
 export function lockPathForKey(key: string, lockDir?: string): string {
   const safe = key.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
   const hash = createHash("sha256").update(key).digest("hex").slice(0, 8);
@@ -364,20 +324,16 @@ export function lockPathForKey(key: string, lockDir?: string): string {
 
 export interface WithLockOptions {
   /**
-   * This holder's expiry in ms (default 600_000 = 10min), written into the lock file: other
-   * processes may reclaim the lock once it has gone this long without being created or
-   * refreshed. Judging someone else's lock uses the expiry in their file, not this value.
+   * How long this holder expects to keep the lock (default 600_000 = 10 min). Recorded in the lock
+   * file. Past it the holder logs a loud warning and `fn`'s AbortSignal fires; waiters log too.
+   * It never lets anyone take the lock away from a live holder.
    */
+  maxHoldMs?: number;
+  /** Older name for maxHoldMs, kept so existing callers read the same; maxHoldMs wins if both are set. */
   expireMs?: number;
-  /**
-   * Refresh the lock file's mtime at this interval while `fn` runs (default: no heartbeat).
-   * For holders that can run longer than their expiry: with a heartbeat, `expireMs` only has
-   * to cover a stalled event loop, not the whole run.
-   */
-  heartbeatMs?: number;
   /** Override the base lock directory (tests). */
   lockDir?: string;
-  /** Behavior when another live process holds the lock (default "skip"). */
+  /** Behavior when another holder has the lock (default "skip"). */
   onBusy?: "skip" | "wait";
   /** For onBusy="wait": total time budget before throwing (default 10_000). */
   waitTimeoutMs?: number;
@@ -389,21 +345,39 @@ export type WithLockOutcome<T> =
   | { ran: true; result: T }
   | { ran: false; reason: "locked_by_another_process" };
 
+/** Reason carried by the AbortSignal handed to `fn` once the lock is held past its max hold. */
+export class LockHoldDeadlineError extends Error {
+  constructor(readonly key: string, readonly maxHoldMs: number) {
+    super(`lock '${key}' held past its max hold of ${maxHoldMs} ms`);
+    this.name = "LockHoldDeadlineError";
+  }
+}
+
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
+
+/** setTimeout/setInterval treat longer delays as 1 ms; such a max hold means "no deadline". */
+const MAX_TIMER_MS = 2_147_483_647;
 
 /**
  * Run `fn` while holding a named cross-process lock, releasing it afterwards
  * (even on throw). Maintenance-type writes use onBusy:"skip" — for a personal
  * store, skipping a redundant dream/consolidate/gc run beats queueing it.
+ *
+ * Stuck holders: once `fn` has held the lock for `maxHoldMs`, this process logs a warning (and
+ * again every `maxHoldMs` while it still holds it) and aborts the signal passed to `fn`. The lock
+ * itself is NOT released then — `fn` may be in the middle of a write, and handing the lock to the
+ * next writer would be exactly the double-writer bug this lock exists to prevent. A caller that can
+ * stop at a safe point (e.g. between independent batches) checks `signal.aborted` and returns.
  */
 export async function withLock<T>(
   key: string,
-  fn: () => Promise<T>,
+  fn: (signal: AbortSignal) => Promise<T>,
   opts: WithLockOptions = {},
 ): Promise<WithLockOutcome<T>> {
   const lockPath = lockPathForKey(key, opts.lockDir);
-  const lockCfg = { lockPath, expireMs: opts.expireMs ?? 600_000 };
+  const maxHoldMs = opts.maxHoldMs ?? opts.expireMs ?? 600_000;
+  const lockCfg = { lockPath, expireMs: maxHoldMs };
 
   if (!acquireLock(lockCfg)) {
     if ((opts.onBusy ?? "skip") === "skip") {
@@ -415,6 +389,7 @@ export async function withLock<T>(
     const pollMs = opts.pollMs ?? 50;
     let acquired = false;
     while (Date.now() < deadline) {
+      warnIfHolderOverdue(key, lockPath);
       await sleep(pollMs);
       if (acquireLock(lockCfg)) {
         acquired = true;
@@ -422,18 +397,33 @@ export async function withLock<T>(
       }
     }
     if (!acquired) {
-      throw new Error(`lock '${key}' timed out after ${timeoutMs}ms (held by another process)`);
+      const holder = describeHolder(lockPath);
+      throw new Error(`lock '${key}' timed out after ${timeoutMs}ms (held by ${holder ?? "another process"})`);
     }
   }
 
-  const heartbeat = opts.heartbeatMs !== undefined && opts.heartbeatMs > 0
-    ? setInterval(() => refreshLock(lockCfg), opts.heartbeatMs)
+  const controller = new AbortController();
+  const acquiredAt = Date.now();
+  let repeat: ReturnType<typeof setInterval> | undefined;
+  const overdue = (): void => {
+    logWarn(`[distill-lock] lock '${key}' held by this process (pid ${process.pid}) for ` +
+      `${Math.round((Date.now() - acquiredAt) / 1000)} s, past its max hold of ${Math.round(maxHoldMs / 1000)} s. ` +
+      `Its critical section looks stuck; other writers time out until it finishes or this process is restarted.`);
+  };
+  const watchdog = maxHoldMs <= MAX_TIMER_MS
+    ? setTimeout(() => {
+      overdue();
+      controller.abort(new LockHoldDeadlineError(key, maxHoldMs));
+      repeat = setInterval(overdue, maxHoldMs);
+      repeat.unref?.();
+    }, maxHoldMs)
     : undefined;
-  heartbeat?.unref?.();
+  watchdog?.unref?.();
   try {
-    return { ran: true, result: await fn() };
+    return { ran: true, result: await fn(controller.signal) };
   } finally {
-    if (heartbeat !== undefined) clearInterval(heartbeat);
+    if (watchdog !== undefined) clearTimeout(watchdog);
+    if (repeat !== undefined) clearInterval(repeat);
     releaseLock(lockCfg);
   }
 }
@@ -446,7 +436,7 @@ export async function withLock<T>(
  */
 export async function withWriteLock<T>(
   key: string,
-  fn: () => Promise<T>,
+  fn: (signal: AbortSignal) => Promise<T>,
   opts: Omit<WithLockOptions, "onBusy"> = {},
 ): Promise<T> {
   const outcome = await withLock(key, fn, { ...opts, onBusy: "wait" });
@@ -470,4 +460,14 @@ export function stampLock(cfg?: Partial<DistillLockConfig>): void {
   // file in place — it is a persistent "last run" marker (gc's cross-process throttle),
   // read back via getLastDistillTime.
   writeFileSync(lockPath, String(process.pid), "utf-8");
+}
+
+/** Remove a stamp written by stampLock (tests). Stamps are markers, not locks: nobody holds them. */
+export function clearStamp(cfg?: Partial<DistillLockConfig>): void {
+  const { lockPath } = resolveConfig(cfg);
+  try {
+    unlinkSync(lockPath);
+  } catch {
+    /* already gone */
+  }
 }

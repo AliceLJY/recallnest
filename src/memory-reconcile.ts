@@ -73,8 +73,9 @@ const LOCK_HEARTBEAT_MS = 60_000;
  */
 export const RECONCILE_LOCK_KEYS = ["memory-reconcile", `consolidate-${MEMORY_DOC_SCOPE}`, "gc-run"] as const;
 /**
- * 判断别人的锁是否过期时用的时限：一律视为永不过期——持有者进程还活着就绝不抢（死进程留下的锁照常回收）。
- * dream / GC 自己不续期，按修改时间回收会在它们跑得久时把锁抢过来、让它们在对账之后拿旧判断提交（上线前代码单审 C2）。
+ * 对账自己持锁时登记的「预计最长持有」：不设上限，不触发 distill-lock 的超时告警（对账跑多久都正常）。
+ * 「持有者进程还活着就绝不抢」现在由内核保证：锁是 flock，活着的持有者谁都拿不走，进程一退出或被杀就自动释放，
+ * 跟双方各自传的时限无关（上线前代码单审 C2；PR #27 互审：持锁方的 10 / 30 分钟租期曾被当成可抢的时限）。
  * 活着却长期不动的持有者由 LOCK_STALE_ALERT_MS 报警兜住。
  */
 const NEVER_EXPIRE_MS = Number.MAX_SAFE_INTEGER;
@@ -1003,7 +1004,7 @@ async function withLocks<T>(keys: readonly string[], fn: () => Promise<T>): Prom
   return outcome.ran ? inner : { ran: false, busy: head };
 }
 
-/** 刷新所持锁文件的 mtime：别的进程按 mtime 判断锁是否过期，长任务不刷就可能被当成死锁抢走。 */
+/** 刷新所持锁文件的 mtime。锁不会因 mtime 旧被抢（flock），这里只让 inspectLock 报的「多久没更新」反映对账还在动。 */
 function touchLocks(keys: readonly string[]): void {
   const now = new Date();
   for (const key of keys) {

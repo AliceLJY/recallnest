@@ -104,21 +104,20 @@ export interface LegacyScopeAudit {
 // ============================================================================
 
 /**
- * Options for every `store-write` critical section in this file. The expiry is written into the
- * lock file, so other processes reclaim the lock only once its holder has gone this long without
- * finishing (or, with a heartbeat, without refreshing). Waiters wait as long as that expiry: with
- * a shorter budget (the old 10 s default against a 30 s expiry) a waiter throws while a live
- * holder is still inside its own window, and can never get as far as reclaiming a stalled one.
+ * Options for every `store-write` critical section (this file, checkpoint-mirror.ts). The lock is a
+ * kernel flock (distill-lock.ts): nobody can take it from a live holder, it is freed the moment the
+ * holder exits or is killed. `maxHoldMs` only raises the stuck-holder warning. Waiters wait at least
+ * as long as a normal hold may last: with a shorter budget (the old 10 s default against 30 s holds)
+ * a waiter throws while a healthy holder is still inside its own window.
  */
-export const STORE_WRITE_LOCK_OPTS = { expireMs: 30_000, waitTimeoutMs: 30_000 } as const;
+export const STORE_WRITE_LOCK_OPTS = { maxHoldMs: 30_000, waitTimeoutMs: 30_000 } as const;
 
 /**
- * For a critical section that can outlast the expiry (the singleton version-group pass scans the
- * whole table): keep the same 30 s expiry and refresh the lock file while it runs. Previously it
- * passed a 30-minute expiry, which only its own waiting honoured — every other writer judged it
- * by 30 s and reclaimed it while it was still writing.
+ * For the singleton version-group pass, which scans the whole table under the lock: same wait
+ * budget, but it may legitimately hold for longer, so it only counts as stuck after 30 minutes —
+ * at which point it stops at the next batch boundary (see repairSingletonVersionGroups).
  */
-export const STORE_WRITE_LONG_LOCK_OPTS = { ...STORE_WRITE_LOCK_OPTS, heartbeatMs: 5_000 } as const;
+export const STORE_WRITE_LONG_LOCK_OPTS = { maxHoldMs: 30 * 60_000, waitTimeoutMs: 30_000 } as const;
 
 // ============================================================================
 // Deterministic ID
@@ -1543,7 +1542,7 @@ export class MemoryStore implements MemoryStorePort {
   async repairSingletonVersionGroups(): Promise<number> {
     await this.ensureInitialized();
 
-    return withWriteLock("store-write", async () => {
+    return withWriteLock("store-write", async (signal) => {
       const membershipRows = await this.table!.query()
         .select(["id", "metadata"])
         .toArray();
@@ -1558,6 +1557,12 @@ export class MemoryStore implements MemoryStorePort {
       let repaired = 0;
       const BATCH = 200;
       for (let i = 0; i < repairs.length; i += BATCH) {
+        // Past its max hold: stop between batches (each batch is an independent, re-checked
+        // commit) so the lock goes back to other writers; the rest is repaired next pass.
+        if (signal.aborted) {
+          logWarn(`[store] repairSingletonVersionGroups stopped after ${repaired} of ${repairs.length} repairs: held store-write past its max hold`);
+          break;
+        }
         const batch = repairs.slice(i, i + BATCH);
         const expectedById = new Map(batch.map(item => [item.id, item.groupId]));
         const conditions = batch

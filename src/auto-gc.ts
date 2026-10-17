@@ -22,7 +22,7 @@ import type { RetentionPolicy } from "./retention-policy.js";
 import type { AuditLogger } from "./audit-log.js";
 import * as envConfig from "./env-config.js";
 import { isUsageSignalActive } from "./usage-tracker.js";
-import { acquireLock, releaseLock, getLastDistillTime, stampLock, lockPathForKey } from "./distill-lock.js";
+import { acquireLock, releaseLock, getLastDistillTime, stampLock, clearStamp, lockPathForKey } from "./distill-lock.js";
 import { logInfo } from "./stderr-log.js";
 
 // ---------------------------------------------------------------------------
@@ -315,9 +315,10 @@ export function resetGcTimestamp(): void {
   lastGcTimestamp = 0;
   lastVersionGroupRepairTimestamp = 0;
   try {
-    releaseLock({ lockPath: lockPathForKey("gc-last") });
+    clearStamp({ lockPath: lockPathForKey("gc-last") });
+    clearStamp({ lockPath: lockPathForKey("version-group-repair-last") });
+    // Only releases gc-run if this process holds it; another holder's lock is never removed.
     releaseLock({ lockPath: lockPathForKey("gc-run") });
-    releaseLock({ lockPath: lockPathForKey("version-group-repair-last") });
   } catch {
     /* ignore — nothing to clear */
   }

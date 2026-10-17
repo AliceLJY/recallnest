@@ -1,23 +1,25 @@
 /**
- * 跨进程锁的多进程用例（2026-10-17）。distill-lock.test.ts 只在单进程里跑，这里把锁交给真的子进程去抢。
+ * 跨进程锁的多进程用例（2026-10-17；PR #27 互审后锁改成内核 flock）。distill-lock.test.ts 只在单进程里跑，
+ * 这里把锁交给真的子进程：
  *
- *   1. 回收过期锁的竞态：留一把过期锁（持有者 pid 已死 / 持有者活着但锁文件过期），8 个子进程在同一时刻
- *      `acquireLock`，重复 100 轮，每轮恰好一个赢家，锁文件里留着的就是赢家写进去的那份。
- *      改之前是「读 → 删 → 建」，A 的删会删掉 B 刚建好的新锁，这台云端机器上 40 轮里 15–17 轮不止一个赢家。
- *   2. 端到端互斥：几个子进程用 `withWriteLock` 在锁内对同一个计数文件做读改写，中途有进程持锁时被
- *      SIGKILL，剩下的进程回收它的锁后继续；临界区用 O_EXCL 哨兵文件探测「同时有两个在里面」。
- *   3. 过期时间以持锁方为准：子进程以 30 分钟过期持锁，锁文件 mtime 往回拨 31 秒，按 30 秒判断的
- *      等待方仍然拿不到锁；子进程跑完自己放锁。
+ *   1. 同时抢：上一个持有者死了、锁文件留在原地，8 个子进程在同一时刻 `acquireLock`，100 轮，每轮恰好一个赢家，
+ *      锁文件里留着的就是赢家写的那份。改成 flock 之前是「读 → 删 → 建」，40 轮里 15–17 轮不止一个赢家。
+ *      旧格式锁文件写着活着的 pid（还没停掉的旧版进程）：100 轮里一个赢家都没有。
+ *   2. 任意时刻 SIGKILL：6 个子进程不停地进出 `withWriteLock`，父进程每隔几十毫秒随机杀掉一个再补一个
+ *      ——落在拿锁中、临界区里、放锁中都有可能。临界区里用写着 pid 的哨兵文件探测「同时有两个活进程在里面」。
+ *   3. 持有者被杀：哪怕它登记的预计持有是 30 分钟，别的进程立刻就能拿到，不用等任何过期。
+ *   4. 持有超时：子进程登记 300 ms、却一直不出临界区；锁文件 mtime 再往回拨两小时。别的进程照样拿不到
+ *      （不会因为超时被抢），等待方超时报错时点出持有者 pid，持有方和等待方都打出告警。
  *
  * 一律在临时目录里跑，不碰 data/。
  */
 import { afterAll, describe, expect, it } from "bun:test";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import { acquireLock, lockPathForKey } from "../distill-lock.js";
+import { acquireLock, lockPathForKey, releaseLock, withWriteLock } from "../distill-lock.js";
 
 const LOCK_MODULE = resolve(import.meta.dir, "../distill-lock.ts");
 const BUN = Bun.which("bun")!;
@@ -35,8 +37,7 @@ function tempDir(prefix: string): string {
 
 /** 一个确定已经退出的进程的 pid：起一个立刻结束的进程，等它退出再拿它的 pid。 */
 function deadPid(): number {
-  const child = spawnSync("true");
-  const pid = child.pid;
+  const pid = spawnSync("true").pid;
   if (typeof pid !== "number") throw new Error("could not obtain a dead pid");
   return pid;
 }
@@ -60,209 +61,264 @@ function runChild(script: string, args: string[]): Promise<ChildRun> {
   });
 }
 
+/** Start a child and resolve once its stdout contains `marker`. */
+function startUntil(script: string, args: string[], marker: string): Promise<{ child: ChildProcess; out: () => string; err: () => string; closed: Promise<number | null> }> {
+  return new Promise((done, fail) => {
+    const child = spawn(BUN, [script, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    const closed = new Promise<number | null>((r) => child.on("close", (code) => r(code)));
+    child.stderr!.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on("error", fail);
+    child.stdout!.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+      if (stdout.includes(marker)) done({ child, out: () => stdout, err: () => stderr, closed });
+    });
+    void closed.then(() => { if (!stdout.includes(marker)) fail(new Error(`child exited before '${marker}': ${stderr}`)); });
+  });
+}
+
 // ---------------------------------------------------------------------------
-// 1. 同时回收同一把过期锁：每轮至多（也恰好）一个赢家
+// 1. 同时抢一把空出来的锁
 // ---------------------------------------------------------------------------
 
-const RECLAIM_CHILD = `
+const RACE_CHILD = `
 import { acquireLock } from ${JSON.stringify(LOCK_MODULE)};
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const [dir, roundsArg, t0Arg, gapArg, expireArg] = process.argv.slice(2);
-const rounds = Number(roundsArg), t0 = Number(t0Arg), gap = Number(gapArg), expireMs = Number(expireArg);
+const [dir, roundsArg, t0Arg, gapArg] = process.argv.slice(2);
+const rounds = Number(roundsArg), t0 = Number(t0Arg), gap = Number(gapArg);
 const results = [];
 for (let r = 0; r < rounds; r++) {
   const start = t0 + r * gap;
   while (Date.now() < start) { /* 自旋等到这一轮的发令时刻，让 8 个进程尽量同时出手 */ }
   const lockPath = join(dir, "round-" + r + ".lock");
-  const won = acquireLock({ lockPath, expireMs });
-  // 赢了就立刻记下自己写进去的内容：别的进程若把它删掉重建，终局内容就对不上了。
+  const won = acquireLock({ lockPath, expireMs: 60_000 });
   results.push({ round: r, won, body: won ? readFileSync(lockPath, "utf-8") : null });
 }
-// 不放锁，也先别退出：赢家的 pid 一死，落在后面的进程就能合法回收，那就测不出竞态了。
+// 不放锁，也先别退出：赢家一退出，落在后面的进程就能合法拿到锁，那就测不出同时有两个了。
 const end = t0 + rounds * gap + 1500;
 while (Date.now() < end) await new Promise((r) => setTimeout(r, 20));
 console.log(JSON.stringify({ pid: process.pid, results }));
 `;
 
-interface ReclaimResult {
+interface RaceResult {
   pid: number;
   results: Array<{ round: number; won: boolean; body: string | null }>;
 }
 
-async function raceReclaim(staleBody: string, staleMtime: Date | null): Promise<void> {
+async function race(leftover: string): Promise<{ winnersPerRound: number[]; dir: string; parsed: RaceResult[] }> {
   const CHILDREN = 8;
   const ROUNDS = 100;
   const GAP_MS = 30;
-  const EXPIRE_MS = 60_000;
-  const dir = tempDir("rn-lock-reclaim-");
+  const dir = tempDir("rn-lock-race-");
   const script = join(dir, "child.ts");
-  writeFileSync(script, RECLAIM_CHILD);
-  for (let r = 0; r < ROUNDS; r++) {
-    const p = join(dir, `round-${r}.lock`);
-    writeFileSync(p, staleBody);
-    if (staleMtime) utimesSync(p, staleMtime, staleMtime);
-  }
+  writeFileSync(script, RACE_CHILD);
+  for (let r = 0; r < ROUNDS; r++) writeFileSync(join(dir, `round-${r}.lock`), leftover);
   // 子进程启动要几百毫秒，发令时刻留足余量；晚到的进程照样参赛，只是对手少了，不影响断言。
   const t0 = Date.now() + 2_500;
   const runs = await Promise.all(
-    Array.from({ length: CHILDREN }, () =>
-      runChild(script, [dir, String(ROUNDS), String(t0), String(GAP_MS), String(EXPIRE_MS)])),
+    Array.from({ length: CHILDREN }, () => runChild(script, [dir, String(ROUNDS), String(t0), String(GAP_MS)])),
   );
-  const parsed: ReclaimResult[] = runs.map((run) => {
-    expect(run.stderr).toBe("");
+  const parsed: RaceResult[] = runs.map((run) => {
     expect(run.code).toBe(0);
-    return JSON.parse(run.stdout.trim()) as ReclaimResult;
+    return JSON.parse(run.stdout.trim()) as RaceResult;
   });
-
-  const multiWinnerRounds: number[] = [];
-  for (let r = 0; r < ROUNDS; r++) {
-    const winners = parsed.flatMap((p) => p.results.filter((x) => x.round === r && x.won));
-    if (winners.length !== 1) multiWinnerRounds.push(r);
-    if (winners.length === 1) {
-      // 锁文件里留着的就是赢家写的那份：没有别的进程把它删了重建。
-      expect(readFileSync(join(dir, `round-${r}.lock`), "utf-8")).toBe(winners[0]!.body!);
-    }
-  }
-  expect(multiWinnerRounds).toEqual([]);
+  const winnersPerRound = Array.from({ length: ROUNDS }, (_, r) =>
+    parsed.reduce((n, p) => n + p.results.filter((x) => x.round === r && x.won).length, 0));
+  return { winnersPerRound, dir, parsed };
 }
 
-describe("reclaiming a stale lock from many processes at once", () => {
-  it("dead holder: exactly one of 8 processes wins, in every one of 100 rounds", async () => {
-    await raceReclaim(`${deadPid()}:dead-holder-token`, null);
+describe("many processes acquiring the same free lock at once", () => {
+  it("lock file left by a dead holder: exactly one of 8 wins, in every one of 100 rounds", async () => {
+    const { winnersPerRound, dir, parsed } = await race(`${deadPid()}:dead-holder:flock:${Date.now()}:30000`);
+    expect(winnersPerRound.filter((n) => n !== 1)).toEqual([]);
+    for (let r = 0; r < winnersPerRound.length; r++) {
+      const winner = parsed.flatMap((p) => p.results).find((x) => x.round === r && x.won)!;
+      expect(readFileSync(join(dir, `round-${r}.lock`), "utf-8")).toBe(winner.body!);
+    }
   }, 30_000);
 
-  it("expired holder that is still alive: exactly one of 8 processes wins, in every one of 100 rounds", async () => {
-    // 持有者是测试进程本身（活着），锁文件两小时没动过，按 60 秒判定为过期。
-    await raceReclaim(`${process.pid}:expired-holder-token`, new Date(Date.now() - 7_200_000));
+  it("pre-flock lock file naming a live pid: nobody takes it, in any of 100 rounds", async () => {
+    const { winnersPerRound } = await race(`${process.pid}:legacy-holder`);
+    expect(winnersPerRound.filter((n) => n !== 0)).toEqual([]);
   }, 30_000);
 });
 
 // ---------------------------------------------------------------------------
-// 2. 端到端：持锁进程被杀掉之后，剩下的写方之间仍然互斥
+// 2. 随机时刻 SIGKILL，互斥照样成立、也不会卡死
 // ---------------------------------------------------------------------------
 
 const WORKER_CHILD = `
-import { withWriteLock, lockPathForKey } from ${JSON.stringify(LOCK_MODULE)};
-import { openSync, closeSync, readFileSync, writeFileSync, unlinkSync, appendFileSync } from "node:fs";
+import { withWriteLock } from ${JSON.stringify(LOCK_MODULE)};
+import { openSync, closeSync, readFileSync, writeFileSync, unlinkSync, appendFileSync, existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
-const [dir, itersArg, t0Arg] = process.argv.slice(2);
-const iters = Number(itersArg), t0 = Number(t0Arg);
-const counter = join(dir, "counter");
+const [dir] = process.argv.slice(2);
 const sentinel = join(dir, "inside");
-while (Date.now() < t0) await new Promise((r) => setTimeout(r, 2));
-for (let i = 0; i < iters; i++) {
-  await withWriteLock("mp-counter", async () => {
-    let fd;
-    try { fd = openSync(sentinel, "wx"); } catch {
-      appendFileSync(join(dir, "violations"), process.pid + "\\n");
-    }
-    const n = Number(readFileSync(counter, "utf-8"));
-    await new Promise((r) => setTimeout(r, 1));
-    writeFileSync(counter, String(n + 1));
-    if (fd !== undefined) { closeSync(fd); unlinkSync(sentinel); }
-  }, { lockDir: dir, expireMs: 20_000, waitTimeoutMs: 25_000, pollMs: 1 });
-}
-console.log("done");
-`;
-
-const VICTIM_CHILD = `
-import { acquireLock, lockPathForKey } from ${JSON.stringify(LOCK_MODULE)};
-const [dir, t0Arg, delayArg] = process.argv.slice(2);
-const at = Number(t0Arg) + Number(delayArg);
-while (Date.now() < at) await new Promise((r) => setTimeout(r, 1));
-const lockPath = lockPathForKey("mp-counter", dir);
+// A SIGKILLed worker stays a zombie until the test runner reaps it: kill(pid, 0) still succeeds,
+// but the process is gone and the kernel has already dropped its flock. Count zombies as dead.
+const statState = (line) => line.slice(line.lastIndexOf(") ") + 2, line.lastIndexOf(") ") + 3);
+const alive = (pid) => {
+  try { process.kill(pid, 0); } catch { return false; }
+  const stat = existsSync("/proc/" + pid + "/stat")
+    ? statState(readFileSync("/proc/" + pid + "/stat", "utf-8"))
+    : spawnSync("ps", ["-o", "stat=", "-p", String(pid)]).stdout.toString().trim().slice(0, 1);
+  return stat !== "Z" && stat !== "";
+};
+console.log("up");
 for (;;) {
-  if (acquireLock({ lockPath, expireMs: 20_000 })) {
-    console.log("holding");
-    process.kill(process.pid, "SIGKILL"); // 持锁时被杀，锁文件留在原地、持有者 pid 已死
-  }
-  await new Promise((r) => setTimeout(r, 1));
+  await withWriteLock("mp-kill", async () => {
+    // 哨兵写着当前在临界区里的 pid。还在、且那个 pid 活着 = 有两个活进程同时在里面。
+    // 还在但 pid 已死 = 上一个持有者在临界区里被杀了，不算违例。
+    try {
+      const fd = openSync(sentinel, "wx"); writeFileSync(fd, String(process.pid)); closeSync(fd);
+    } catch {
+      const other = Number(readFileSync(sentinel, "utf-8"));
+      if (other && other !== process.pid && alive(other)) appendFileSync(join(dir, "violations"), other + " " + process.pid + " " + Date.now() + "\\n");
+      writeFileSync(sentinel, String(process.pid));
+    }
+    await new Promise((r) => setTimeout(r, Math.random() * 3));
+    if (readFileSync(sentinel, "utf-8") === String(process.pid)) unlinkSync(sentinel);
+    appendFileSync(join(dir, "done-" + process.pid), "x");
+  }, { lockDir: dir, maxHoldMs: 30_000, waitTimeoutMs: 60_000, pollMs: 1 });
 }
 `;
 
-describe("mutual exclusion survives holders being SIGKILLed", () => {
-  it("counter read-modify-write under withWriteLock loses no update and never has two writers inside", async () => {
-    const WORKERS = 6;
-    const ITERS = 25;
+describe("mutual exclusion survives SIGKILL at any point", () => {
+  it("6 workers, one killed and replaced every 15–60 ms for 6 s: never two live writers inside, never wedged", async () => {
     const dir = tempDir("rn-lock-kill-");
     const worker = join(dir, "worker.ts");
-    const victim = join(dir, "victim.ts");
     writeFileSync(worker, WORKER_CHILD);
-    writeFileSync(victim, VICTIM_CHILD);
-    writeFileSync(join(dir, "counter"), "0");
-    // 一开始就有一把死掉的持有者留下的锁：第一批写方一起来回收。
-    writeFileSync(lockPathForKey("mp-counter", dir), `${deadPid()}:dead-holder-token`);
+    const workers = new Set<ChildProcess>();
+    const spawnWorker = (): void => {
+      const child = spawn(BUN, [worker, dir], { stdio: ["ignore", "ignore", "pipe"] });
+      child.stderr!.on("data", (chunk: Buffer) => { stderrAll += chunk.toString(); });
+      workers.add(child);
+      child.on("close", () => workers.delete(child));
+    };
+    let stderrAll = "";
+    for (let i = 0; i < 6; i++) spawnWorker();
+    await new Promise((r) => setTimeout(r, 1_500)); // let them start
 
-    const t0 = Date.now() + 2_500;
-    const runs = await Promise.all([
-      ...Array.from({ length: WORKERS }, () => runChild(worker, [dir, String(ITERS), String(t0)])),
-      ...[30, 120, 260].map((delay) => runChild(victim, [dir, String(t0), String(delay)])),
-    ]);
-    const workers = runs.slice(0, WORKERS);
-    const victims = runs.slice(WORKERS);
-    for (const run of workers) {
-      expect(run.stderr).toBe("");
-      expect(run.code).toBe(0);
+    let kills = 0;
+    const killedAt = new Map<number, number>();
+    const until = Date.now() + 6_000;
+    while (Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 15 + Math.random() * 45));
+      const list = [...workers];
+      const victim = list[Math.floor(Math.random() * list.length)];
+      if (victim?.pid !== undefined && !killedAt.has(victim.pid)) {
+        killedAt.set(victim.pid, Date.now()); // recorded before the signal is sent
+        if (victim.kill("SIGKILL")) kills++;
+      }
+      spawnWorker();
     }
-    for (const run of victims) {
-      expect(run.signal).toBe("SIGKILL");
-      expect(run.stdout.trim()).toBe("holding");
+    const doneBefore = countDone(dir);
+    // Still making progress after the storm: the lock is not wedged by any of the killed holders.
+    await new Promise((r) => setTimeout(r, 1_000));
+    const doneAfter = countDone(dir);
+    for (const w of workers) w.kill("SIGKILL");
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(kills).toBeGreaterThan(80);
+    // A process being SIGKILLed has its flock dropped in the kernel's exit path a moment before it
+    // shows up as a zombie, so a check landing in that gap still sees it "alive". It cannot run any
+    // code by then; such a sighting is only discounted when the parent had already sent that pid
+    // SIGKILL before the sighting. Anything else is two live writers inside at once.
+    const sightings = existsSync(join(dir, "violations")) ? readFileSync(join(dir, "violations"), "utf-8").trim().split("\n") : [];
+    const violations = sightings.filter((line) => {
+      const [other, , at] = line.split(" ").map(Number);
+      const killed = killedAt.get(other!);
+      return !(killed !== undefined && killed <= at!);
+    });
+    expect(violations).toEqual([]);
+    expect(doneBefore).toBeGreaterThan(200);
+    expect(doneAfter).toBeGreaterThan(doneBefore);
+    expect(stderrAll).not.toMatch(/timed out|Error/);
+    // And this process gets it right away once everyone is gone.
+    expect(acquireLock({ lockPath: lockPathForKey("mp-kill", dir) })).toBe(true);
+    releaseLock({ lockPath: lockPathForKey("mp-kill", dir) });
+  }, 30_000);
+});
+
+function countDone(dir: string): number {
+  let n = 0;
+  for (const f of require("node:fs").readdirSync(dir) as string[]) {
+    if (f.startsWith("done-")) n += readFileSync(join(dir, f), "utf-8").length;
+  }
+  return n;
+}
+
+// ---------------------------------------------------------------------------
+// 3. 持有者被杀：立刻能拿到，不等任何过期
+// ---------------------------------------------------------------------------
+
+const HOLDER_CHILD = `
+import { withLock } from ${JSON.stringify(LOCK_MODULE)};
+const [dir, key, maxHold] = process.argv.slice(2);
+await withLock(key, async () => {
+  console.log("HELD");
+  await new Promise(() => { setInterval(() => {}, 1000); }); // 一直不出临界区
+}, { lockDir: dir, maxHoldMs: Number(maxHold) });
+`;
+
+describe("a killed holder frees the lock at once", () => {
+  it("holder that declared 30 min is SIGKILLed: the next process acquires within a second", async () => {
+    const dir = tempDir("rn-lock-killed-holder-");
+    const script = join(dir, "holder.ts");
+    writeFileSync(script, HOLDER_CHILD);
+    const lockPath = lockPathForKey("killed-holder", dir);
+    const h = await startUntil(script, [dir, "killed-holder", String(30 * 60_000)], "HELD");
+    expect(acquireLock({ lockPath })).toBe(false);
+    h.child.kill("SIGKILL");
+    await h.closed;
+    const start = Date.now();
+    let got = false;
+    while (!got && Date.now() - start < 1_000) {
+      got = acquireLock({ lockPath });
+      if (!got) await new Promise((r) => setTimeout(r, 10));
     }
-    expect(existsSync(join(dir, "violations")) ? readFileSync(join(dir, "violations"), "utf-8") : "").toBe("");
-    expect(Number(readFileSync(join(dir, "counter"), "utf-8"))).toBe(WORKERS * ITERS);
-  }, 60_000);
+    expect(got).toBe(true);
+    releaseLock({ lockPath });
+  }, 20_000);
 });
 
 // ---------------------------------------------------------------------------
-// 3. 过期时间以持锁方写进锁文件的为准
+// 4. 持有超过 maxHold：告警，但锁不会被抢
 // ---------------------------------------------------------------------------
 
-const LONG_HOLDER_CHILD = `
-import { withLock } from ${JSON.stringify(LOCK_MODULE)};
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-const [dir] = process.argv.slice(2);
-await withLock("long-holder", async () => {
-  console.log("HELD");
-  // 一直占着，直到父进程放下 go 文件
-  while (!existsSync(join(dir, "go"))) await new Promise((r) => setTimeout(r, 10));
-  console.log("CHILD_DONE");
-}, { lockDir: dir, expireMs: 30 * 60_000 });
-`;
-
-describe("expiry is the holder's, not the waiter's", () => {
-  it("a waiter judging by 30 s cannot take a lock its live holder declared for 30 min", async () => {
-    const dir = tempDir("rn-lock-expire-");
+describe("max-hold deadline across processes", () => {
+  it("a stuck holder past its max hold is never pushed out; waiter times out naming it; both sides warn", async () => {
+    const dir = tempDir("rn-lock-deadline-");
     const script = join(dir, "holder.ts");
-    writeFileSync(script, LONG_HOLDER_CHILD);
-    const lockPath = lockPathForKey("long-holder", dir);
+    writeFileSync(script, HOLDER_CHILD);
+    const lockPath = lockPathForKey("stuck", dir);
+    const h = await startUntil(script, [dir, "stuck", "300"], "HELD");
+    const holderPid = h.child.pid!;
+    try {
+      await new Promise((r) => setTimeout(r, 600)); // well past the 300 ms max hold
+      const twoHoursAgo = new Date(Date.now() - 7_200_000);
+      utimesSync(lockPath, twoHoursAgo, twoHoursAgo); // stale mtime means nothing either
+      expect(acquireLock({ lockPath, expireMs: 1_000 })).toBe(false);
 
-    const child = spawn(BUN, [script, dir], { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-    const closed = new Promise<number | null>((done) => child.on("close", (code) => done(code)));
-    await new Promise<void>((done) => {
-      child.stdout.on("data", (chunk: Buffer) => {
-        stdout += chunk.toString();
-        if (stdout.includes("HELD")) done();
-      });
-    });
-
-    // 持锁方 31 秒没刷新过锁文件；等待方自己按 30 秒判断的话会当成过期锁回收。
-    const past = new Date(Date.now() - 31_000);
-    utimesSync(lockPath, past, past);
-    const bodyBefore = readFileSync(lockPath, "utf-8");
-    expect(acquireLock({ lockPath, expireMs: 30_000 })).toBe(false);
-    expect(readFileSync(lockPath, "utf-8")).toBe(bodyBefore);
-
-    writeFileSync(join(dir, "go"), "");
-    expect(await closed).toBe(0);
-    expect(stderr).toBe("");
-    expect(stdout).toContain("CHILD_DONE");
-    expect(existsSync(lockPath)).toBe(false); // 持锁方自己放的锁，没被别人动过
+      const warnings: string[] = [];
+      const original = console.warn;
+      console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); };
+      try {
+        await expect(withWriteLock("stuck", async () => 1, { lockDir: dir, waitTimeoutMs: 400, pollMs: 20 }))
+          .rejects.toThrow(new RegExp(`timed out after 400ms \\(held by pid ${holderPid}, held \\d+ s \\(max hold 0 s\\)\\)`));
+      } finally {
+        console.warn = original;
+      }
+      expect(warnings.some((w) => w.includes(`held by pid ${holderPid}`) && w.includes("past its max hold"))).toBe(true);
+      expect(h.err()).toContain("past its max hold");
+      expect(h.child.exitCode).toBeNull(); // still running, still holding
+    } finally {
+      h.child.kill("SIGKILL");
+      await h.closed;
+    }
   }, 20_000);
 });

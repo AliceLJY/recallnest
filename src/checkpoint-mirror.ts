@@ -37,7 +37,7 @@ import { redactSecrets } from "./pii-detector.js";
 import type { SessionCheckpointRecord } from "./session-schema.js";
 import { checkpointFileName, classifyCheckpointQuality } from "./session-store.js";
 import { logWarn } from "./stderr-log.js";
-import { deterministicId, escapeSqlLiteral, loadLanceDB, type MemoryEntry, type MemoryStore } from "./store.js";
+import { deterministicId, escapeSqlLiteral, loadLanceDB, STORE_WRITE_LOCK_OPTS, type MemoryEntry, type MemoryStore } from "./store.js";
 
 export { CHECKPOINT_MIRROR_SCOPE };
 const MIRROR_CATEGORY = "events" as const;
@@ -233,8 +233,8 @@ export async function mirrorCheckpoint(
         language,
         fts_text: tokenizeFts(text, language),
       });
-      // The merge itself refuses to move a row back in time — this catches a writer whose lock
-      // expired mid-write while a newer checkpoint got in (timestamp = the checkpoint's updatedAt).
+      // The merge itself refuses to move a row back in time (timestamp = the checkpoint's updatedAt).
+      // The lock is a flock now and cannot be taken from a live writer; this stays as a second guard.
       if (!written) return { status: "skipped-stale", id };
       const status: CheckpointMirrorStatus = !current ? "stored" : current.text === text ? "refreshed" : "replaced";
       return { status, id };
@@ -401,7 +401,7 @@ export async function purgeCheckpointMirror(
     const rowsBefore = await table.countRows(exact);
     if (rowsBefore > 0) {
       await withWriteLock("store-write", async () => { await table.delete(exact); }, {
-        expireMs: 30_000,
+        ...STORE_WRITE_LOCK_OPTS,
         ...(options.lockDir ? { lockDir: options.lockDir } : {}),
       });
     }
