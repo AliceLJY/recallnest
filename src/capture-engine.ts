@@ -184,9 +184,12 @@ function mergeTags(...groups: string[][]): string[] {
 // F-3b 覆盖结构化字段（2026-10-17）：原先只有拼好的正文过 redactSecrets，case / pattern 的
 // metadata、tags、显式 canonicalKey、trigger 都是原始入参，密钥原样进库、进外部嵌入接口。
 // scope 与 source 不动：scope 是路由键，source 是枚举。
+// 这些字段里放的是名字（key、标签、问法），`workflow.database.recovery` 这类点分标识符照原样留下；
+// 正文仍走默认规则，逐字节不变（已存行的确定性 id 靠它对得上）。
+const FIELD_REDACTION = { keepIdentifiers: true } as const;
 
 function redactField(value: string): string {
-  return redactSecrets(value).text;
+  return redactSecrets(value, FIELD_REDACTION).text;
 }
 
 /** 只在字段存在时给出覆盖项，没传的可选字段不多出一个值为 undefined 的键。 */
@@ -214,7 +217,7 @@ function redactList(values: readonly string[]): string[] {
  * 必须在 normalizeCanonicalKey 之前做——规整会把 `ghp_` 改成 `ghp-`，之后就认不出了。
  */
 function withoutSecretCanonicalKey<T extends { canonicalKey?: string }>(input: T): T {
-  if (input.canonicalKey === undefined || redactSecrets(input.canonicalKey).redacted === 0) return input;
+  if (input.canonicalKey === undefined || redactSecrets(input.canonicalKey, FIELD_REDACTION).redacted === 0) return input;
   const { canonicalKey: _dropped, ...rest } = input;
   return rest as T;
 }

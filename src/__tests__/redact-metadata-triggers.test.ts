@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  buildStructuredMetadata,
   persistCaseMemory,
   persistMemory,
   persistWorkflowPattern,
@@ -12,7 +13,8 @@ import {
 } from "../capture-engine.js";
 import { buildDefaultCanonicalKey } from "../memory-boundaries.js";
 import { loadLanceDB, MemoryStore } from "../store.js";
-import { normalizeTriggerTexts, TRIGGER_TABLE_NAME, TriggerStore } from "../trigger-store.js";
+import { redactSecrets } from "../pii-detector.js";
+import { extractTriggerCandidates, normalizeTriggerTexts, TRIGGER_TABLE_NAME, TriggerStore } from "../trigger-store.js";
 
 /**
  * 脱敏覆盖 metadata 与 trigger（2026-10-17）。
@@ -99,7 +101,8 @@ describe("normalizeTriggerTexts redacts", () => {
     for (const s of sent) expectNoSecret("embed input", s);
     const stored = await h.triggerRows();
     expect(stored).toEqual(["token [REDACTED:github_token] 是做什么的"]);
-  });
+    // 本文件第一条开 LanceDB 的用例，冷启动（加载原生模块）一次实测 5.3 秒，撞过默认的 5 秒
+  }, 30_000);
 });
 
 describe("persistMemory redacts metadata fields and triggers", () => {
@@ -303,5 +306,139 @@ describe("promoteMemory redacts tags and explicit canonicalKey", () => {
     expect(row.metadata.toLowerCase()).not.toContain(SECRET_BODY.toLowerCase());
     expect(JSON.parse(row.metadata).tags).toEqual(["release", "[REDACTED:github_token]"]);
     expectNoSecret("returned record", JSON.stringify(result));
+  });
+});
+
+// ============================================================================
+// Fixes after review（2026-10-17，owner 请的独立 reviewer）
+// ============================================================================
+
+/** 主表里已有的一行，形状照改动前的 persistMemory 写出来的样子（id 不是确定性 id）。 */
+async function seedLegacyRow(
+  store: MemoryStore,
+  params: { id: string; scope: string; text: string; category: "events" | "patterns"; canonicalKey: string },
+): Promise<void> {
+  await store.store({
+    id: params.id,
+    text: params.text,
+    vector: [1, 2, 0.5],
+    category: params.category,
+    scope: params.scope,
+    importance: 0.8,
+    metadata: buildStructuredMetadata({
+      source: "manual",
+      tags: [],
+      capture: "store_memory_schema_v1",
+      category: params.category,
+      canonicalKey: params.canonicalKey,
+    }),
+  });
+}
+
+describe("review 1: ordinary dotted canonical keys are kept", () => {
+  it("field mode keeps a dotted identifier; prose mode and real tokens are unchanged", () => {
+    expect(redactSecrets("workflow.database.recovery", { keepIdentifiers: true })).toEqual({
+      text: "workflow.database.recovery",
+      redacted: 0,
+    });
+    // 正文仍按原规则逐字节不变
+    expect(redactSecrets("workflow.database.recovery").text).toBe("[REDACTED:segmented_token]");
+    // 真的分段 token（大小写混着数字）照样脱敏
+    const opaque = "aB3dE9fG" + ".Hj2kL5mN" + ".pQ7rS1tU";
+    expect(redactSecrets(`key ${opaque}`, { keepIdentifiers: true }).text).toBe("key [REDACTED:segmented_token]");
+    // 豁免只管 segmented_token：长得像点分标识符的密码值仍被密码规则抓住
+    const pw = redactSecrets("password=workflow.database.recovery", { keepIdentifiers: true });
+    expect(pw.text).toBe("password=[REDACTED:password]");
+  });
+
+  it("persistMemory resubmitting identical content with workflow.database.recovery dedupes onto the existing row", async () => {
+    const h = harness();
+    const scope = "project:redact";
+    const text = "数据库恢复流程：先停写、再从最近一次快照回放日志，最后核对行数";
+    const seedId = "11111111-2222-4333-8444-555555555555";
+    await seedLegacyRow(h.store, { id: seedId, scope, text, category: "events", canonicalKey: "workflow-database-recovery" });
+
+    const result = await persistMemory(h.deps, {
+      text,
+      category: "events",
+      importance: 0.8,
+      scope,
+      source: "manual",
+      canonicalKey: "workflow.database.recovery",
+    });
+
+    expect(result.disposition).toBe("deduped");
+    expect(result.id).toBe(seedId);
+    expect(result.canonicalKey).toBe("workflow-database-recovery");
+    expect((await h.rows(scope)).map((r) => r.id)).toEqual([seedId]);
+  });
+
+  it("persistWorkflowPattern resubmitting identical content with workflow.database.recovery dedupes onto the existing row", async () => {
+    const input = {
+      title: "数据库恢复",
+      trigger: "主库写入失败且副本落后",
+      steps: ["停写", "从快照回放日志", "核对行数"],
+      scope: "project:redact",
+      canonicalKey: "workflow.database.recovery",
+    };
+    // 先在另一个库里取到这组字段拼出的正文，再在被测库里照旧形状种一行
+    const probe = harness();
+    const builtText = (await persistWorkflowPattern(probe.deps, input)).text;
+
+    const h = harness();
+    const seedId = "66666666-7777-4888-9999-000000000000";
+    await seedLegacyRow(h.store, { id: seedId, scope: input.scope, text: builtText, category: "patterns", canonicalKey: "workflow-database-recovery" });
+    const result = await persistWorkflowPattern(h.deps, input);
+
+    expect(result.disposition).toBe("deduped");
+    expect(result.id).toBe(seedId);
+    expect((await h.rows(input.scope)).map((r) => r.id)).toEqual([seedId]);
+  });
+
+  it("a dotted identifier inside a trigger stays as written", () => {
+    expect(normalizeTriggerTexts(["workflow.database.recovery 那套流程怎么走"])).toEqual([
+      "workflow.database.recovery 那套流程怎么走",
+    ]);
+  });
+
+  it("a dotted identifier tag stays as written", async () => {
+    const h = harness();
+    const scope = "project:redact";
+    await persistMemory(h.deps, {
+      text: "恢复演练每季度一次，演练记录放到运维仓库的 drills 目录",
+      category: "events",
+      importance: 0.8,
+      scope,
+      source: "manual",
+      tags: ["workflow.database.recovery"],
+    });
+    const [row] = await h.rows(scope);
+    expect(JSON.parse(row.metadata).tags).toEqual(["workflow.database.recovery"]);
+  });
+});
+
+describe("review 2: trigger backfill redacts the whole source before splitting", () => {
+  const PASSWORD = "Hunter2" + "Secret99";
+  const LEGACY_TEXT = `连内部库的办法记在这里，账号是运维组的共享账号。\n\n检索锚点：怎么连 https://alice:${PASSWORD}@db.internal`;
+
+  it("extractTriggerCandidates never yields the scheme-less user:password@host fragment", () => {
+    const candidates = extractTriggerCandidates(LEGACY_TEXT);
+    expect(candidates.length).toBeGreaterThan(0);
+    for (const c of candidates) expect(c).not.toContain(PASSWORD);
+    expect(candidates.some((c) => c.includes("[REDACTED:uri_credentials]"))).toBe(true);
+  });
+
+  it("the backfill path (extract → upsertForMemory) embeds and stores no credential", async () => {
+    const h = harness();
+    const payload: string[] = [];
+    // 与 cli.ts triggers-backfill 同一条路：抠候选 → upsertForMemory（嵌入 + 侧表）
+    const texts = extractTriggerCandidates(LEGACY_TEXT);
+    await h.triggerStore.upsertForMemory("legacy-1", "memory:pivot", texts, async (batch) => {
+      payload.push(...batch);
+      return batch.map(() => [1, 1, 1]);
+    });
+    expect(payload.length).toBeGreaterThan(0);
+    for (const s of payload) expect(s).not.toContain(PASSWORD);
+    for (const t of await h.triggerRows()) expect(t).not.toContain(PASSWORD);
   });
 });
