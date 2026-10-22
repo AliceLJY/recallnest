@@ -10,6 +10,7 @@ import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import type { LLMClient } from "./llm-client.js";
+import { redactSecrets } from "./pii-detector.js";
 import { buildLedger, type GenerateLedgerOptions } from "./session-ledger.js";
 import type { SessionSource } from "./session-events.js";
 import { applyDecision, decide, DEFAULT_POLICY, discoverTranscripts, ledgerRelPath, SessionStateStore, type RootSpec, type SweepAction, type SweepPolicy, type TranscriptFile } from "./sessions-sweep.js";
@@ -92,7 +93,9 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
     if (needsLedger && decision.doc && !opts.dryRun) {
       if (opts.llm && opts.llmDelayMs && result.llmCalls > 0) await new Promise((r) => setTimeout(r, opts.llmDelayMs));
       const pass = decision.action === "candidates" ? state.pass : state.pass + 1;
-      const render = await buildLedger(decision.doc, { trigger: opts.trigger ?? "auto-sweep", pass, machine: file.machine, generatedAt: new Date(nowMs).toISOString() }, opts.llm, opts.render);
+      // D2 两步：第一次静默只写事实账本，候选到期（ledger+candidates / candidates）才出经验
+      const includeCandidates = decision.action !== "ledger";
+      const render = await buildLedger(decision.doc, { trigger: opts.trigger ?? "auto-sweep", pass, machine: file.machine, generatedAt: new Date(nowMs).toISOString() }, opts.llm, { ...opts.render, includeCandidates });
       if (opts.llm) {
         result.llmCalls++;
         if (render.usage) {
@@ -100,7 +103,7 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
           result.llmCompletionTokens += render.usage.completionTokens;
         }
         if (render.generator === "llm-failed") result.llmFailures++;
-        usageNote = { generator: render.generator, tokens: render.usage ? [render.usage.promptTokens, render.usage.completionTokens] : null, wallMs: render.usage?.wallMs ?? null, failure: render.failure, experience: render.body?.experience.length ?? 0, anchorsUnverified: render.body?.experience.filter((x) => !x.anchorVerified).length ?? 0 };
+        usageNote = { generator: render.generator, tokens: render.usage ? [render.usage.promptTokens, render.usage.completionTokens] : null, wallMs: render.usage?.wallMs ?? null, failure: render.failure ? redactSecrets(render.failure).text.slice(0, 300) : undefined, candidates: includeCandidates, experience: render.body?.experience.length ?? 0, anchorsUnverified: render.body?.experience.filter((x) => !x.anchorVerified).length ?? 0 };
       }
       ledgerPath = join(ledgerRoot, ledgerRelPath(decision.doc.sessionId, decision.lastMessageAt ?? decision.doc.endedAt ?? new Date(nowMs).toISOString()));
       mkdirSync(dirname(ledgerPath), { recursive: true });

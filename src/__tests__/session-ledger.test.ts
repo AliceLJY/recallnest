@@ -42,6 +42,18 @@ describe("session-ledger rendering for the LLM", () => {
   });
 });
 
+describe("session-ledger redaction before the LLM sees anything", () => {
+  it("redacts user/assistant/error/memory-write text in the rendered transcript", () => {
+    const d = doc();
+    const fake = ["sk", "-", "b".repeat(24), "7".repeat(16)].join("");
+    d.events[0].text = `帮我修 bot，key 是 ${fake}`;
+    d.events[5].toolInput = { title: "x", problem: `token=${fake}` };
+    const r = renderTranscriptForLLM(d);
+    expect(r.text).not.toContain(fake);
+    expect(r.text).toContain("[REDACTED");
+  });
+});
+
 describe("session-ledger anchors and JSON", () => {
   it("verifies anchors verbatim (ignoring whitespace/punctuation) and repairs the seq", () => {
     const d = doc();
@@ -57,11 +69,12 @@ describe("session-ledger anchors and JSON", () => {
   });
   it("parses the LLM JSON (even fenced) and flags unverifiable anchors", () => {
     const d = doc();
-    const body = parseLedgerJson('```json\n{"oneLine":"挪日志目录","solved":["日志目录改到 ops-logs"],"experience":[{"text":"自建日志放 ops-logs","anchor":"以后自建日志一律放 ops-logs","anchorSeq":6,"kind":"偏好"},{"text":"编的","anchor":"原文里没有这句","anchorSeq":2,"kind":"坑"},{"text":"","anchor":"x"}],"unfinished":[]}\n```', d);
+    const body = parseLedgerJson('```json\n{"oneLine":"挪日志目录","solved":["日志目录改到 ops-logs"],"experience":[{"text":"自建日志放 ops-logs","anchor":"以后自建日志一律放 ops-logs","anchorSeq":6,"kind":"偏好"},{"text":"编的","anchor":"原文里没有这句","anchorSeq":2,"kind":"sk-not-a-kind"},{"text":"","anchor":"x"}],"unfinished":[]}\n```', d);
     expect(body.oneLine).toBe("挪日志目录");
     expect(body.experience).toHaveLength(2);
     expect(body.experience[0].anchorVerified).toBe(true);
     expect(body.experience[1].anchorVerified).toBe(false);
+    expect(body.experience[1].kind).toBe(""); // kind 只认枚举
   });
   it("renders frontmatter + five sections, redacts secrets, and marks unverified anchors", () => {
     const d = doc();

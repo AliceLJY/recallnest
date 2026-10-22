@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -68,6 +68,26 @@ describe("sweep decide()", () => {
     const s3 = applyDecision(s2, f2, d3, Date.parse(later) + 40 * MIN, DEFAULT_POLICY);
     expect(s3.pass).toBe(2);
     expect(s3.candidateDone).toBe(false);
+  });
+  it("does not let a not-idle sweep cache the mtime (resumed content must still get a ledger later)", () => {
+    // 互审 R1 Codex #1 的合成复现：处理过一次 → 用户续写 → 5 分钟时 not-idle → 40 分钟时必须 ledger，而不是 up-to-date
+    const f = file(60 * 24);
+    const endedAt = new Date(NOW - 24 * 60 * MIN).toISOString();
+    const s1 = applyDecision(store.fresh(f), f, decide(f, store.fresh(f), NOW, DEFAULT_POLICY, () => fakeDoc({ users: 4, endedAt })), NOW, DEFAULT_POLICY);
+    const resumedAt = new Date(NOW + 10 * MIN).toISOString();
+    const f2 = { ...f, mtimeMs: Date.parse(resumedAt) };
+    const d5 = decide(f2, s1, Date.parse(resumedAt) + 5 * MIN, DEFAULT_POLICY, () => fakeDoc({ users: 6, endedAt: resumedAt }));
+    expect(d5.action).toBe("not-idle");
+    const s2 = applyDecision(s1, f2, d5, Date.parse(resumedAt) + 5 * MIN, DEFAULT_POLICY);
+    expect(s2.lastMtimeMs).toBe(s1.lastMtimeMs);
+    const d40 = decide(f2, s2, Date.parse(resumedAt) + 40 * MIN, DEFAULT_POLICY, () => fakeDoc({ users: 6, endedAt: resumedAt }));
+    expect(d40.action).toBe("ledger");
+  });
+  it("dry-run never creates the state directory", () => {
+    const dir = join(tmpdir(), `sweep-nomkdir-${process.pid}-${Date.now()}`);
+    const st = new SessionStateStore(dir);
+    expect(st.load("x")).toBeNull();
+    expect(existsSync(dir)).toBe(false);
   });
   it("in replay (now far after the session) does ledger+candidates in one pass", () => {
     const f = file(60 * 24);

@@ -2,6 +2,8 @@
 // 口径一：按静默段（episode）——扫描器每撞见一次 ≥X 的静默就会处理一次，其中多少次之后用户又说话了 = 误判率（会被重处理）。
 //        分母 = 所有 ≥X 的段 + 每场会话结尾那一段（结尾段永远不会被续写，所以算一次「正确判断」）。
 // 口径二：按会话——有过 ≥X 静默且之后续写的会话 / 有 ≥3 轮的会话（D2 原话的写法）。
+// 资格（互审 R1 Codex #11）：一次静默段只有在「静默发生那一刻会话已经有 ≥3 轮人话」时才算扫描器会处理的段；
+// 结尾那一段只有在「到现在为止已经静默 ≥ 阈值」时才算一次真结束（刚结束不到阈值的会话还没到判定时刻）。
 import { statSync, writeFileSync } from "node:fs";
 import { idleGaps, parseSessionFile, summarizeSession, type SessionSource } from "../../src/session-events.js";
 import { discoverTranscripts, truthRoots } from "../../src/sessions-sweep.js";
@@ -10,6 +12,8 @@ const out = process.argv[2];
 const SINCE = Date.now() - 30 * 86_400_000;
 const THRESH: Array<[string, number]> = [["30m", 30 * 60_000], ["60m", 60 * 60_000], ["6h", 360 * 60_000]];
 const disc = discoverTranscripts(truthRoots(), { sinceMs: SINCE });
+const NOW = Date.now();
+const MIN_TURNS = 3;
 type Row = { source: SessionSource; sessions: number; ge3: number; rich: number; byThresh: Record<string, { episodes: number; resumed: number; endEpisodes: number; sessionsWithResume: number; sessionsGe3WithResume: number; richWithResume: number; medianResumeGapMin: number | null; p90ResumeGapMin: number | null }> };
 const rows: Record<string, Row> = {};
 const resumeGaps: Record<string, Record<string, number[]>> = {};
@@ -22,11 +26,15 @@ for (const f of disc.files) {
   row.sessions++;
   if (s.userTurns >= 3) row.ge3++;
   if (s.rich) row.rich++;
+  const userSeqs = doc.events.filter((e) => e.kind === "user" && !e.injected).map((e) => e.seq);
+  const turnsBefore = (seq: number) => userSeqs.filter((q) => q <= seq).length;
+  const lastMs = doc.endedAt ? Date.parse(doc.endedAt) : NaN;
   for (const [k, ms] of THRESH) {
-    const gaps = idleGaps(doc, ms);
+    // 只算静默发生时已满 MIN_TURNS 轮的段（扫描器对不满的会话 skip-short，不会处理）
+    const gaps = idleGaps(doc, ms).filter((g) => turnsBefore(g.afterSeq) >= MIN_TURNS);
     const b = row.byThresh[k];
     b.episodes += gaps.length;
-    b.endEpisodes += 1;
+    if (s.userTurns >= MIN_TURNS && Number.isFinite(lastMs) && NOW - lastMs >= ms) b.endEpisodes += 1;
     const resumed = gaps.filter((g) => g.resumedByUser);
     b.resumed += resumed.length;
     if (resumed.length) {
@@ -50,6 +58,6 @@ for (const row of Object.values(rows)) {
   }
   summary[row.source] = { sessions: row.sessions, ge3: row.ge3, rich: row.rich, thresholds: t };
 }
-const result = { generatedAt: new Date().toISOString(), window: "30d", files: disc.files.length, note: "prematureRate = resumed episodes / (all ≥X idle episodes + one terminal episode per session); sessionRate = sessions with ≥1 resumed gap / denominator", summary };
+const result = { generatedAt: new Date().toISOString(), window: "30d", files: disc.files.length, note: "prematureRate = resumed eligible episodes / (eligible ≥X idle episodes + terminal episodes already idle ≥X); eligible = ≥3 user turns before the gap; sessionRate = sessions with ≥1 resumed gap / denominator", summary };
 console.log(JSON.stringify(result, null, 2));
 if (out) writeFileSync(out, JSON.stringify(result, null, 2));

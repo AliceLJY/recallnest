@@ -168,9 +168,8 @@ export function stateKey(source: SessionSource, sessionId: string): string {
 }
 
 export class SessionStateStore {
-  constructor(private readonly dir: string) {
-    mkdirSync(dir, { recursive: true });
-  }
+  /** 目录懒创建：构造 / 读取不落盘，`--dry-run` 才真的一个字节都不写（互审 R1 Codex #2） */
+  constructor(private readonly dir: string) {}
   path(key: string): string {
     return join(this.dir, `${key}.json`);
   }
@@ -184,6 +183,7 @@ export class SessionStateStore {
     }
   }
   save(state: SessionState): void {
+    mkdirSync(this.dir, { recursive: true });
     const p = this.path(state.key);
     const tmp = `${p}.tmp-${process.pid}`;
     writeFileSync(tmp, JSON.stringify(state, null, 2));
@@ -228,9 +228,10 @@ export function decide(
   parse: () => SessionDoc = () => parseSessionFile(file.path, { source: file.source }),
 ): SweepDecision {
   const idleMs = policy.idleMinutes * 60_000;
-  if (nowMs - file.mtimeMs < idleMs) return { action: "not-idle", reason: `mtime ${Math.round((nowMs - file.mtimeMs) / 60_000)}min ago < ${policy.idleMinutes}` };
-
   const candidateDue = !!state.candidateDueAt && nowMs >= Date.parse(state.candidateDueAt) && !state.candidateDone;
+  // mtime 只是省解析的粗筛（D2 第一分句）；候选到期（第二分句）不看 mtime——否则同步工具每隔几分钟刷一次 mtime，
+  // 候选阶段永远进不来（互审 R1 Grok #1）。进了解析路径后静默一律按消息时间判。
+  if (!candidateDue && nowMs - file.mtimeMs < idleMs) return { action: "not-idle", reason: `mtime ${Math.round((nowMs - file.mtimeMs) / 60_000)}min ago < ${policy.idleMinutes}` };
   const mtimeUnchanged = state.lastMtimeMs !== null && state.lastMtimeMs === file.mtimeMs;
   if (mtimeUnchanged && !candidateDue) {
     if (state.processedUpto) return { action: "up-to-date", reason: "mtime unchanged, candidates done or not due" };
@@ -260,8 +261,13 @@ export function decide(
 
 /** 把决策应用到游标（纯函数，返回新 state；写盘由调用方） */
 export function applyDecision(state: SessionState, file: TranscriptFile, decision: SweepDecision, nowMs: number, policy: SweepPolicy, ledgerPath?: string): SessionState {
-  const next: SessionState = { ...state, path: file.path, lastMtimeMs: file.mtimeMs, lastSweepAt: new Date(nowMs).toISOString(), lastAction: decision.action };
-  delete next.skipReason;
+  const next: SessionState = { ...state, path: file.path, lastSweepAt: new Date(nowMs).toISOString(), lastAction: decision.action };
+  // lastMtimeMs 是「这个 mtime 的内容我已经解析并下过结论」的缓存，只有真解析过才更新。
+  // not-idle / unchanged 没解析：若在这里记下 mtime，用户续写后文件再静默，下一轮会因 mtime 没变直接 up-to-date，
+  // 新内容永远不进账本（互审 R1 Codex #1 合成复现：续聊第 5 分钟 not-idle，第 40 分钟与 24 小时后都 up-to-date）。
+  const parsed = decision.action !== "not-idle" && decision.action !== "unchanged";
+  if (parsed) next.lastMtimeMs = file.mtimeMs;
+  if (parsed) delete next.skipReason;
   switch (decision.action) {
     case "ledger":
     case "ledger+candidates": {

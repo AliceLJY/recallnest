@@ -67,14 +67,16 @@ export function buildRecallLogEntry(input: {
       }
     }
     const score = typeof r.score === "number" && Number.isFinite(r.score) ? Math.round(r.score * 1000) / 1000 : null;
-    return { id8: id.slice(0, 8), score, scope, canonicalKey: canonicalKey?.slice(0, 80), category };
+    const r1 = (v?: string) => (v === undefined ? undefined : redactSecrets(v).text);
+    return { id8: id.slice(0, 8), score, scope: r1(scope), canonicalKey: r1(canonicalKey)?.slice(0, 80), category };
   });
+  // 所有进文件的字符串都过一遍脱敏（互审 R1 Codex #8）：sessionId / scope 一般不会带凭证，但账本不该靠「一般」
   return {
     ts: new Date(input.now ?? Date.now()).toISOString(),
-    sessionId: input.sessionId,
+    sessionId: redactSecrets(input.sessionId).text,
     operation: input.operation,
     query: redactSecrets(input.query).text.replace(/\s+/g, " ").slice(0, RECALL_LOG_QUERY_MAX),
-    scope: input.scope,
+    scope: input.scope === undefined ? undefined : redactSecrets(input.scope).text,
     mode: input.mode,
     resultCount: input.results.length,
     results,

@@ -47,20 +47,22 @@ for (const p of index.picks.filter((x) => x.group === "A-manual")) {
     const inp = (w.input ?? {}) as Record<string, unknown>;
     const tool = w.tool.replace(/^mcp__recallnest__/, "");
     if (tool === "checkpoint_session") {
-      if (inp.summary) items.push({ n: 0, sid8: p.sid8, tool, field: "summary", item: str(inp.summary) });
-      for (const k of ["decisions", "openLoops", "nextActions"]) for (const it of (Array.isArray(inp[k]) ? inp[k] as unknown[] : [])) items.push({ n: 0, sid8: p.sid8, tool, field: k, item: str(it) });
+      if (inp.summary) items.push({ n: 0, sid8: p.sid8, tool, field: "summary", item: red(str(inp.summary)) });
+      for (const k of ["decisions", "openLoops", "nextActions"]) for (const it of (Array.isArray(inp[k]) ? inp[k] as unknown[] : [])) items.push({ n: 0, sid8: p.sid8, tool, field: k, item: red(str(it)) });
     } else if (tool === "store_case") {
-      for (const k of ["title", "problem", "solution", "rootCause"]) if (inp[k]) items.push({ n: 0, sid8: p.sid8, tool, field: k, item: str(inp[k]) });
-      for (const it of (Array.isArray(inp.solutionSteps) ? inp.solutionSteps as unknown[] : [])) items.push({ n: 0, sid8: p.sid8, tool, field: "solutionSteps", item: str(it) });
+      for (const k of ["title", "problem", "solution", "rootCause"]) if (inp[k]) items.push({ n: 0, sid8: p.sid8, tool, field: k, item: red(str(inp[k])) });
+      for (const it of (Array.isArray(inp.solutionSteps) ? inp.solutionSteps as unknown[] : [])) items.push({ n: 0, sid8: p.sid8, tool, field: "solutionSteps", item: red(str(it)) });
     }
   }
   if (!items.length) continue;
-  recallSessions.push({ sid8: p.sid8, ledger: ledgerBodyOnly(md), items });
+  recallSessions.push({ sid8: p.sid8, ledger: red(ledgerBodyOnly(md)), items });
   recallItems.push(...items);
 }
 recallItems.forEach((it, i) => (it.n = i + 1));
 writeFileSync(join(outDir, "recall", "recall-key.json"), JSON.stringify({ sessions: recallSessions.length, items: recallItems }, null, 1));
-writeFileSync(join(outDir, "recall", "recall-for-readers.md"), recallSessions.map((rs) => `# 会话 ${rs.sid8}\n\n【自动账本】\n${red(rs.ledger)}\n\n【当场人工记录的条目——逐条判账本有没有覆盖】\n${rs.items.map((it) => `- 条目 ${it.n}（${it.tool}.${it.field}）：${red(it.item).replace(/\s+/g, " ").slice(0, 400)}`).join("\n")}\n`).join("\n\n---\n\n"));
+const recallChunks: string[][] = [];
+recallSessions.forEach((rs, i) => { (recallChunks[Math.floor(i / 18)] ??= []).push(`# 会话 ${rs.sid8}\n\n【自动账本】\n${red(rs.ledger)}\n\n【当场人工记录的条目——逐条判账本有没有覆盖】\n${rs.items.map((it) => `- 条目 ${it.n}（${it.tool}.${it.field}）：${red(it.item).replace(/\s+/g, " ").slice(0, 400)}`).join("\n")}\n`); });
+recallChunks.forEach((c, i) => writeFileSync(join(outDir, "recall", `recall-for-readers-${i + 1}.md`), c.join("\n\n---\n\n")));
 writeFileSync(join(outDir, "recall", "judge-prompt.md"), `你是账本覆盖度的读者。每个会话给你两样：【自动账本】（机器从对话转录里写的）和【当场人工记录的条目】（当时的 AI 助手手写进记忆库的 checkpoint / case 字段，已拆成条目）。
 对每一条人工条目回答：账本有没有把它覆盖到？
 - A 覆盖：账本里有一句或几句说的是同一件事（措辞不同没关系，细节少一点没关系）。
@@ -76,12 +78,14 @@ for (const p of silentPicks) {
   const f = byId.get(p.sessionId); const md = ledgerFor(p);
   if (!f || !md) continue;
   const doc = parseSessionFile(f.path, { source: f.source });
-  const t = renderTranscriptForLLM(doc, { maxChars: 14_000, assistantClip: 300, errorClip: 200, maskMemoryWrites: true });
-  silent.push({ n: 0, sid8: p.sid8, ledger: ledgerBodyOnly(md), transcript: t.text });
+  const t = renderTranscriptForLLM(doc, { maxChars: 9_000, assistantClip: 260, errorClip: 160, maskMemoryWrites: true });
+  silent.push({ n: 0, sid8: p.sid8, ledger: red(ledgerBodyOnly(md)), transcript: red(t.text) });
 }
 silent.sort((a, b) => h(a.sid8) - h(b.sid8)).forEach((x, i) => (x.n = i + 1));
 writeFileSync(join(outDir, "silent", "silent-key.json"), JSON.stringify(silent.map((x) => ({ n: x.n, sid8: x.sid8 })), null, 1));
-writeFileSync(join(outDir, "silent", "silent-for-readers.md"), silent.map((x) => `# 会话 ${x.n}\n\n【自动账本】\n${red(x.ledger)}\n\n【对话转录（压缩版）】\n${red(x.transcript)}\n`).join("\n\n---\n\n"));
+const silentChunks: string[][] = [];
+silent.forEach((x, i) => { (silentChunks[Math.floor(i / 10)] ??= []).push(`# 会话 ${x.n}\n\n【自动账本】\n${red(x.ledger)}\n\n【对话转录（压缩版）】\n${red(x.transcript)}\n`); });
+silentChunks.forEach((c, i) => writeFileSync(join(outDir, "silent", `silent-for-readers-${i + 1}.md`), c.join("\n\n---\n\n")));
 writeFileSync(join(outDir, "silent", "judge-prompt.md"), `你是账本正确性的读者。每个会话给你【自动账本】和【对话转录（压缩版）】。
 判一道总题：账本的「解决了什么 / 经验 / 没做完」三节，与转录对不对得上？
 - A 基本对：三节说的事转录里都有，没有编造，没有把没做完说成做完。
@@ -106,12 +110,12 @@ for (const p of index.picks) {
     const seq = m[3] === "?" ? null : Number(m[3]);
     doc ??= parseSessionFile(f.path, { source: f.source });
     const ctx = seq !== null ? doc.events.slice(Math.max(0, seq - 2), seq + 3).filter((e) => e.kind === "user" || e.kind === "assistant" || e.kind === "tool_result").map((e) => `[${e.kind}#${e.seq}] ${e.text.replace(/\s+/g, " ").slice(0, 400)}`).join("\n") : "";
-    cands.push({ n: 0, sid8: p.sid8, group: p.group, text: m[1], anchor: m[2], anchorSeq: seq, anchorVerified: !m[4], context: ctx });
+    cands.push({ n: 0, sid8: p.sid8, group: p.group, text: red(m[1]), anchor: red(m[2]), anchorSeq: seq, anchorVerified: !m[4], context: red(ctx) });
   }
 }
 cands.sort((a, b) => h(a.sid8 + a.text) - h(b.sid8 + b.text));
 const picked = cands.slice(0, CAND_N).map((c, i) => ({ ...c, n: i + 1 }));
 writeFileSync(join(outDir, "candidates", "candidates-key.json"), JSON.stringify({ total: cands.length, verifiedTotal: cands.filter((c) => c.anchorVerified).length, picked }, null, 1));
 writeFileSync(join(outDir, "candidates", "candidates-for-readers.md"), picked.map((c) => `## 条目 ${c.n}\n\n【提炼后的记忆】\n${red(c.text)}\n\n【原文证据（当时的对话原话）】\n- ${red(c.anchor)}\n\n【原话前后几句（上下文）】\n${red(c.context) || "（无）"}\n`).join("\n"));
-writeFileSync(join(outDir, "candidates", "judge-prompt.md"), readFileSync(join(outDir, "..", "calib", "judge-prompt.md"), "utf-8").replace("【原文证据】是它所依据的对话原话。", "【原文证据】是它所依据的对话原话，【上下文】是原话前后几句，帮助你判断原话的语境。"));
-console.log(JSON.stringify({ recallSessions: recallSessions.length, recallItems: recallItems.length, silent: silent.length, candidatesTotal: cands.length, candidatesVerified: cands.filter((c) => c.anchorVerified).length, picked: picked.length }));
+writeFileSync(join(outDir, "candidates", "judge-prompt.md"), readFileSync(join(outDir, "calib", "judge-prompt.md"), "utf-8").replace("【原文证据】是它所依据的对话原话。", "【原文证据】是它所依据的对话原话，【上下文】是原话前后几句，帮助你判断原话的语境。"));
+console.log(JSON.stringify({ recallChunks: recallChunks.length, silentChunks: silentChunks.length, recallSessions: recallSessions.length, recallItems: recallItems.length, silent: silent.length, candidatesTotal: cands.length, candidatesVerified: cands.filter((c) => c.anchorVerified).length, picked: picked.length }));
