@@ -83,6 +83,25 @@ describe("sweep decide()", () => {
     const d40 = decide(f2, s2, Date.parse(resumedAt) + 40 * MIN, DEFAULT_POLICY, () => fakeDoc({ users: 6, endedAt: resumedAt }));
     expect(d40.action).toBe("ledger");
   });
+  it("enters the candidate stage when candidateDueAt has passed even if the mtime is fresh (Grok R3 residual)", () => {
+    const f = file(60);
+    const endedAt = new Date(NOW - 60 * MIN).toISOString();
+    const s1 = applyDecision(store.fresh(f), f, decide(f, store.fresh(f), NOW, DEFAULT_POLICY, () => fakeDoc({ users: 4, endedAt })), NOW, DEFAULT_POLICY);
+    const due = Date.parse(s1.candidateDueAt!) + MIN;
+    const fresh = { ...f, mtimeMs: due - 2 * MIN }; // 同步工具刚刷过 mtime
+    const d = decide(fresh, s1, due, DEFAULT_POLICY, () => fakeDoc({ users: 4, endedAt }));
+    expect(d.action).toBe("candidates");
+  });
+  it("keeps skipReason across repeated unchanged rounds (apply + decide again)", () => {
+    const f = file(60);
+    let st = applyDecision(store.fresh(f), f, { action: "skip-short", reason: "x" }, NOW, DEFAULT_POLICY);
+    for (let k = 1; k <= 3; k++) {
+      const d = decide(f, st, NOW + k * MIN, DEFAULT_POLICY, () => { throw new Error("must not parse"); });
+      expect(d.action).toBe("unchanged");
+      st = applyDecision(st, f, d, NOW + k * MIN, DEFAULT_POLICY);
+      expect(st.skipReason).toBe("skip-short");
+    }
+  });
   it("forces a parse after being not-idle for candidateAfterMinutes even if mtime keeps refreshing", () => {
     // R3 Codex 对 G#1 的补刀：从未处理的会话、外部每隔几分钟刷一次 mtime → 不能永远 not-idle
     const endedAt = new Date(NOW - 24 * 60 * MIN).toISOString();
