@@ -2946,6 +2946,93 @@ program
     if (hasFailure) process.exitCode = 1;
   });
 
+// ---------------------------------------------------------------------------
+// sessions —— 会话扫描与账本（P0 影子期：只写 --shadow 目录下的文件，不写库、不碰 cc-memory/ledgers/）
+// 设计：sync-bridge AI产出/2026-10-22-RecallNest自动总结经验/plan.md（v3 节 + v2.1 D2 / D5）
+// ---------------------------------------------------------------------------
+const sessionsCmd = program
+  .command("sessions")
+  .description("会话转录扫描与账本（P0 影子期）");
+
+function parseRootsOption(value: string | undefined): import("./sessions-sweep.js").RootSpec[] {
+  const { defaultLocalRoots, truthRoots } = require("./sessions-sweep.js") as typeof import("./sessions-sweep.js");
+  if (!value || value === "local") return defaultLocalRoots();
+  if (value === "truth") return truthRoots();
+  // source=dir[,source=dir...]
+  return value.split(",").map((pair) => {
+    const [source, dir] = pair.split("=");
+    if (!source || !dir) throw new Error(`--roots 项格式应为 source=dir，收到 ${pair}`);
+    return { source: source as import("./session-events.js").SessionSource, dir: dir.replace(/^~\//, `${require("node:os").homedir()}/`) };
+  });
+}
+
+sessionsCmd
+  .command("scan")
+  .description("只做文件发现并计时（数⑦：stat 墙钟），不解析不写")
+  .option("--roots <spec>", "local（本机四端 + MacBook agy 落点）| truth（conversation-truth）| source=dir,...", "local")
+  .option("--since-days <n>", "只数最近 N 天的文件", "30")
+  .option("--json", "JSON 输出")
+  .action(async (options) => {
+    const { discoverTranscripts } = await import("./sessions-sweep.js");
+    const roots = parseRootsOption(options.roots);
+    const sinceMs = Date.now() - Number(options.sinceDays) * 86_400_000;
+    const r = discoverTranscripts(roots, { sinceMs });
+    const by: Record<string, number> = {};
+    for (const f of r.files) by[f.source] = (by[f.source] ?? 0) + 1;
+    const out = { files: r.files.length, bySource: by, statCalls: r.statCalls, wallMs: r.wallMs, missingRoots: r.missingRoots };
+    if (options.json) console.log(JSON.stringify(out, null, 2));
+    else console.log(`发现 ${out.files} 个转录（${Object.entries(by).map(([k, v]) => `${k} ${v}`).join("，")}），stat ${out.statCalls} 次，${out.wallMs} ms${r.missingRoots.length ? `；缺目录：${r.missingRoots.join(" ")}` : ""}`);
+  });
+
+sessionsCmd
+  .command("sweep")
+  .description("扫一轮：静默会话 → 账本（P0 只支持 --shadow 影子模式）")
+  .requiredOption("--shadow <dir>", "影子输出目录（ledgers/ session-state/ sweep-log.jsonl 都写在这里）")
+  .option("--roots <spec>", "同 scan", "local")
+  .option("--since-days <n>", "只看最近 N 天的转录", "30")
+  .option("--idle-minutes <n>", "静默多少分钟算结束", String(30))
+  .option("--candidate-after-minutes <n>", "经验候选在最后一条消息多少分钟后才出", String(360))
+  .option("--min-user-turns <n>", "少于这么多轮用户发言的会话跳过", String(3))
+  .option("--sources <list>", "只扫这些端：cc,codex,kimi,antigravity")
+  .option("--limit <n>", "本轮最多生成多少份账本（0 = 不限）", "0")
+  .option("--no-llm", "不调 LLM，只出机器抽取版账本（影子期先量覆盖与游标）")
+  .option("--mask-memory-writes", "回放用：隐藏当场写过的记忆，免得账本召回被灌水")
+  .option("--now <iso>", "把「现在」定在某个时刻（回放用）")
+  .option("--only <sids>", "只处理这些 session id（逗号分隔，可用前 8 位）")
+  .option("--trigger <name>", "frontmatter 的 trigger：auto-sweep | replay", "auto-sweep")
+  .option("--llm-delay-ms <n>", "两次 LLM 调用之间至少隔多少毫秒（限速余量）", "0")
+  .option("--dry-run", "只决策不写任何文件")
+  .option("--json", "结尾输出 JSON 汇总")
+  .action(async (options) => {
+    const { runSweep } = await import("./sessions-sweep-run.js");
+    let llm: import("./llm-client.js").LLMClient | null = null;
+    if (options.llm !== false) {
+      const { createLLMClient } = await import("./llm-client.js");
+      const config = loadConfig();
+      const { resolveEnv } = await import("./runtime-config.js");
+      llm = config.llm ? createLLMClient({ ...config.llm, apiKey: resolveEnv(config.llm.apiKey) }) : null;
+      if (!llm) console.error("⚠️ config.llm 缺失或无法初始化，退回 --no-llm 行为");
+    }
+    const result = await runSweep({
+      roots: parseRootsOption(options.roots),
+      shadowDir: options.shadow.replace(/^~\//, `${require("node:os").homedir()}/`),
+      policy: { idleMinutes: Number(options.idleMinutes), candidateAfterMinutes: Number(options.candidateAfterMinutes), minUserTurns: Number(options.minUserTurns) },
+      sinceDays: Number(options.sinceDays),
+      nowMs: options.now ? Date.parse(options.now) : undefined,
+      sources: options.sources ? String(options.sources).split(",") as import("./session-events.js").SessionSource[] : undefined,
+      limit: Number(options.limit) || 0,
+      llm,
+      render: { maskMemoryWrites: !!options.maskMemoryWrites },
+      dryRun: !!options.dryRun,
+      onlySessionIds: options.only ? new Set(String(options.only).split(",").map((s) => s.trim()).filter(Boolean)) : undefined,
+      trigger: options.trigger === "replay" ? "replay" : "auto-sweep",
+      llmDelayMs: Number(options.llmDelayMs) || 0,
+      log: (line) => console.log(line),
+    });
+    if (options.json) console.log(JSON.stringify(result, null, 2));
+    else console.log(`发现 ${result.discovered}（stat ${result.statCalls} 次 / ${result.discoveryWallMs} ms）；决策 ${JSON.stringify(result.actions)}；写账本 ${result.ledgersWritten.length} 份；LLM ${result.llmCalls} 次（${result.llmPromptTokens}+${result.llmCompletionTokens} tokens，失败 ${result.llmFailures}）；${result.wallMs} ms`);
+  });
+
 program
   .command("lint")
   .description("Run memory quality lint checks")
