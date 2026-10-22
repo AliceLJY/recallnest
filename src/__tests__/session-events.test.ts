@@ -26,7 +26,7 @@ function writeCC(): string {
     jsonl([
       { type: "user", sessionId: sid, timestamp: "2026-10-20T10:00:00.000Z", message: { role: "user", content: "<system-reminder>注入</system-reminder>\n帮我修 bot" } },
       { type: "assistant", sessionId: sid, timestamp: "2026-10-20T10:00:05.000Z", message: { role: "assistant", content: [{ type: "text", text: "先看日志" }, { type: "tool_use", id: "t1", name: "Bash", input: { command: "tail x" } }] } },
-      { type: "user", sessionId: sid, timestamp: "2026-10-20T10:00:06.000Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", is_error: true, content: "zsh: command not found: tail-x" }] } },
+      { type: "user", sessionId: sid, timestamp: "2026-10-20T10:00:06.000Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", is_error: true, content: `zsh: command not found: tail-x\nAuthorization: Bearer ${["sk", "-", "a".repeat(24), "9".repeat(16)].join("")}` }] } },
       { type: "user", sessionId: sid, timestamp: "2026-10-20T10:00:07.000Z", isMeta: true, message: { role: "user", content: "系统插入" } },
       { type: "user", sessionId: sid, timestamp: "2026-10-20T10:01:00.000Z", message: { role: "user", content: "/code-review" } },
       { type: "user", sessionId: sid, timestamp: "2026-10-20T10:02:00.000Z", message: { role: "user", content: "好" } },
@@ -58,6 +58,13 @@ function writeCodex(): string {
       { timestamp: "2026-10-19T12:20:00.000Z", type: "event_msg", payload: { type: "user_message", message: "继续" } },
       { timestamp: "2026-10-19T12:20:00.100Z", type: "event_msg", payload: { type: "item_completed", item: { type: "UserMessage", content: [{ type: "text", text: "继续" }] } } },
       { timestamp: "2026-10-19T12:25:00.000Z", type: "event_msg", payload: { type: "item_completed", item: { type: "UserMessage", content: [{ type: "text", text: "只在 item_completed 里的那句" }] } } },
+      // 一条消息两个文本块 = 一轮（Codex #4）；相邻两轮同文 = 两轮（Codex #3 的 Codex 版）
+      { timestamp: "2026-10-19T12:30:00.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "第一块" }, { type: "input_text", text: "第二块" }] } },
+      { timestamp: "2026-10-19T12:31:00.000Z", type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "收到" }] } },
+      { timestamp: "2026-10-19T12:32:00.000Z", type: "event_msg", payload: { type: "user_message", message: "继续" } },
+      { timestamp: "2026-10-19T12:33:00.000Z", type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "好" }] } },
+      { timestamp: "2026-10-19T12:34:00.000Z", type: "event_msg", payload: { type: "user_message", message: "继续" } },
+      { timestamp: "2026-10-19T12:35:00.000Z", type: "response_item", payload: { type: "function_call_output", call_id: "c3", output: "Process exited with code 2\nOutput:\nboom" } },
     ]),
   );
   return p;
@@ -111,6 +118,11 @@ function writeKimi(): string {
       { type: "context.append_loop_event", time: t0 + 2600, event: { type: "content.part", part: { type: "text", text: "我看到报错了" } } },
       { type: "agent.message.appended", time: t0 + 2601, message: { message: { role: "assistant", content: [{ type: "think", think: "..." }, { type: "text", text: "我看到报错了" }] }, meta: {} } },
       { type: "agent.message.appended", time: t0 + 2602, message: { message: { role: "tool", toolCallId: "k1", content: [{ type: "text", text: "ls: cannot access" }] }, meta: {} } },
+      { type: "turn.prompt", time: t0 + 3000, origin: { kind: "user" }, input: [{ type: "text", text: "继续" }] },
+      { type: "context.append_message", time: t0 + 3001, message: { role: "user", origin: { kind: "user" }, content: [{ type: "text", text: "继续" }] } },
+      { type: "agent.message.appended", time: t0 + 3500, message: { message: { role: "assistant", content: [{ type: "text", text: "好" }] }, meta: {} } },
+      { type: "turn.prompt", time: t0 + 4000, origin: { kind: "user" }, input: [{ type: "text", text: "继续" }] },
+      { type: "context.append_message", time: t0 + 4001, message: { role: "user", origin: { kind: "user" }, content: [{ type: "text", text: "继续" }] } },
     ]),
   );
   return p;
@@ -163,6 +175,7 @@ describe("session-events: CC", () => {
     expect(s.toolErrors).toBe(1);
     expect(s.errors[0].toolName).toBe("Bash");
     expect(s.errors[0].text).toContain("command not found");
+    expect(s.errors[0].text).not.toContain("a".repeat(24));
     expect(s.memoryWrites).toHaveLength(1);
     expect(s.memoryWrites[0].tool).toBe("mcp__recallnest__checkpoint_session");
     expect((s.memoryWrites[0].input as { summary: string }).summary).toBe("修好了 bot");
@@ -200,15 +213,17 @@ describe("session-events: Codex", () => {
   it("takes session id from session_meta and skips developer/AGENTS injections as human turns", () => {
     expect(doc.sessionId).toBe("01a15411-54df-7b23-93ef-1272cbe09290");
     const humans = doc.events.filter((e) => e.kind === "user" && !e.injected).map((e) => e.text);
-    expect(humans).toEqual(["读交接文件", "继续", "只在 item_completed 里的那句"]);
-    expect(s.userTurns).toBe(3);
+    expect(humans).toEqual(["读交接文件", "继续", "只在 item_completed 里的那句", "第一块\n第二块", "继续", "继续"]);
+    expect(s.userTurns).toBe(6);
     expect(doc.isSubagent).toBeUndefined();
   });
   it("flags subagent threads from session_meta", () => {
     expect(parseSessionFile(writeCodexSubagent()).isSubagent).toBe(true);
   });
   it("detects errors from output text only", () => {
-    expect(s.toolErrors).toBe(1);
+    expect(s.toolErrors).toBe(2);
+    expect(detectCodexError("Process exited with code 1\nOutput:")).toBe(true);
+    expect(detectCodexError("Process exited with code 0\nOutput:")).toBe(false);
     expect(detectCodexError("Exit code: 1\nOutput:")).toBe(true);
     expect(detectCodexError("Exit code: 0\nOutput:")).toBe(false);
     expect(detectCodexError("Script completed\nWall time 0.6 seconds")).toBe(false);
@@ -221,13 +236,14 @@ describe("session-events: Kimi", () => {
   const s = summarizeSession(doc);
   it("dedupes turn.prompt against append_message and marks system-origin user text as injected", () => {
     const users = doc.events.filter((e) => e.kind === "user");
-    expect(users.filter((u) => !u.injected).map((u) => u.text)).toEqual(["审一下这段代码"]);
+    expect(users.filter((u) => !u.injected).map((u) => u.text)).toEqual(["审一下这段代码", "继续", "继续"]);
     expect(users.filter((u) => u.injected)).toHaveLength(1);
+    expect(s.userTurns).toBe(3);
   });
   it("reads tool.result isError and assistant text from the nested message once", () => {
     expect(s.toolErrors).toBe(1);
     expect(s.errors[0].toolName).toBe("Bash");
-    expect(doc.events.filter((e) => e.kind === "assistant")).toHaveLength(1);
+    expect(doc.events.filter((e) => e.kind === "assistant")).toHaveLength(2);
     expect(doc.events.filter((e) => e.kind === "tool_result")).toHaveLength(1);
     expect(doc.startedAt).toBe("2026-10-18T08:00:01.000Z"); // metadata 行不是事件，首事件是 turn.prompt
   });

@@ -39,8 +39,11 @@ for (const f of disc.files) {
     const sigs = extractErrorSignatures({ problem: e.text.slice(0, 4000) }).filter((x) => classifySignatureSpecificity(x) === "specific");
     if (!sigs.length) continue;
     totalSpecificErrors++;
+    if (!e.ts) continue; // 无时间戳判不了「事前」，不进样本（互审 R1 Grok #6）
     const key = sigs[0].toLowerCase();
-    if (!bySig.has(key)) bySig.set(key, { source: f.source, sid8: doc.sessionId.slice(0, 8), ts: e.ts, tsMs: e.ts ? Date.parse(e.ts) : Date.now(), tool: e.toolName, text: e.text.replace(/\s+/g, " ").slice(0, 600), sigs });
+    const cand = { source: f.source, sid8: doc.sessionId.slice(0, 8), ts: e.ts, tsMs: Date.parse(e.ts), tool: e.toolName, text: redactSecrets(e.text.replace(/\s+/g, " ")).text.slice(0, 600), sigs };
+    const prev = bySig.get(key);
+    if (!prev || cand.tsMs < prev.tsMs) bySig.set(key, cand); // 同一签名保留最早那次，prior 过滤才最严
   }
 }
 const uniq = [...bySig.values()];
@@ -48,7 +51,7 @@ const uniq = [...bySig.values()];
 const sample = uniq.sort((a, b) => (a.sid8 + a.sigs[0]).localeCompare(b.sid8 + b.sigs[0])).filter((_, i) => i % Math.max(1, Math.ceil(uniq.length / MAX_EMBED)) === 0).slice(0, MAX_EMBED);
 
 // 2) 嵌入 + 检索
-type Hit = { id8: string; sim: number; writtenAt: number; textHead: string; scope: string };
+type Hit = { id8: string; sim: number; writtenAt: number; textHead: string; scope: string; active?: boolean };
 type Row = { err: Err; top: Hit[]; topPrior: Hit | null; vectorHit: boolean; vectorHitPrior: boolean };
 const rows: Row[] = [];
 let embedCalls = 0;
@@ -62,10 +65,13 @@ for (const err of sample) {
     console.error("embed failed", String(e).slice(0, 120));
     continue;
   }
-  const res = await table.vectorSearch(vec).distanceType("cosine").where("category = 'cases'").select(["id", "scope", "timestamp", "text", "metadata"]).limit(5).toArray();
-  const top: Hit[] = res.map((r: any) => ({ id8: String(r.id).slice(0, 8), sim: Math.round((1 - Number(r._distance)) * 1000) / 1000, writtenAt: Number(r.timestamp), textHead: redactSecrets(String(r.text)).text.replace(/\s+/g, " ").slice(0, 160), scope: String(r.scope) })).filter((h: Hit) => (JSON.parse((res.find((r: any) => String(r.id).startsWith(h.id8))?.metadata) || "{}").evolution?.status ?? "active") === "active");
-  const topPrior = top.find((h) => h.writtenAt < err.tsMs) ?? null;
-  rows.push({ err, top: top.slice(0, 3), topPrior, vectorHit: !!top[0] && top[0].sim >= THRESH, vectorHitPrior: !!topPrior && topPrior.sim >= THRESH });
+  // 先多取（30），再按「活跃 且 写入早于报错时刻」过滤，最后才取 top（互审 R1 Codex #13：先截前五再过滤会把合格的旧 case 挤掉）
+  const res = await table.vectorSearch(vec).distanceType("cosine").where("category = 'cases'").select(["id", "scope", "timestamp", "text", "metadata"]).limit(30).toArray();
+  const all: Hit[] = res.map((r: any) => ({ id8: String(r.id).slice(0, 8), sim: Math.round((1 - Number(r._distance)) * 1000) / 1000, writtenAt: Number(r.timestamp), textHead: redactSecrets(String(r.text)).text.replace(/\s+/g, " ").slice(0, 160), scope: String(r.scope), active: (JSON.parse(r.metadata || "{}").evolution?.status ?? "active") === "active" }));
+  const eligible = all.filter((h) => h.active && h.writtenAt < err.tsMs).sort((a, b) => b.sim - a.sim);
+  const top = eligible;
+  const topPrior = eligible[0] ?? null;
+  rows.push({ err, top: top.slice(0, 3), topPrior, vectorHit: !!topPrior && topPrior.sim >= THRESH, vectorHitPrior: !!topPrior && topPrior.sim >= THRESH });
 }
 const sims = rows.map((r) => r.top[0]?.sim ?? 0).sort((a, b) => a - b);
 const q = (p: number) => sims[Math.min(sims.length - 1, Math.floor(p * sims.length))];

@@ -32,6 +32,8 @@
 import { readFileSync } from "node:fs";
 import { basename, dirname, sep } from "node:path";
 
+import { redactSecrets } from "./pii-detector.js";
+
 export type SessionSource = "cc" | "codex" | "kimi" | "antigravity";
 export type EventKind = "user" | "assistant" | "tool_call" | "tool_result" | "system";
 
@@ -94,7 +96,7 @@ const CC_INJECTED_PREFIXES = [
 ];
 const SLASH_COMMAND_RE = /^\/[A-Za-z][A-Za-z0-9:_-]*(\s|$)/;
 const CODEX_INJECTED_MARKERS = ["# AGENTS.md instructions", "<INSTRUCTIONS>", "<environment_context>", "<permissions instructions>", "<user_instructions>", "<turn_aborted>", "<collaboration_mode>"];
-const CODEX_ERROR_RE = /(^|\n)\s*(Script failed\b|Exit code:\s*[1-9]\d*\b|Traceback \(most recent call last\)|(Error|ERROR|error):\s)/;
+const CODEX_ERROR_RE = /(^|\n)\s*(Script failed\b|Exit code:\s*[1-9]\d*\b|Process exited with code\s+[1-9]\d*\b|exit(?:ed)? with (?:code|status)\s+[1-9]\d*\b|Traceback \(most recent call last\)|(Error|ERROR|error):\s)/;
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 function toIso(value: unknown): { ts: string | null; tsMs: number | null } {
@@ -109,9 +111,11 @@ function toIso(value: unknown): { ts: string | null; tsMs: number | null } {
   return { ts: null, tsMs: null };
 }
 
+/** 先脱敏再截断：截断切在凭证中间会留下正则认不出的半截（互审 R1 Codex #7）；工具结果与系统注入都走这里 */
 function clip(text: string, max = MAX_TOOL_TEXT): string {
-  if (text.length <= max) return text;
-  return `${text.slice(0, max)}\n… [truncated ${text.length - max} of ${text.length} chars]`;
+  const safe = redactSecrets(text).text;
+  if (safe.length <= max) return safe;
+  return `${safe.slice(0, max)}\n… [truncated ${safe.length - max} of ${safe.length} chars]`;
 }
 
 function blockText(content: unknown): string {
@@ -249,6 +253,15 @@ function push(doc: SessionDoc, e: Omit<SessionEvent, "seq">): void {
   doc.events.push({ seq: doc.events.length, ...e });
 }
 
+/** 两条通道记同一句用户话时只留一条：只和「紧邻的上一条事件」比，不和历史上最后一句人话比——
+ *  不然用户连说两次「继续」会被并成一轮（互审 R1 Codex #3）。*/
+function pushUserDedupAdjacent(doc: SessionDoc, e: Omit<SessionEvent, "seq">): boolean {
+  const prev = doc.events[doc.events.length - 1];
+  if (prev && prev.kind === "user" && !prev.injected && !e.injected && prev.text === e.text) return false;
+  push(doc, e);
+  return true;
+}
+
 // ---------------------------------------------------------------- CC
 
 export function classifyCCUserText(raw: string): { text: string; injected: boolean } | null {
@@ -257,7 +270,9 @@ export function classifyCCUserText(raw: string): { text: string; injected: boole
     // 整条都是 system-reminder → 保留为注入事件，不算人说的
     return raw.trim() ? { text: raw.trim().slice(0, 400), injected: true } : null;
   }
-  const injected = CC_INJECTED_PREFIXES.some((p) => text.startsWith(p)) || SLASH_COMMAND_RE.test(text);
+  // 以 < 开头的几乎都是宿主注入（<command-name> / <local-command-stdout> / <task-notification> …），
+  // 唯一的例外是用户贴进来的 <pasted_content>（互审 R1 Grok #9）
+  const injected = (!text.startsWith("<pasted_content") && CC_INJECTED_PREFIXES.some((p) => text.startsWith(p))) || SLASH_COMMAND_RE.test(text);
   return { text, injected };
 }
 
@@ -347,7 +362,6 @@ export function detectCodexError(outputText: string): boolean {
 }
 
 function parseCodex(doc: SessionDoc): void {
-  let lastUserText = "";
   for (const line of readLines(doc.filePath)) {
     if (!line.trim()) continue;
     let o: { timestamp?: unknown; type?: string; payload?: Record<string, unknown> };
@@ -373,20 +387,23 @@ function parseCodex(doc: SessionDoc): void {
         const role = payload.role;
         const content = payload.content;
         if (!Array.isArray(content)) continue;
+        // 一条消息里的多个文本块合成一条事件（互审 R1 Codex #4：13 条双块消息曾被数成 26 轮）
+        const texts: string[] = [];
         for (const c of content) {
           if (!c || typeof c !== "object") continue;
           const blk = c as { type?: string; text?: string };
           if (typeof blk.text !== "string" || !blk.text.trim()) continue;
-          if (blk.type === "input_text" && role === "user") {
-            const text = blk.text.trim();
-            const injected = CODEX_INJECTED_MARKERS.some((m) => text.startsWith(m) || text.includes(m)) || text.startsWith("<");
-            if (!injected) lastUserText = text;
-            push(doc, { ts, tsMs, kind: "user", text, injected: injected || undefined });
-          } else if (blk.type === "input_text" && role === "developer") {
-            push(doc, { ts, tsMs, kind: "system", text: clip(blk.text.trim(), 400), injected: true });
-          } else if (blk.type === "output_text" && role === "assistant") {
-            push(doc, { ts, tsMs, kind: "assistant", text: blk.text.trim() });
-          }
+          if ((blk.type === "input_text" && (role === "user" || role === "developer")) || (blk.type === "output_text" && role === "assistant")) texts.push(blk.text.trim());
+        }
+        if (!texts.length) continue;
+        const text = texts.join("\n");
+        if (role === "user") {
+          const injected = CODEX_INJECTED_MARKERS.some((m) => text.startsWith(m) || text.includes(m)) || text.startsWith("<");
+          pushUserDedupAdjacent(doc, { ts, tsMs, kind: "user", text, injected: injected || undefined });
+        } else if (role === "developer") {
+          push(doc, { ts, tsMs, kind: "system", text: clip(text, 400), injected: true });
+        } else if (role === "assistant") {
+          push(doc, { ts, tsMs, kind: "assistant", text });
         }
       } else if (ptype === "function_call" || ptype === "custom_tool_call") {
         const name = typeof payload.name === "string" ? payload.name : undefined;
@@ -400,10 +417,7 @@ function parseCodex(doc: SessionDoc): void {
     }
     if (o.type === "event_msg" && payload.type === "user_message" && typeof payload.message === "string") {
       const text = payload.message.trim();
-      if (text && text !== lastUserText) {
-        lastUserText = text;
-        push(doc, { ts, tsMs, kind: "user", text });
-      }
+      if (text) pushUserDedupAdjacent(doc, { ts, tsMs, kind: "user", text });
       continue;
     }
     // 第三条用户通道：有的会话（13/397，2026-10-23 实测）只在 item_completed 的 UserMessage 里有用户原话
@@ -411,10 +425,7 @@ function parseCodex(doc: SessionDoc): void {
       const item = payload.item as { type?: string; content?: unknown } | undefined;
       if (item?.type === "UserMessage") {
         const text = blockText(item.content).trim();
-        if (text && text !== lastUserText && !text.startsWith("<")) {
-          lastUserText = text;
-          push(doc, { ts, tsMs, kind: "user", text });
-        }
+        if (text && !text.startsWith("<")) pushUserDedupAdjacent(doc, { ts, tsMs, kind: "user", text });
       }
     }
   }
@@ -423,7 +434,6 @@ function parseCodex(doc: SessionDoc): void {
 // ---------------------------------------------------------------- Kimi
 
 function parseKimi(doc: SessionDoc): void {
-  let lastUserText = "";
   for (const line of readLines(doc.filePath)) {
     if (!line.trim()) continue;
     let o: Record<string, unknown>;
@@ -439,10 +449,8 @@ function parseKimi(doc: SessionDoc): void {
       const origin = o.origin as { kind?: string } | undefined;
       if (origin?.kind !== "user") continue;
       const text = blockText(o.input).trim();
-      if (text && text !== lastUserText) {
-        lastUserText = text;
-        push(doc, { ts, tsMs, kind: "user", text });
-      }
+      // 每个 turn.prompt 都是用户新开的一轮，一律记（连说两次「继续」是两轮）；紧随其后的 append_message 副本在下面去重
+      if (text) push(doc, { ts, tsMs, kind: "user", text });
       continue;
     }
     if (type === "context.append_message") {
@@ -452,9 +460,8 @@ function parseKimi(doc: SessionDoc): void {
       if (!text) continue;
       if (msg.role === "user") {
         const injected = msg.origin?.kind !== "user";
-        if (!injected && text === lastUserText) continue; // turn.prompt 已记
-        if (!injected) lastUserText = text;
-        push(doc, { ts, tsMs, kind: "user", text: injected ? clip(text, 400) : text, injected: injected || undefined });
+        if (injected) push(doc, { ts, tsMs, kind: "user", text: clip(text, 400), injected: true });
+        else pushUserDedupAdjacent(doc, { ts, tsMs, kind: "user", text }); // turn.prompt 已记的副本在这里被挡掉
       } else if (msg.role === "assistant") {
         push(doc, { ts, tsMs, kind: "assistant", text });
       }

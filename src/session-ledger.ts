@@ -61,6 +61,13 @@ export interface RenderTranscriptOptions {
 }
 
 export const DEFAULT_RENDER: Required<RenderTranscriptOptions> = { maxChars: 28_000, assistantClip: 500, errorClip: 300, maskMemoryWrites: false };
+export const EXPERIENCE_KINDS = ["坑", "技巧", "决定", "偏好"] as const;
+
+/** 出站前脱敏（互审 R1 Codex #9）：原始转录不该带着凭证去 LLM；先脱敏再截断（#7） */
+function safe(text: string, max?: number): string {
+  const t = redactSecrets(text).text;
+  return max !== undefined && t.length > max ? `${t.slice(0, max)}…` : t;
+}
 
 function shortTs(ts: string | null): string {
   return ts ? ts.slice(11, 16) : "--:--";
@@ -75,22 +82,22 @@ export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOp
     switch (e.kind) {
       case "user":
         if (e.injected) break;
-        lines.push({ seq: e.seq, text: `[U#${e.seq} ${shortTs(e.ts)}] ${e.text}`, weight: 3 });
+        lines.push({ seq: e.seq, text: `[U#${e.seq} ${shortTs(e.ts)}] ${safe(e.text)}`, weight: 3 });
         break;
       case "assistant":
-        lines.push({ seq: e.seq, text: `[A#${e.seq}] ${e.text.length > o.assistantClip ? `${e.text.slice(0, o.assistantClip)}…` : e.text}`, weight: 1 });
+        lines.push({ seq: e.seq, text: `[A#${e.seq}] ${safe(e.text, o.assistantClip)}`, weight: 1 });
         break;
       case "tool_call":
         if (e.toolCallId && e.toolName) callNames.set(e.toolCallId, e.toolName);
         if (e.toolName && /(checkpoint_session|store_case|store_memory|store_workflow_pattern)$/.test(e.toolName)) {
           if (o.maskMemoryWrites) lines.push({ seq: e.seq, text: `[MEM#${e.seq}] （当场写了一条记忆，回放时隐藏）`, weight: 2 });
-          else lines.push({ seq: e.seq, text: `[MEM#${e.seq} ${e.toolName.replace(/^mcp__recallnest__/, "")}] ${e.toolInput ? JSON.stringify(e.toolInput).slice(0, 800) : ""}`, weight: 2 });
+          else lines.push({ seq: e.seq, text: `[MEM#${e.seq} ${e.toolName.replace(/^mcp__recallnest__/, "")}] ${e.toolInput ? safe(JSON.stringify(e.toolInput), 800) : ""}`, weight: 2 });
         }
         break;
       case "tool_result":
         if (e.isError && !/interrupted|doesn't want to proceed|rejected/i.test(e.text.slice(0, 300))) {
           const name = e.toolCallId ? callNames.get(e.toolCallId) : undefined;
-          lines.push({ seq: e.seq, text: `[ERR#${e.seq}${name ? ` ${name}` : ""}] ${e.text.replace(/\s+/g, " ").slice(0, o.errorClip)}`, weight: 2 });
+          lines.push({ seq: e.seq, text: `[ERR#${e.seq}${name ? ` ${name}` : ""}] ${safe(e.text.replace(/\s+/g, " "), o.errorClip)}`, weight: 2 });
         }
         break;
       default:
@@ -130,7 +137,7 @@ export const LEDGER_SYSTEM_PROMPT = `你是会话账本的记录员。读一场 
   "unfinished": ["没做完 / 等人拍板 / 下一步，每条一句"]
 }
 规则：
-1. experience 宁缺毋滥：没有真正可复用的就给空数组；一次性的操作细节不算经验。
+1. experience 宁缺毋滥：没有真正可复用的就给空数组；一次性的操作细节不算经验。{{EXPERIENCE_RULE}}
 2. anchor 必须是转录里能逐字找到的一段，不要用自己的话转述；找不到原话就不要写这条经验。
 3. 用户明确表达的偏好、否决、决定，用用户自己的话当 anchor。
 4. 不写任何密钥、token、密码；遇到就写 [REDACTED]。
@@ -164,7 +171,8 @@ export function parseLedgerJson(raw: string, doc: SessionDoc): LedgerBody {
       const anchor = typeof it.anchor === "string" ? it.anchor.trim() : "";
       const seqIn = typeof it.anchorSeq === "number" && Number.isInteger(it.anchorSeq) ? it.anchorSeq : null;
       const v = anchor ? verifyAnchor(doc, anchor, seqIn) : { verified: false, seq: seqIn };
-      experience.push({ text: it.text.trim(), anchor, anchorSeq: v.seq, anchorVerified: v.verified, kind: typeof it.kind === "string" ? it.kind : "" });
+      const kind = typeof it.kind === "string" && (EXPERIENCE_KINDS as readonly string[]).includes(it.kind.trim()) ? it.kind.trim() : "";
+      experience.push({ text: it.text.trim(), anchor, anchorSeq: v.seq, anchorVerified: v.verified, kind });
     }
   }
   return { oneLine: typeof parsed.oneLine === "string" ? parsed.oneLine.trim() : "", solved: strs(parsed.solved), experience, unfinished: strs(parsed.unfinished) };
@@ -172,6 +180,8 @@ export function parseLedgerJson(raw: string, doc: SessionDoc): LedgerBody {
 
 export interface GenerateLedgerOptions extends RenderTranscriptOptions {
   maxTokens?: number;
+  /** 候选阶段到了没（D2：第一次静默只写账本，经验候选 6 小时后才出）。false 时 prompt 不要经验、输出里也清空（互审 R1 Codex #6） */
+  includeCandidates?: boolean;
   /** 429 / 超时类错误的重试次数（默认 3）与退避起点毫秒（默认 8000，逐次翻倍） */
   retries?: number;
   retryBaseMs?: number;
@@ -186,11 +196,13 @@ export async function generateLedgerBody(doc: SessionDoc, llm: LLMClient, opts: 
   const t0 = performance.now();
   const retries = opts.retries ?? 3;
   const base = opts.retryBaseMs ?? 8000;
+  const includeCandidates = opts.includeCandidates ?? true;
+  const systemPrompt = LEDGER_SYSTEM_PROMPT.replace("{{EXPERIENCE_RULE}}", includeCandidates ? "" : "\n   本阶段只记事实账本，experience 一律给空数组 []。");
   let result;
   let lastError = "";
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      result = await llm.chatLongDetailed(LEDGER_SYSTEM_PROMPT, `会话来源：${doc.source}；事件数 ${doc.events.length}${rendered.droppedEvents ? `（已削去 ${rendered.droppedEvents} 条助手发言）` : ""}。\n\n${rendered.text}`, {
+      result = await llm.chatLongDetailed(systemPrompt, `会话来源：${doc.source}；事件数 ${doc.events.length}${rendered.droppedEvents ? `（已削去 ${rendered.droppedEvents} 条助手发言）` : ""}。\n\n${rendered.text}`, {
         responseFormat: { type: "json_object" },
         tokenLimit: { parameter: "max_tokens", value: opts.maxTokens ?? 1800 },
         temperature: 0.1,
@@ -210,8 +222,9 @@ export async function generateLedgerBody(doc: SessionDoc, llm: LLMClient, opts: 
   const wallMs = Math.round(performance.now() - t0);
   if (!result?.content) return { body: null, usage: null, failure: "llm returned empty (breaker open or null content)", rendered };
   const usage: LedgerUsage = { model: result.responseModel, promptTokens: result.usage?.promptTokens ?? 0, completionTokens: result.usage?.completionTokens ?? 0, wallMs, inputChars: rendered.text.length };
+  const finish = (body: LedgerBody): LedgerBody => (includeCandidates ? body : { ...body, experience: [] });
   try {
-    return { body: parseLedgerJson(result.content, doc), usage, rendered };
+    return { body: finish(parseLedgerJson(result.content, doc)), usage, rendered };
   } catch (error) {
     // 坏 JSON 重试一次：把坏输出喂回去让它只修格式（不重新读转录，省 token；修不好就记失败）
     try {
@@ -219,7 +232,7 @@ export async function generateLedgerBody(doc: SessionDoc, llm: LLMClient, opts: 
       if (fix?.content) {
         usage.promptTokens += fix.usage?.promptTokens ?? 0;
         usage.completionTokens += fix.usage?.completionTokens ?? 0;
-        return { body: parseLedgerJson(fix.content, doc), usage, rendered };
+        return { body: finish(parseLedgerJson(fix.content, doc)), usage, rendered };
       }
     } catch {
       /* fall through */
@@ -278,8 +291,8 @@ export function renderLedgerMarkdown(doc: SessionDoc, summary: SessionSummary, b
   const errLines = summary.errors.slice(0, 20).map((e) => {
     const sigs = extractErrorSignatures({ problem: e.text.slice(0, 4000) });
     const specific = sigs.filter((s) => classifySignatureSpecificity(s) === "specific");
-    const head = red(e.text.replace(/\s+/g, " ").slice(0, 160));
-    return `- ${e.toolName ?? "tool"} #${e.seq}: ${head}${specific.length ? ` ｜签名：${specific.map((s) => red(s.slice(0, 100))).join(" ‖ ")}` : ""}`;
+    const head = red(e.text.replace(/\s+/g, " ")).slice(0, 160);
+    return `- ${e.toolName ?? "tool"} #${e.seq}: ${head}${specific.length ? ` ｜签名：${specific.map((s) => red(s).slice(0, 100)).join(" ‖ ")}` : ""}`;
   });
   sections.push(`## 报错（机器抽取，${summary.toolErrors} 条${summary.errors.length > 20 ? "，只列前 20" : ""}）\n${errLines.length ? errLines.join("\n") : "- （无）"}`);
   const memCounts = new Map<string, number>();

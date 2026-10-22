@@ -47,7 +47,8 @@ for (const f of disc.files) {
     const specific = sigs.filter((x) => classifySignatureSpecificity(x) === "specific");
     for (const x of sigs) sigFreq.set(x.toLowerCase(), (sigFreq.get(x.toLowerCase()) ?? 0) + 1);
     for (const x of specific) specFreq.set(x.toLowerCase(), (specFreq.get(x.toLowerCase()) ?? 0) + 1);
-    const errMs = e.ts ? Date.parse(e.ts) : Number.POSITIVE_INFINITY;
+    // 无时间戳的报错不能判「事前」，一律不算 prior 命中（互审 R1 Grok #6 / Codex 问题 5）
+    const errMs = e.ts ? Date.parse(e.ts) : Number.NEGATIVE_INFINITY;
     const hits = (list: string[], pred: (c: CaseSig) => boolean) => [...new Set(list.flatMap((x) => (sigIndex.get(x.toLowerCase()) ?? []).filter(pred).map((c) => c.id8)))];
     const rec: ErrRec = {
       source: f.source, sid8: doc.sessionId.slice(0, 8), ts: e.ts, toolName: e.toolName, sigs, specific,

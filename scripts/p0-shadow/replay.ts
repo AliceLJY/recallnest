@@ -1,6 +1,7 @@
 // 回放：30 天真实会话 → 影子账本（LLM 版，隐藏当场写过的记忆），分三组：
 //   A) CC 里当场写过 checkpoint_session / store_case 的会话（账本召回的对照组，已知偏乐观）
-//   B) CC 无声结束的有料会话（最后两条没有收尾语、没有记忆写入）随机 30 场（双读者抽检）
+//   B) CC 无声结束的有料会话（最后两条没有收尾语；没有 checkpoint / store_case——那些进 A 组；store_memory 不作排除条件，
+//      回放时所有记忆写入都已从转录里隐藏）随机 30 场（双读者抽检）。互审 R1 Codex #12 指出原注释写成「没有记忆写入」与代码不符，已改注释。
 //   C) 其余三端的全部有料会话（四端形状太小，全量）
 // 输出：<out>/ledgers/YYYY-MM/<sid8>.md + <out>/replay-index.json（分组、sid、是否生成成功、token）
 import { mkdirSync, writeFileSync } from "node:fs";
