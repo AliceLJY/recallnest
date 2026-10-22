@@ -109,7 +109,7 @@ for (const p of index.picks) {
     if (!m) continue;
     const seq = m[3] === "?" ? null : Number(m[3]);
     doc ??= parseSessionFile(f.path, { source: f.source });
-    const ctx = seq !== null ? doc.events.slice(Math.max(0, seq - 2), seq + 3).filter((e) => e.kind === "user" || e.kind === "assistant" || e.kind === "tool_result").map((e) => `[${e.kind}#${e.seq}] ${e.text.replace(/\s+/g, " ").slice(0, 400)}`).join("\n") : "";
+    const ctx = seq !== null ? doc.events.slice(Math.max(0, seq - 2), seq + 3).filter((e) => e.kind === "user" || e.kind === "assistant" || e.kind === "tool_result").map((e) => `[${e.kind}#${e.seq}] ${red(e.text.replace(/\s+/g, " ")).slice(0, 400)}`).join("\n") : "";
     cands.push({ n: 0, sid8: p.sid8, group: p.group, text: red(m[1]), anchor: red(m[2]), anchorSeq: seq, anchorVerified: !m[4], context: red(ctx) });
   }
 }

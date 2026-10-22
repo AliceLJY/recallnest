@@ -90,13 +90,21 @@ const CC_INJECTED_PREFIXES = [
   "A session-scoped",
   "Another Claude session",
   "Caveat:",
-  "<",
   "[Request interrupted",
   "This session is being continued",
 ];
+/** 宿主注入标签都是带连字符 / 下划线的（30 天实测 262 条：task-notification 228、command-name 11、scheduled-task 7、
+ *  side-sessions-event 5、local-command-stdout 4、bash-input 2、routine-fire-payload 1）；用户贴的 HTML / JSX 是单词标签
+ *  （<div> <p> <script>），不算注入（R3 Codex #11）。<pasted_content> 是用户贴的内容，单独放行。 */
+const HOST_TAG_RE = /^<(?!pasted_content\b)[a-z]+[-_][a-z0-9_-]*[\s>]/i;
 const SLASH_COMMAND_RE = /^\/[A-Za-z][A-Za-z0-9:_-]*(\s|$)/;
 const CODEX_INJECTED_MARKERS = ["# AGENTS.md instructions", "<INSTRUCTIONS>", "<environment_context>", "<permissions instructions>", "<user_instructions>", "<turn_aborted>", "<collaboration_mode>"];
-const CODEX_ERROR_RE = /(^|\n)\s*(Script failed\b|Exit code:\s*[1-9]\d*\b|Process exited with code\s+[1-9]\d*\b|exit(?:ed)? with (?:code|status)\s+[1-9]\d*\b|Traceback \(most recent call last\)|(Error|ERROR|error):\s)/;
+/** 强信号：明确的失败头 / 非零退出码 / Traceback——命中即报错，不被任何成功头压掉（R3 Codex N3） */
+const CODEX_STRONG_ERROR_RE = /(^|\n)\s*(Script failed\b|Exit code:\s*[1-9]\d*\b|Process exited with code\s+[1-9]\d*\b|exit(?:ed)? with (?:code|status)\s+[1-9]\d*\b|Traceback \(most recent call last\))/;
+/** 弱信号：正文里的 "Error:"——只有在没有成功标记时才算 */
+const CODEX_WEAK_ERROR_RE = /(^|\n)\s*(Error|ERROR|error):\s/;
+/** 成功标记：前三行里出现 Script completed / Exit code: 0 / Process exited with code 0（不要求在行首，R3 Codex #9） */
+const CODEX_SUCCESS_MARK_RE = /\b(Script completed\b|Exit code:\s*0\b|Process exited with code 0\b)/;
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 function toIso(value: unknown): { ts: string | null; tsMs: number | null } {
@@ -253,13 +261,33 @@ function push(doc: SessionDoc, e: Omit<SessionEvent, "seq">): void {
   doc.events.push({ seq: doc.events.length, ...e });
 }
 
-/** 两条通道记同一句用户话时只留一条：只和「紧邻的上一条事件」比，不和历史上最后一句人话比——
- *  不然用户连说两次「继续」会被并成一轮（互审 R1 Codex #3）。*/
-function pushUserDedupAdjacent(doc: SessionDoc, e: Omit<SessionEvent, "seq">): boolean {
-  const prev = doc.events[doc.events.length - 1];
-  if (prev && prev.kind === "user" && !prev.injected && !e.injected && prev.text === e.text) return false;
+/** 两条通道记同一句用户话时只留一条。判「副本」的尺度是**回合**：上一条人话之后如果只经过了注入 / 系统事件
+ *  （没有助手回复、没有工具调用、没有回合边界），同文就是另一通道的副本；隔着助手回复或回合边界的同文是用户又说了一遍
+ *  （R1 Codex #3：连说两次「继续」是两轮；R3 Codex N2：turn.prompt → 注入 → append_message 副本不能数成两轮）。*/
+function pushUserDedupInTurn(doc: SessionDoc, e: Omit<SessionEvent, "seq">): boolean {
+  for (let i = doc.events.length - 1; i >= 0; i--) {
+    const prev = doc.events[i];
+    if (prev.kind === "user" && prev.injected) continue;
+    if (prev.kind === "system") continue;
+    if (prev.kind === "user") {
+      if ((prev as SessionEvent & { turnClosed?: boolean }).turnClosed) break;
+      if (!e.injected && prev.text === e.text) return false;
+      break;
+    }
+    break; // assistant / tool_call / tool_result：回合已推进
+  }
   push(doc, e);
   return true;
+}
+/** 回合边界标记：之后的同文一律算新一轮 */
+function markTurnBoundary(doc: SessionDoc): void {
+  // 往回跳过注入 / 系统事件，把边界标在最后一条人话上（边界事件前面常常紧跟着一条注入）
+  for (let i = doc.events.length - 1; i >= 0; i--) {
+    const prev = doc.events[i];
+    if ((prev.kind === "user" && prev.injected) || prev.kind === "system") continue;
+    if (prev.kind === "user") (prev as SessionEvent & { turnClosed?: boolean }).turnClosed = true;
+    break;
+  }
 }
 
 // ---------------------------------------------------------------- CC
@@ -272,7 +300,7 @@ export function classifyCCUserText(raw: string): { text: string; injected: boole
   }
   // 以 < 开头的几乎都是宿主注入（<command-name> / <local-command-stdout> / <task-notification> …），
   // 唯一的例外是用户贴进来的 <pasted_content>（互审 R1 Grok #9）
-  const injected = (!text.startsWith("<pasted_content") && CC_INJECTED_PREFIXES.some((p) => text.startsWith(p))) || SLASH_COMMAND_RE.test(text);
+  const injected = HOST_TAG_RE.test(text) || CC_INJECTED_PREFIXES.some((p) => text.startsWith(p)) || SLASH_COMMAND_RE.test(text);
   return { text, injected };
 }
 
@@ -357,13 +385,11 @@ function parseCC(doc: SessionDoc): void {
 
 // ---------------------------------------------------------------- Codex
 
-const CODEX_SUCCESS_HEAD_RE = /^\s*(Script completed\b|Exit code:\s*0\b|Process exited with code 0\b)/;
-
 export function detectCodexError(outputText: string): boolean {
-  // 输出头明确说成功（Script completed / Exit code: 0）时，正文里再出现 "Error:" 也只是内容（grep 结果、文档），不算失败
-  //（互审 R1 Kimi #2：30 天 10,215 条输出里 16 条只靠 "Error:" 规则命中，其中 4 条带成功头）
-  if (CODEX_SUCCESS_HEAD_RE.test(outputText)) return false;
-  return CODEX_ERROR_RE.test(outputText);
+  if (CODEX_STRONG_ERROR_RE.test(outputText)) return true; // 外层 Script completed 包着内层 Exit code: 2 仍是失败
+  const head3 = outputText.split("\n").slice(0, 3).join("\n");
+  if (CODEX_SUCCESS_MARK_RE.test(head3)) return false; // 成功标记只压弱规则（R1 Kimi #2：16 条 Error:-only 命中里 4 条带成功头）
+  return CODEX_WEAK_ERROR_RE.test(outputText);
 }
 
 function parseCodex(doc: SessionDoc): void {
@@ -392,20 +418,29 @@ function parseCodex(doc: SessionDoc): void {
         const role = payload.role;
         const content = payload.content;
         if (!Array.isArray(content)) continue;
-        // 一条消息里的多个文本块合成一条事件（互审 R1 Codex #4：13 条双块消息曾被数成 26 轮）
+        // 一条消息里的多个文本块：先逐块分注入 / 真人，再把真人块合成一条事件（R1 Codex #4：13 条双块消息曾被数成 26 轮；
+        // R3 Codex N1：先合并再判注入会把「AGENTS 注入块 + 真人请求」整条吞掉）
+        const human: string[] = [];
+        const injectedTexts: string[] = [];
         const texts: string[] = [];
         for (const c of content) {
           if (!c || typeof c !== "object") continue;
           const blk = c as { type?: string; text?: string };
           if (typeof blk.text !== "string" || !blk.text.trim()) continue;
-          if ((blk.type === "input_text" && (role === "user" || role === "developer")) || (blk.type === "output_text" && role === "assistant")) texts.push(blk.text.trim());
+          const t = blk.text.trim();
+          if (blk.type === "input_text" && role === "user") {
+            const inj = CODEX_INJECTED_MARKERS.some((m) => t.startsWith(m) || t.includes(m)) || HOST_TAG_RE.test(t) || /^<(?!pasted_content)/.test(t);
+            (inj ? injectedTexts : human).push(t);
+          } else if ((blk.type === "input_text" && role === "developer") || (blk.type === "output_text" && role === "assistant")) texts.push(t);
+        }
+        if (role === "user") {
+          for (const t of injectedTexts) push(doc, { ts, tsMs, kind: "user", text: clip(t, 400), injected: true });
+          if (human.length) pushUserDedupInTurn(doc, { ts, tsMs, kind: "user", text: human.join("\n") });
+          continue;
         }
         if (!texts.length) continue;
         const text = texts.join("\n");
-        if (role === "user") {
-          const injected = CODEX_INJECTED_MARKERS.some((m) => text.startsWith(m) || text.includes(m)) || text.startsWith("<");
-          pushUserDedupAdjacent(doc, { ts, tsMs, kind: "user", text, injected: injected || undefined });
-        } else if (role === "developer") {
+        if (role === "developer") {
           push(doc, { ts, tsMs, kind: "system", text: clip(text, 400), injected: true });
         } else if (role === "assistant") {
           push(doc, { ts, tsMs, kind: "assistant", text });
@@ -420,9 +455,13 @@ function parseCodex(doc: SessionDoc): void {
       }
       continue;
     }
+    if (o.type === "event_msg" && (payload.type === "task_complete" || payload.type === "turn_aborted")) {
+      markTurnBoundary(doc);
+      continue;
+    }
     if (o.type === "event_msg" && payload.type === "user_message" && typeof payload.message === "string") {
       const text = payload.message.trim();
-      if (text) pushUserDedupAdjacent(doc, { ts, tsMs, kind: "user", text });
+      if (text) pushUserDedupInTurn(doc, { ts, tsMs, kind: "user", text });
       continue;
     }
     // 第三条用户通道：有的会话（13/397，2026-10-23 实测）只在 item_completed 的 UserMessage 里有用户原话
@@ -430,7 +469,7 @@ function parseCodex(doc: SessionDoc): void {
       const item = payload.item as { type?: string; content?: unknown } | undefined;
       if (item?.type === "UserMessage") {
         const text = blockText(item.content).trim();
-        if (text && !text.startsWith("<")) pushUserDedupAdjacent(doc, { ts, tsMs, kind: "user", text });
+        if (text && !text.startsWith("<")) pushUserDedupInTurn(doc, { ts, tsMs, kind: "user", text });
       }
     }
   }
@@ -466,7 +505,7 @@ function parseKimi(doc: SessionDoc): void {
       if (msg.role === "user") {
         const injected = msg.origin?.kind !== "user";
         if (injected) push(doc, { ts, tsMs, kind: "user", text: clip(text, 400), injected: true });
-        else pushUserDedupAdjacent(doc, { ts, tsMs, kind: "user", text }); // turn.prompt 已记的副本在这里被挡掉
+        else pushUserDedupInTurn(doc, { ts, tsMs, kind: "user", text }); // turn.prompt 已记的副本在这里被挡掉
       } else if (msg.role === "assistant") {
         push(doc, { ts, tsMs, kind: "assistant", text });
       }
@@ -487,6 +526,10 @@ function parseKimi(doc: SessionDoc): void {
         if (text) push(doc, { ts, tsMs, kind: "assistant", text });
       }
       // role === "tool" 的结果走下面的 tool.result（带 isError），这里不重复记
+      continue;
+    }
+    if (type === "turn.ended" || type === "agent.turn.ended") {
+      markTurnBoundary(doc);
       continue;
     }
     if (type === "context.append_loop_event") {

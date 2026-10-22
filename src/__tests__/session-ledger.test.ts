@@ -35,7 +35,8 @@ describe("session-ledger rendering for the LLM", () => {
   });
   it("drops assistant lines first when over budget but never user lines", () => {
     const d = doc();
-    const r = renderTranscriptForLLM(d, { maxChars: 400 });
+    for (let i = 0; i < 6; i++) d.events.push({ seq: 8 + i, ts: d.events[7].ts, tsMs: d.events[7].tsMs, kind: "assistant", text: `中段助手发言 ${i} `.repeat(30) });
+    const r = renderTranscriptForLLM(d, { maxChars: 600 });
     expect(r.droppedEvents).toBeGreaterThan(0);
     expect(r.text).toContain("[U#0");
     expect(r.text).toContain("[U#6");
@@ -60,6 +61,25 @@ describe("session-ledger anchors and JSON", () => {
     expect(verifyAnchor(d, "以后自建日志一律放 ops-logs", 6)).toEqual({ verified: true, seq: 6 });
     expect(verifyAnchor(d, "以后自建日志，一律放ops-logs", 1)).toEqual({ verified: true, seq: 6 });
     expect(verifyAnchor(d, "她说日志放哪都行", 6)).toEqual({ verified: false, seq: 6 });
+  });
+  it("rejects anchors that start mid-word or flip a sign (R3 Codex from self-review #5)", () => {
+    const d = doc();
+    d.events[7].text = "注意：这不是生产环境，温度是 -10 度。";
+    expect(verifyAnchor(d, "是生产环境", 7).verified).toBe(false);
+    expect(verifyAnchor(d, "这不是生产环境", 7).verified).toBe(true);
+    expect(verifyAnchor(d, "温度是 10 度", 7).verified).toBe(false);
+    expect(verifyAnchor(d, "温度是 -10 度", 7).verified).toBe(true);
+  });
+  it("keeps the last assistant/error lines when trimming and clips oversized user lines instead of dropping them", () => {
+    const d = doc();
+    for (let i = 0; i < 40; i++) d.events.push({ seq: 8 + i, ts: d.events[7].ts, tsMs: d.events[7].tsMs, kind: "assistant", text: `中间的助手发言 ${i} `.repeat(40) });
+    d.events.push({ seq: 48, ts: d.events[7].ts, tsMs: d.events[7].tsMs, kind: "assistant", text: "最后一条：都做完了" });
+    d.events[0].text = "超长用户输入".repeat(1000);
+    const r = renderTranscriptForLLM(d, { maxChars: 6000 });
+    expect(r.text).toContain("最后一条：都做完了");
+    expect(r.text).toContain("[U#0");
+    expect(r.text).toContain("用户发言截断");
+    expect(r.droppedEvents).toBeGreaterThan(0);
   });
   it("ignores markdown markers in the original when matching an anchor", () => {
     const d = doc();
