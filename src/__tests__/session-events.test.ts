@@ -65,6 +65,8 @@ function writeCodex(): string {
       { timestamp: "2026-10-19T12:33:00.000Z", type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "好" }] } },
       { timestamp: "2026-10-19T12:34:00.000Z", type: "event_msg", payload: { type: "user_message", message: "继续" } },
       { timestamp: "2026-10-19T12:35:00.000Z", type: "response_item", payload: { type: "function_call_output", call_id: "c3", output: "Process exited with code 2\nOutput:\nboom" } },
+      // N1：同一条消息里「AGENTS 注入块 + 真人请求」→ 真人块单独成一轮
+      { timestamp: "2026-10-19T12:36:00.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "# AGENTS.md instructions\n<INSTRUCTIONS>x</INSTRUCTIONS>" }, { type: "input_text", text: "帮我看一下这个仓库" }] } },
     ]),
   );
   return p;
@@ -122,7 +124,12 @@ function writeKimi(): string {
       { type: "context.append_message", time: t0 + 3001, message: { role: "user", origin: { kind: "user" }, content: [{ type: "text", text: "继续" }] } },
       { type: "agent.message.appended", time: t0 + 3500, message: { message: { role: "assistant", content: [{ type: "text", text: "好" }] }, meta: {} } },
       { type: "turn.prompt", time: t0 + 4000, origin: { kind: "user" }, input: [{ type: "text", text: "继续" }] },
+      // N2：turn.prompt → 系统注入 → 同轮 append_message 副本，仍是一轮
+      { type: "context.append_message", time: t0 + 4000, message: { role: "user", origin: { kind: "system" }, content: [{ type: "text", text: "Skill tool loaded instructions" }] } },
       { type: "context.append_message", time: t0 + 4001, message: { role: "user", origin: { kind: "user" }, content: [{ type: "text", text: "继续" }] } },
+      { type: "agent.turn.ended", time: t0 + 4500 },
+      // 回合边界之后同文（没有助手回复也）算新一轮
+      { type: "context.append_message", time: t0 + 5000, message: { role: "user", origin: { kind: "user" }, content: [{ type: "text", text: "继续" }] } },
     ]),
   );
   return p;
@@ -191,6 +198,11 @@ describe("session-events: CC", () => {
     expect(doc.malformedLines).toBe(1);
     expect(doc.importedSource).toBeUndefined();
     expect(classifyCCUserText("<system-reminder>x</system-reminder>")?.injected).toBe(true);
+    // G#9：宿主标签（带 - / _）算注入；用户贴的 HTML 单词标签与 <pasted_content> 算人话
+    expect(classifyCCUserText("<task-notification>done</task-notification>")?.injected).toBe(true);
+    expect(classifyCCUserText("<command-name>/x</command-name>")?.injected).toBe(true);
+    expect(classifyCCUserText("<div>example</div> 请解释这段代码")?.injected).toBe(false);
+    expect(classifyCCUserText("<pasted_content id=\"1\">贴的内容</pasted_content> 看看")?.injected).toBe(false);
   });
   it("finds idle gaps and whether the user resumed after them", () => {
     const gaps = idleGaps(doc, 30 * 60_000);
@@ -213,8 +225,8 @@ describe("session-events: Codex", () => {
   it("takes session id from session_meta and skips developer/AGENTS injections as human turns", () => {
     expect(doc.sessionId).toBe("01a15411-54df-7b23-93ef-1272cbe09290");
     const humans = doc.events.filter((e) => e.kind === "user" && !e.injected).map((e) => e.text);
-    expect(humans).toEqual(["读交接文件", "继续", "只在 item_completed 里的那句", "第一块\n第二块", "继续", "继续"]);
-    expect(s.userTurns).toBe(6);
+    expect(humans).toEqual(["读交接文件", "继续", "只在 item_completed 里的那句", "第一块\n第二块", "继续", "继续", "帮我看一下这个仓库"]);
+    expect(s.userTurns).toBe(7);
     expect(doc.isSubagent).toBeUndefined();
   });
   it("flags subagent threads from session_meta", () => {
@@ -230,6 +242,9 @@ describe("session-events: Codex", () => {
     expect(detectCodexError("Traceback (most recent call last):\n  File x")).toBe(true);
     expect(detectCodexError("Script completed\nWall time 0.6 seconds\nOutput:\ngrep hit: Error: something in docs")).toBe(false);
     expect(detectCodexError("Wall time: 0.6 seconds\nOutput:\nError: ENOENT")).toBe(true);
+    // N3：外层 Script completed 包着内层非零退出码仍是失败；K#2：成功标记在第二行也算
+    expect(detectCodexError("Script completed\nWall time 1 s\nOutput:\nExit code: 2\nboom")).toBe(true);
+    expect(detectCodexError("Wall time: 0.6 seconds\nProcess exited with code 0\nOutput:\nError: cited in docs")).toBe(false);
   });
 });
 
@@ -238,9 +253,9 @@ describe("session-events: Kimi", () => {
   const s = summarizeSession(doc);
   it("dedupes turn.prompt against append_message and marks system-origin user text as injected", () => {
     const users = doc.events.filter((e) => e.kind === "user");
-    expect(users.filter((u) => !u.injected).map((u) => u.text)).toEqual(["审一下这段代码", "继续", "继续"]);
-    expect(users.filter((u) => u.injected)).toHaveLength(1);
-    expect(s.userTurns).toBe(3);
+    expect(users.filter((u) => !u.injected).map((u) => u.text)).toEqual(["审一下这段代码", "继续", "继续", "继续"]);
+    expect(users.filter((u) => u.injected)).toHaveLength(2);
+    expect(s.userTurns).toBe(4);
   });
   it("reads tool.result isError and assistant text from the nested message once", () => {
     expect(s.toolErrors).toBe(1);

@@ -138,6 +138,8 @@ export interface SessionState {
   lastMtimeMs: number | null;
   lastSweepAt: string | null;
   lastAction: SweepAction | null;
+  /** 连续 not-idle 从什么时候开始；超过 candidateAfterMinutes 就不再信 mtime，强制解析一次看消息时间（R3 Codex 对 G#1 的补刀） */
+  notIdleSince?: string | null;
   skipReason?: string;
   /** 上一轮写出的账本文件（影子模式下是样例路径） */
   ledgerPath?: string;
@@ -231,7 +233,10 @@ export function decide(
   const candidateDue = !!state.candidateDueAt && nowMs >= Date.parse(state.candidateDueAt) && !state.candidateDone;
   // mtime 只是省解析的粗筛（D2 第一分句）；候选到期（第二分句）不看 mtime——否则同步工具每隔几分钟刷一次 mtime，
   // 候选阶段永远进不来（互审 R1 Grok #1）。进了解析路径后静默一律按消息时间判。
-  if (!candidateDue && nowMs - file.mtimeMs < idleMs) return { action: "not-idle", reason: `mtime ${Math.round((nowMs - file.mtimeMs) / 60_000)}min ago < ${policy.idleMinutes}` };
+  // 粗筛还有一个上限：同一文件连续 not-idle 超过 candidateAfterMinutes（默认 6 小时）就强制解析一次——mtime 被外部反复刷新时，
+  // 至少每 6 小时会按消息时间重新判一次（R3 Codex：从未处理的会话会被刷 mtime 饿死）。
+  const starving = !!state.notIdleSince && nowMs - Date.parse(state.notIdleSince) >= policy.candidateAfterMinutes * 60_000;
+  if (!candidateDue && !starving && nowMs - file.mtimeMs < idleMs) return { action: "not-idle", reason: `mtime ${Math.round((nowMs - file.mtimeMs) / 60_000)}min ago < ${policy.idleMinutes}` };
   const mtimeUnchanged = state.lastMtimeMs !== null && state.lastMtimeMs === file.mtimeMs;
   if (mtimeUnchanged && !candidateDue) {
     if (state.processedUpto) return { action: "up-to-date", reason: "mtime unchanged, candidates done or not due" };
@@ -268,6 +273,8 @@ export function applyDecision(state: SessionState, file: TranscriptFile, decisio
   const parsed = decision.action !== "not-idle" && decision.action !== "unchanged";
   if (parsed) next.lastMtimeMs = file.mtimeMs;
   if (parsed) delete next.skipReason;
+  if (decision.action === "not-idle") next.notIdleSince = state.notIdleSince ?? new Date(nowMs).toISOString();
+  else next.notIdleSince = null;
   switch (decision.action) {
     case "ledger":
     case "ledger+candidates": {

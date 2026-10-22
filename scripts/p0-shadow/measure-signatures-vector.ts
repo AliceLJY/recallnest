@@ -66,7 +66,8 @@ for (const err of sample) {
     continue;
   }
   // 先多取（30），再按「活跃 且 写入早于报错时刻」过滤，最后才取 top（互审 R1 Codex #13：先截前五再过滤会把合格的旧 case 挤掉）
-  const res = await table.vectorSearch(vec).distanceType("cosine").where("category = 'cases'").select(["id", "scope", "timestamp", "text", "metadata"]).limit(30).toArray();
+  // 时间过滤下推到 SQL（timestamp 是列），活跃状态在 metadata JSON 里只能事后过滤；上限放到 100（R3 Codex #18：固定小上限仍会漏合格的旧 case）
+  const res = await table.vectorSearch(vec).distanceType("cosine").where(`category = 'cases' AND timestamp < ${Math.floor(err.tsMs)}`).select(["id", "scope", "timestamp", "text", "metadata"]).limit(100).toArray();
   const all: Hit[] = res.map((r: any) => ({ id8: String(r.id).slice(0, 8), sim: Math.round((1 - Number(r._distance)) * 1000) / 1000, writtenAt: Number(r.timestamp), textHead: redactSecrets(String(r.text)).text.replace(/\s+/g, " ").slice(0, 160), scope: String(r.scope), active: (JSON.parse(r.metadata || "{}").evolution?.status ?? "active") === "active" }));
   const eligible = all.filter((h) => h.active && h.writtenAt < err.tsMs).sort((a, b) => b.sim - a.sim);
   const top = eligible;

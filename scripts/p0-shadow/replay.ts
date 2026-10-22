@@ -32,9 +32,12 @@ for (const f of disc.files) {
   if (!s.rich) continue;
   const base = { source: f.source, sessionId: doc.sessionId, sid8: doc.sessionId.slice(0, 8), userTurns: s.userTurns, toolErrors: s.toolErrors, memoryWrites: s.memoryWrites.map((m) => m.tool.replace(/^mcp__recallnest__/, "")), closeSignal: s.closeSignal, endedAt: doc.endedAt };
   if (f.source !== "cc") { picks.push({ group: "C-otherEnds", ...base }); continue; }
+  // plan §7：A = 「收工」场里当场写了 checkpoint / store_case 的；B = 全部无声场（有没有写过记忆都算，回放时记忆写入已隐藏）
+  //（R3 Codex #17：此前把所有写过 checkpoint / case 的场都划进 A，包括无声场，B 池因此偏向没写过记忆的会话——代码已改，
+  //   本轮已出的数仍是旧分组，复测时按新分组重抽）
   const manual = s.memoryWrites.some((m) => /checkpoint_session|store_case$/.test(m.tool));
-  if (manual) picks.push({ group: "A-manual", ...base });
-  else if (!s.closeSignal) silentPool.push({ group: "B-silent", ...base });
+  if (!s.closeSignal) silentPool.push({ group: "B-silent", ...base });
+  else if (manual) picks.push({ group: "A-manual", ...base });
 }
 // 稳定随机：按 sid8 哈希排序取前 N
 const h = (s: string) => [...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);

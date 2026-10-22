@@ -83,6 +83,22 @@ describe("sweep decide()", () => {
     const d40 = decide(f2, s2, Date.parse(resumedAt) + 40 * MIN, DEFAULT_POLICY, () => fakeDoc({ users: 6, endedAt: resumedAt }));
     expect(d40.action).toBe("ledger");
   });
+  it("forces a parse after being not-idle for candidateAfterMinutes even if mtime keeps refreshing", () => {
+    // R3 Codex 对 G#1 的补刀：从未处理的会话、外部每隔几分钟刷一次 mtime → 不能永远 not-idle
+    const endedAt = new Date(NOW - 24 * 60 * MIN).toISOString();
+    let st = store.fresh(file(5));
+    let parsed = 0;
+    for (let k = 0; k < 40; k++) {
+      const now = NOW + k * 10 * MIN;
+      const f = { ...file(0), mtimeMs: now - 5 * MIN }; // 每轮 mtime 都「刚刷新过」
+      const d = decide(f, st, now, DEFAULT_POLICY, () => { parsed++; return fakeDoc({ users: 5, endedAt }); });
+      st = applyDecision(st, f, d, now, DEFAULT_POLICY);
+      if (d.action === "ledger+candidates") break;
+    }
+    expect(parsed).toBe(1);
+    expect(st.lastAction).toBe("ledger+candidates");
+    expect(st.notIdleSince).toBeNull();
+  });
   it("dry-run never creates the state directory", () => {
     const dir = join(tmpdir(), `sweep-nomkdir-${process.pid}-${Date.now()}`);
     const st = new SessionStateStore(dir);

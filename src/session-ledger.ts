@@ -107,17 +107,28 @@ export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOp
   let total = lines.reduce((n, l) => n + l.text.length + 1, 0);
   let dropped = 0;
   if (total > o.maxChars) {
-    // 从中间往两头削权重最低的（助手发言），直到够用
+    // 从中间往两头削权重最低的（助手发言），但保全最后 3 条助手行与最后 3 条报错行——结尾定结果，
+    // 削掉它们会让「没做完」把已完成的事写成待办（P0 无声场抽检 10 场里 8 场是这个）
+    const protectedIdx = new Set<number>();
+    for (const w of [1, 2]) {
+      let kept = 0;
+      for (let i = lines.length - 1; i >= 0 && kept < 3; i--) if (lines[i].weight === w) { protectedIdx.add(i); kept++; }
+    }
     const order = lines.map((l, i) => ({ i, dist: Math.abs(i - lines.length / 2), w: l.weight })).sort((a, b) => a.w - b.w || a.dist - b.dist);
     const drop = new Set<number>();
     for (const { i } of order) {
       if (total <= o.maxChars) break;
-      if (lines[i].weight >= 3) continue;
+      if (lines[i].weight >= 3 || protectedIdx.has(i)) continue;
       drop.add(i);
       total -= lines[i].text.length + 1;
       dropped++;
     }
-    return { text: lines.filter((_, i) => !drop.has(i)).map((l) => l.text).join("\n"), droppedEvents: dropped };
+    let kept = lines.filter((_, i) => !drop.has(i));
+    if (total > o.maxChars) {
+      // 还超：用户行不丢，但单条截到 2,000 字（R3 Codex 自评 #4：30,000 字的用户输入会让预算形同虚设）
+      kept = kept.map((l) => (l.weight >= 3 && l.text.length > 2000 ? { ...l, text: `${l.text.slice(0, 2000)}… [用户发言截断 ${l.text.length - 2000} 字]` } : l));
+    }
+    return { text: kept.map((l) => l.text).join("\n"), droppedEvents: dropped };
   }
   return { text: lines.map((l) => l.text).join("\n"), droppedEvents: 0 };
 }
@@ -143,16 +154,57 @@ export const LEDGER_SYSTEM_PROMPT = `你是会话账本的记录员。读一场 
 4. 不写任何密钥、token、密码；遇到就写 [REDACTED]。
 5. 只输出 JSON，不加解释。`;
 
+const STRIP_CHAR_RE = /[\s“”"'‘’「」『』。，、；：！？,.;:!?()（）\-—…*_`#>•·\[\]【】]/u;
+
+/** 归一化并记下每个归一化字符对应的原文下标（边界检查要看原文里前一个字符是什么） */
+function normalizeWithMap(s: string): { norm: string; map: number[] } {
+  let norm = "";
+  const map: number[] = [];
+  const chars = [...s];
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    // 数字前的负号保留（「-10 度」≠「10 度」，R3 Codex 从自评 #5 推出的反例）
+    if (ch === "-" && i + 1 < chars.length && /\d/.test(chars[i + 1])) {
+      norm += "-";
+      map.push(i);
+      continue;
+    }
+    if (STRIP_CHAR_RE.test(ch)) continue;
+    norm += ch.toLowerCase();
+    map.push(i);
+  }
+  return { norm, map };
+}
+
 export function normalizeForMatch(s: string): string {
   // 去空白、标点、markdown 记号（**粗体**、`code`、列表的 - / • / 1.）——原文常是 markdown，LLM 摘录时会把这些抹掉
-  return s.replace(/\s+/g, "").replace(/[“”"'‘’「」『』。，、；：！？,.;:!?()（）\-—…*_`#>•·\[\]【】]/g, "").toLowerCase();
+  return normalizeWithMap(s).norm;
+}
+
+/** 边界：锚点起点在**原文**里的前一个字符不能是汉字 / 字母 / 数字——「这不是生产环境」截成「是生产环境」过不了，
+ *  而「注意：这不是…」里从「这」起的摘录（前面是冒号）照常通过（R3 Codex 自评 #5 反例） */
+function startsAtBoundary(raw: string[], map: number[], idx: number): boolean {
+  if (idx <= 0) return true;
+  const rawIdx = map[idx];
+  if (rawIdx === undefined || rawIdx === 0) return true;
+  return !/[\p{L}\p{N}]/u.test(raw[rawIdx - 1]);
 }
 
 /** 核锚点：逐字（去空白与标点后）在转录事件里找得到才算 verified；找到了但序号不对就修正序号 */
 export function verifyAnchor(doc: SessionDoc, anchor: string, seq: number | null): { verified: boolean; seq: number | null } {
   const needle = normalizeForMatch(anchor);
   if (needle.length < 4) return { verified: false, seq };
-  const check = (e: SessionEvent | undefined) => !!e && normalizeForMatch(e.text).includes(needle);
+  const check = (e: SessionEvent | undefined) => {
+    if (!e) return false;
+    const { norm, map } = normalizeWithMap(e.text);
+    const raw = [...e.text];
+    let idx = norm.indexOf(needle);
+    while (idx >= 0) {
+      if (startsAtBoundary(raw, map, idx)) return true;
+      idx = norm.indexOf(needle, idx + 1);
+    }
+    return false;
+  };
   if (seq !== null && check(doc.events[seq])) return { verified: true, seq };
   const hit = doc.events.find((e) => (e.kind === "user" || e.kind === "assistant" || e.kind === "tool_result") && check(e));
   return hit ? { verified: true, seq: hit.seq } : { verified: false, seq };
