@@ -268,7 +268,7 @@ export function classifyCCUserText(raw: string): { text: string; injected: boole
   const text = raw.replace(SYSTEM_REMINDER_RE, "").trim();
   if (!text) {
     // 整条都是 system-reminder → 保留为注入事件，不算人说的
-    return raw.trim() ? { text: raw.trim().slice(0, 400), injected: true } : null;
+    return raw.trim() ? { text: clip(raw.trim(), 400), injected: true } : null;
   }
   // 以 < 开头的几乎都是宿主注入（<command-name> / <local-command-stdout> / <task-notification> …），
   // 唯一的例外是用户贴进来的 <pasted_content>（互审 R1 Grok #9）
@@ -357,7 +357,12 @@ function parseCC(doc: SessionDoc): void {
 
 // ---------------------------------------------------------------- Codex
 
+const CODEX_SUCCESS_HEAD_RE = /^\s*(Script completed\b|Exit code:\s*0\b|Process exited with code 0\b)/;
+
 export function detectCodexError(outputText: string): boolean {
+  // 输出头明确说成功（Script completed / Exit code: 0）时，正文里再出现 "Error:" 也只是内容（grep 结果、文档），不算失败
+  //（互审 R1 Kimi #2：30 天 10,215 条输出里 16 条只靠 "Error:" 规则命中，其中 4 条带成功头）
+  if (CODEX_SUCCESS_HEAD_RE.test(outputText)) return false;
   return CODEX_ERROR_RE.test(outputText);
 }
 
