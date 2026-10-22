@@ -55,6 +55,19 @@ describe("session-ledger redaction before the LLM sees anything", () => {
   });
 });
 
+describe("session-ledger candidate gate", () => {
+  it("drops experience when includeCandidates is false (ledger stage), via a fake LLM", async () => {
+    const d = doc();
+    const { generateLedgerBody } = await import("../session-ledger.js");
+    const fake = { chatLongDetailed: async () => ({ content: JSON.stringify({ oneLine: "x", solved: ["a"], experience: [{ text: "e", anchor: "以后自建日志一律放 ops-logs", anchorSeq: 6, kind: "偏好" }], unfinished: [] }), finishReason: "stop", responseModel: "fake", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } }) } as unknown as import("../llm-client.js").LLMClient;
+    const withC = await generateLedgerBody(d, fake, { includeCandidates: true });
+    const withoutC = await generateLedgerBody(d, fake, { includeCandidates: false });
+    expect(withC.body?.experience).toHaveLength(1);
+    expect(withoutC.body?.experience).toHaveLength(0);
+    expect(withoutC.body?.solved).toEqual(["a"]);
+  });
+});
+
 describe("session-ledger anchors and JSON", () => {
   it("verifies anchors verbatim (ignoring whitespace/punctuation) and repairs the seq", () => {
     const d = doc();
