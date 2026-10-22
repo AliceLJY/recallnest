@@ -228,6 +228,8 @@ describe("session-events: Codex", () => {
     expect(detectCodexError("Exit code: 0\nOutput:")).toBe(false);
     expect(detectCodexError("Script completed\nWall time 0.6 seconds")).toBe(false);
     expect(detectCodexError("Traceback (most recent call last):\n  File x")).toBe(true);
+    expect(detectCodexError("Script completed\nWall time 0.6 seconds\nOutput:\ngrep hit: Error: something in docs")).toBe(false);
+    expect(detectCodexError("Wall time: 0.6 seconds\nOutput:\nError: ENOENT")).toBe(true);
   });
 });
 
