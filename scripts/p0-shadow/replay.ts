@@ -51,6 +51,6 @@ const config = loadConfig();
 const llm = config.llm ? createLLMClient({ ...config.llm, apiKey: resolveEnv(config.llm.apiKey), timeoutMs: 90_000 }) : null;
 if (!llm) throw new Error("no llm");
 const t0 = Date.now();
-const result = await runSweep({ roots: truthRoots(), shadowDir: out, sinceDays: 30, nowMs: NOW_REPLAY, llm, render: { maskMemoryWrites: true }, onlySessionIds: new Set(picks.map((p) => p.sessionId)), trigger: "replay", log: (l) => console.log(l) });
+const result = await runSweep({ roots: truthRoots(), shadowDir: out, sinceDays: 30, nowMs: NOW_REPLAY, llm, render: { maskMemoryWrites: true, maxTokens: 2600 }, onlySessionIds: new Set(picks.map((p) => p.sessionId)), trigger: "replay", log: (l) => console.log(l) });
 writeFileSync(join(out, "replay-index.json"), JSON.stringify({ generatedAt: new Date().toISOString(), wallMs: Date.now() - t0, picks, result: { ...result, ledgersWritten: result.ledgersWritten.map((p) => p.slice(out.length + 1)) } }, null, 2));
 console.log(JSON.stringify({ ledgers: result.ledgersWritten.length, llmCalls: result.llmCalls, tokens: [result.llmPromptTokens, result.llmCompletionTokens], failures: result.llmFailures, wallMs: Date.now() - t0 }));

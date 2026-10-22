@@ -136,8 +136,9 @@ export const LEDGER_SYSTEM_PROMPT = `你是会话账本的记录员。读一场 
 4. 不写任何密钥、token、密码；遇到就写 [REDACTED]。
 5. 只输出 JSON，不加解释。`;
 
-function normalizeForMatch(s: string): string {
-  return s.replace(/\s+/g, "").replace(/[“”"'‘’「」『』。，、；：！？,.;:!?()（）\-—…]/g, "").toLowerCase();
+export function normalizeForMatch(s: string): string {
+  // 去空白、标点、markdown 记号（**粗体**、`code`、列表的 - / • / 1.）——原文常是 markdown，LLM 摘录时会把这些抹掉
+  return s.replace(/\s+/g, "").replace(/[“”"'‘’「」『』。，、；：！？,.;:!?()（）\-—…*_`#>•·\[\]【】]/g, "").toLowerCase();
 }
 
 /** 核锚点：逐字（去空白与标点后）在转录事件里找得到才算 verified；找到了但序号不对就修正序号 */
@@ -212,6 +213,17 @@ export async function generateLedgerBody(doc: SessionDoc, llm: LLMClient, opts: 
   try {
     return { body: parseLedgerJson(result.content, doc), usage, rendered };
   } catch (error) {
+    // 坏 JSON 重试一次：把坏输出喂回去让它只修格式（不重新读转录，省 token；修不好就记失败）
+    try {
+      const fix = await llm.chatLongDetailed("你只做一件事：把用户给的文本修成合法 JSON（UTF-8），字段与内容一字不改，只修引号、逗号、括号。只输出 JSON。", result.content.slice(0, 12_000), { responseFormat: { type: "json_object" }, tokenLimit: { parameter: "max_tokens", value: opts.maxTokens ?? 1800 }, temperature: 0 });
+      if (fix?.content) {
+        usage.promptTokens += fix.usage?.promptTokens ?? 0;
+        usage.completionTokens += fix.usage?.completionTokens ?? 0;
+        return { body: parseLedgerJson(fix.content, doc), usage, rendered };
+      }
+    } catch {
+      /* fall through */
+    }
     return { body: null, usage, failure: `bad json: ${error instanceof Error ? error.message : String(error)}`, rendered };
   }
 }

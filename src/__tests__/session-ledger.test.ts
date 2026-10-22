@@ -49,6 +49,12 @@ describe("session-ledger anchors and JSON", () => {
     expect(verifyAnchor(d, "以后自建日志，一律放ops-logs", 1)).toEqual({ verified: true, seq: 6 });
     expect(verifyAnchor(d, "她说日志放哪都行", 6)).toEqual({ verified: false, seq: 6 });
   });
+  it("ignores markdown markers in the original when matching an anchor", () => {
+    const d = doc();
+    d.events[7].text = "好的，记下了：\n- **处理完就删 Gem**：收进弹药库的，删前先把原文存一份。\n- `ops-logs` 以后都放这里。";
+    expect(verifyAnchor(d, "处理完就删 Gem：收进弹药库的，删前先把原文存一份。", 7).verified).toBe(true);
+    expect(verifyAnchor(d, "ops-logs 以后都放这里", 1)).toEqual({ verified: true, seq: 7 });
+  });
   it("parses the LLM JSON (even fenced) and flags unverifiable anchors", () => {
     const d = doc();
     const body = parseLedgerJson('```json\n{"oneLine":"挪日志目录","solved":["日志目录改到 ops-logs"],"experience":[{"text":"自建日志放 ops-logs","anchor":"以后自建日志一律放 ops-logs","anchorSeq":6,"kind":"偏好"},{"text":"编的","anchor":"原文里没有这句","anchorSeq":2,"kind":"坑"},{"text":"","anchor":"x"}],"unfinished":[]}\n```', d);
