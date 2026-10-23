@@ -366,6 +366,31 @@ describe("sessions ledger --trigger 白名单（R1 Kimi #9）", () => {
   });
 });
 
+describe("sessions ledger / 正式 sweep 不在仓库数据目录下跑就拒绝（提交锁、游标与扫描器不是同一份）", () => {
+  const cli = join(import.meta.dir, "..", "cli.ts");
+  const root = mkdtempSync(join(tmpdir(), "rn-sweep-cwd-"));
+  const dbDir = join(root, "repo-data", "lancedb");
+  const cfgPath = join(root, "config.json");
+  writeFileSync(cfgPath, JSON.stringify({ dbPath: dbDir, sources: {} }));
+  const elsewhere = join(root, "somewhere-else");
+  mkdirSync(elsewhere);
+  const run = (args: string[], dataDir: string) => spawnSync("bun", ["run", cli, ...args], { cwd: elsewhere, encoding: "utf-8", env: { ...process.env, LOCAL_MEMORY_CONFIG: cfgPath, RECALLNEST_DATA_DIR: dataDir } });
+  it("当前目录下的 data 与库所在的数据目录不是一个：两条命令都退出 2 并说明原因", () => {
+    for (const args of [["sessions", "ledger", "--session", "x"], ["sessions", "sweep"]]) {
+      const r = run(args, "");
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain("不一致");
+    }
+  });
+  it("设了 RECALLNEST_DATA_DIR 指向库所在的数据目录：过了这道核对（往下撞到没配账本目录）", () => {
+    for (const args of [["sessions", "ledger", "--session", "x"], ["sessions", "sweep"]]) {
+      const r = run(args, join(root, "repo-data"));
+      expect(r.stderr).not.toContain("不一致");
+      expect(r.stderr).toContain("sources.ledgers.path");
+    }
+  });
+});
+
 describe("doctor：会话扫描验活", () => {
   const dir = mkdtempSync(join(tmpdir(), "rn-sweep-doctor-"));
   const hbPath = join(dir, "hb.json");

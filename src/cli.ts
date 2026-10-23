@@ -3049,6 +3049,13 @@ sessionsCmd
     const { writeSessionLedgerNow } = await import("./sessions-sweep-run.js");
     const { discoverTranscripts, truthRoots } = await import("./sessions-sweep.js");
     const config = loadConfig();
+    // 账本提交锁与游标都在数据目录下（默认按当前目录解析）：不在仓库根目录跑，拿的就不是扫描器那把锁
+    const dirs = checkReconcilePaths(config, { requireTable: false });
+    if (!dirs.ok) {
+      console.error(`❌ ${dirs.reason}`);
+      process.exitCode = 2;
+      return;
+    }
     const ledgerSource = config.sources.ledgers;
     if (!ledgerSource || ledgerSource.path === "auto") {
       console.error("❌ 需要在 config.json 里显式配置 sources.ledgers.path（账本落点）");
@@ -3136,6 +3143,13 @@ sessionsCmd
     const formal = !options.shadow;
     let ledgerDir: string | undefined;
     if (formal) {
+      // 正式模式的游标、心跳、账本提交锁都在数据目录下：与收工命令必须是同一个（同 sessions ledger 的核对）
+      const dirs = checkReconcilePaths(config, { requireTable: false });
+      if (!dirs.ok) {
+        console.error(`❌ ${dirs.reason}`);
+        process.exitCode = 2;
+        return;
+      }
       const ledgerSource = config.sources.ledgers;
       if (!ledgerSource || ledgerSource.path === "auto") {
         console.error("❌ 正式模式需要在 config.json 里显式配置 sources.ledgers.path（账本落点）；只想试跑就加 --shadow <dir>");
