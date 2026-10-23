@@ -29,6 +29,8 @@ export interface IngestPlan {
   minis: MinisMode;
   /** 记忆文件（memory 来源） */
   memory: boolean;
+  /** 会话账本（ledgers 来源，sources.ledgers.path 显式配置时才真跑；P1 互审 R1 Kimi #7：点名了不能安静地什么都不做） */
+  ledgers: boolean;
   /** 待处理队列里攒的是没有 LLM 时跳过的对话切片，回填等于入库，跟着开关走 */
   drainPendingQueue: boolean;
   /** 这一轮点到了、但因为开关关着而没有入库的对话来源（含 minis），日志里要说出来 */
@@ -50,6 +52,7 @@ export function planIngest(source: string, transcriptIngestOn: boolean): IngestP
     transcriptSources: transcriptIngestOn ? requestedTranscripts : [],
     minis: !wants("minis") ? "skip" : transcriptIngestOn ? "ingest-then-archive" : "archive-only",
     memory: wants("memory"),
+    ledgers: wants("ledgers"),
     drainPendingQueue: transcriptIngestOn,
     skippedTranscriptSources: transcriptIngestOn ? [] : requested,
   };

@@ -6,7 +6,7 @@
  * Port 4318 by default (configurable via RECALLNEST_API_PORT).
  */
 
-import { createComponentResolver, loadConfig, loadDotEnv } from "./runtime-config.js";
+import { createComponentResolver, loadConfig, loadDotEnv, resolveDataDir } from "./runtime-config.js";
 import { HTTP_WRITE_IDLE_TIMEOUT_S } from "./store-write-budget.js";
 import { DurableMemoryCategorySchema } from "./memory-schema.js";
 import { persistCaseMemory, persistMemory, persistMemoryBatch, persistWorkflowPattern, promoteMemory } from "./capture-engine.js";
@@ -28,6 +28,7 @@ import { recordSkillOutcome } from "./skill-engine.js";
 import { WorkflowObservationStore } from "./workflow-observation-store.js";
 import { buildManagedCheckpointObservation, buildManagedResumeObservation } from "./workflow-observation-managed.js";
 import { runAutoRecall } from "./auto-recall.js";
+import { appendRecallLog, buildRecallLogEntry } from "./recall-log.js";
 import { buildRetrievalContext, resolveScopeSelection } from "./scope-policy.js";
 import { runMemoryLint } from "./memory-lint.js";
 import { enforceLocalHttpRequestPolicy, LOCAL_HTTP_HOSTNAME } from "./http-request-policy.js";
@@ -222,6 +223,19 @@ async function handleAutoRecall(request: Request): Promise<Response> {
       scope: typeof body.scope === "string" ? body.scope : undefined,
       sessionId: typeof body.sessionId === "string" ? body.sessionId : undefined,
     }, autoRecall.resume));
+
+    // D5 / G5：带 session_id 的召回落 data/recall-log/<sid>.jsonl，事后才算得出「召回了有没有帮上忙」。
+    // 不带 sid 的调用（现有 hook）行为不变；写失败不影响响应。
+    if (typeof body.sessionId === "string" && body.sessionId) {
+      appendRecallLog(resolveDataDir(config), buildRecallLogEntry({
+        sessionId: body.sessionId,
+        operation: "api:/v1/auto-recall",
+        query: message,
+        scope: autoRecall.resolvedScope ?? (typeof body.scope === "string" ? body.scope : undefined),
+        mode: autoRecall.mode,
+        results: autoRecall.results,
+      }));
+    }
 
     return jsonResponse({
       mode: autoRecall.mode,
