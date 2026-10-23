@@ -181,7 +181,11 @@ export const LEDGER_SYSTEM_PROMPT = `你是会话账本的记录员。读一场 
 {
   "oneLine": "一句话说这场会话做了什么（≤40 字）",
   "solved": ["解决了什么 / 做成了什么，每条一句，带关键名词（文件、命令、服务、数字）"],
-  "decisions": ["定下来的做法或否决掉的做法，每条一句，以「定：」或「否：」开头，写清定的是什么、谁定的（用户拍板 / 用户认可了助手的方案 / 助手自己的技术取舍）、理由"],
+  "decisions": [
+    {"text": "定下来的做法或否决掉的做法，一句，以「定：」或「否：」开头，写清定的是什么和理由",
+     "by": "用户 | 助手（用户亲口拍板、或明确同意了助手的方案，才写用户；用户没表态、助手自己的技术取舍写助手）",
+     "anchor": "by=用户 时必填：用户自己说的那句原话，逐字摘录（≤80 字）"}
+  ],
   "experience": [
     {"text": "一条可复用的经验（坑 / 技巧 / 决定 / 用户偏好），一句话，不超过 60 字",
      "anchor": "转录里逐字摘录的原话（用户或助手说的，≤120 字，不得改写）",
@@ -195,7 +199,7 @@ export const LEDGER_SYSTEM_PROMPT = `你是会话账本的记录员。读一场 
 2. anchor 必须是转录里能逐字找到的一段，不要用自己的话转述；找不到原话就不要写这条经验。
 3. 用户明确表达的偏好、否决、决定，用用户自己的话当 anchor。
 4. unfinished 写之前，先到「${TAIL_MARKER}」之后找完成证据：助手已报告做完、已提交 / 已推送 / 测试通过、或用户已确认的，就不是没做完，写进 solved；中途提过、后来做完了的不写；只是助手的建议、用户没要求做的不写。找不到完成证据、也没人说不做了的，才写进 unfinished。
-5. decisions 不要把助手的建议写成用户的决定；用户没表态的方案不算「定」。被推翻的旧决定写成「否：」并写新决定。没有就给空数组。
+5. decisions 不要把助手的建议写成用户的决定：by 写「用户」必须能给出用户自己的原话；用户只是没反对、或只说了「好」「嗯」的，写助手。被推翻的旧决定写成「否：」并写新决定。没有就给空数组。偏好类 experience 同理：anchor 要用用户自己说的话。
 6. 不写任何密钥、token、密码；遇到就写 [REDACTED]。
 7. 只输出 JSON，不加解释。`;
 
@@ -235,10 +239,12 @@ function startsAtBoundary(raw: string[], map: number[], idx: number): boolean {
   return !/[\p{L}\p{N}]/u.test(raw[rawIdx - 1]);
 }
 
-/** 核锚点：逐字（去空白与标点后）在转录事件里找得到才算 verified；找到了但序号不对就修正序号 */
-export function verifyAnchor(doc: SessionDoc, anchor: string, seq: number | null): { verified: boolean; seq: number | null } {
+/** 核锚点：逐字（去空白与标点后）在转录事件里找得到才算 verified；找到了但序号不对就修正序号。
+ *  userOnly：只在真人用户的发言里找（偏好、用户拍板的决定必须是用户亲口说的，P1 ⑥） */
+export function verifyAnchor(doc: SessionDoc, anchor: string, seq: number | null, opts: { userOnly?: boolean } = {}): { verified: boolean; seq: number | null } {
   const needle = normalizeForMatch(anchor);
   if (needle.length < 4) return { verified: false, seq };
+  const eligible = (e: SessionEvent) => (opts.userOnly ? e.kind === "user" && !e.injected : e.kind === "user" || e.kind === "assistant" || e.kind === "tool_result");
   const check = (e: SessionEvent | undefined) => {
     if (!e) return false;
     const { norm, map } = normalizeWithMap(e.text);
@@ -250,9 +256,39 @@ export function verifyAnchor(doc: SessionDoc, anchor: string, seq: number | null
     }
     return false;
   };
-  if (seq !== null && check(doc.events[seq])) return { verified: true, seq };
-  const hit = doc.events.find((e) => (e.kind === "user" || e.kind === "assistant" || e.kind === "tool_result") && check(e));
+  const atSeq = seq !== null ? doc.events[seq] : undefined;
+  if (atSeq && eligible(atSeq) && check(atSeq)) return { verified: true, seq };
+  const hit = doc.events.find((e) => eligible(e) && check(e));
   return hit ? { verified: true, seq: hit.seq } : { verified: false, seq };
+}
+
+/** 偏好 / 决定的原话找不到用户亲口说过时的标签 */
+export const USER_UNSAID_KIND = "助手提议";
+
+/**
+ * 决定与否决：LLM 给 {text, by, anchor}。by=用户 时原话必须在用户自己的发言里核得到，核不到就按助手提议写（P1 ③ 无声场
+ * 30 场里 5 场至少一位读者判「把助手建议写成用户拍板」）。旧格式（纯字符串）照收，不加标签。
+ */
+export function parseDecisions(v: unknown, doc: SessionDoc): string[] {
+  if (!Array.isArray(v)) return [];
+  const out: string[] = [];
+  for (const item of v) {
+    if (typeof item === "string") {
+      if (item.trim()) out.push(item.trim());
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const it = item as { text?: unknown; by?: unknown; anchor?: unknown };
+    if (typeof it.text !== "string" || !it.text.trim()) continue;
+    const text = it.text.trim();
+    const anchor = typeof it.anchor === "string" ? it.anchor.trim() : "";
+    if (it.by === "用户") {
+      out.push(anchor && verifyAnchor(doc, anchor, null, { userOnly: true }).verified ? `${text}（用户原话：「${anchor}」）` : `${text}（用户原话没核到，按助手提议看）`);
+    } else {
+      out.push(`${text}（助手的取舍）`);
+    }
+  }
+  return out;
 }
 
 export function parseLedgerJson(raw: string, doc: SessionDoc): LedgerBody {
@@ -268,11 +304,14 @@ export function parseLedgerJson(raw: string, doc: SessionDoc): LedgerBody {
       const anchor = typeof it.anchor === "string" ? it.anchor.trim() : "";
       const seqIn = typeof it.anchorSeq === "number" && Number.isInteger(it.anchorSeq) ? it.anchorSeq : null;
       const v = anchor ? verifyAnchor(doc, anchor, seqIn) : { verified: false, seq: seqIn };
-      const kind = typeof it.kind === "string" && (EXPERIENCE_KINDS as readonly string[]).includes(it.kind.trim()) ? it.kind.trim() : "";
+      let kind = typeof it.kind === "string" && (EXPERIENCE_KINDS as readonly string[]).includes(it.kind.trim()) ? it.kind.trim() : "";
+      // 偏好 / 决定 要是用户亲口说的：原话只在助手或工具输出里找得到，就降成「助手提议」（P0 / P1 候选走样的头号形状：
+      // 把助手的判断写成用户偏好）
+      if (v.verified && (kind === "偏好" || kind === "决定") && !verifyAnchor(doc, anchor, v.seq, { userOnly: true }).verified) kind = USER_UNSAID_KIND;
       experience.push({ text: it.text.trim(), anchor, anchorSeq: v.seq, anchorVerified: v.verified, kind });
     }
   }
-  return { oneLine: typeof parsed.oneLine === "string" ? parsed.oneLine.trim() : "", solved: strs(parsed.solved), decisions: strs(parsed.decisions), experience, unfinished: strs(parsed.unfinished) };
+  return { oneLine: typeof parsed.oneLine === "string" ? parsed.oneLine.trim() : "", solved: strs(parsed.solved), decisions: parseDecisions(parsed.decisions, doc), experience, unfinished: strs(parsed.unfinished) };
 }
 
 export interface GenerateLedgerOptions extends RenderTranscriptOptions {
