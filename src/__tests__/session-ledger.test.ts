@@ -194,6 +194,31 @@ describe("session-ledger anchors and JSON", () => {
     expect(out.markdown).toMatch(/## 决定与否决\n- （未生成）\n/);
     expect(out.markdown).toContain("Bash #3: zsh: command not found");
   });
+  it("决定写「用户」时原话必须在用户发言里核得到，核不到按助手提议标；助手的取舍照实标", () => {
+    const d = doc();
+    const body = parseLedgerJson(JSON.stringify({ oneLine: "x", solved: [], experience: [], unfinished: [], decisions: [
+      { text: "定：日志放 ops-logs", by: "用户", anchor: "以后自建日志一律放 ops-logs" },
+      { text: "定：先看现状", by: "用户", anchor: "好的，先看现状。" },
+      { text: "定：日志目录用 launchctl-x 查", by: "用户", anchor: "这句原文里没有" },
+      { text: "否：放 Library/Logs", by: "助手" },
+    ] }), d);
+    expect(body.decisions).toEqual([
+      "定：日志放 ops-logs（用户原话：「以后自建日志一律放 ops-logs」）",
+      "定：先看现状（用户原话没核到，按助手提议看）", // 原话是助手说的
+      "定：日志目录用 launchctl-x 查（用户原话没核到，按助手提议看）",
+      "否：放 Library/Logs（助手的取舍）",
+    ]);
+  });
+  it("偏好 / 决定类经验的原话只在助手发言里：降成「助手提议」；坑、技巧不受影响", () => {
+    const d = doc();
+    const body = parseLedgerJson(JSON.stringify({ oneLine: "x", solved: [], decisions: [], unfinished: [], experience: [
+      { text: "用户要先看现状", anchor: "好的，先看现状。", anchorSeq: 1, kind: "偏好" },
+      { text: "自建日志放 ops-logs", anchor: "以后自建日志一律放 ops-logs", anchorSeq: 6, kind: "偏好" },
+      { text: "先看现状再动手", anchor: "好的，先看现状。", anchorSeq: 1, kind: "技巧" },
+    ] }), d);
+    expect(body.experience.map((x) => x.kind)).toEqual(["助手提议", "偏好", "技巧"]);
+    expect(body.experience.every((x) => x.anchorVerified)).toBe(true);
+  });
   it("决定与否决：解析 decisions、过滤空项，渲染成一节", () => {
     const d = doc();
     const body = parseLedgerJson('{"oneLine":"x","solved":[],"decisions":["定：日志一律放 ops-logs（用户拍板，柠檬会清 Library/Logs 子目录）"," ",3,"否：放 Library/Logs（会被清）"],"experience":[],"unfinished":[]}', d);
