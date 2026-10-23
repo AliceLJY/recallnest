@@ -86,6 +86,24 @@ Restart Claude Code, then ask: "resume my context for RecallNest continuity work
 
 If `resume_context` or `search_memory` is called and returns results, you're set.
 
+## Error Recall Hook (optional)
+
+When a tool call fails, RecallNest can tell the agent that the same error was seen in an earlier session and how that session ended. It only fires on an exact match of a *specific* error signature (bare exit codes, bare "no such file", and hook interceptions never match), so most failures produce no output.
+
+Prerequisites: session ledgers are being written (`sources.ledgers.path` in `config.json` plus `bash scripts/setup-sessions-sweep.sh install`); each sweep refreshes `data/ledger-signature-index.json`, which this hook reads.
+
+Add to `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "PostToolUseFailure": [
+    { "hooks": [{ "type": "command", "command": "bash ~/recallnest/integrations/claude-code/hooks/recall-on-error.sh", "timeout": 5 }] }
+  ]
+}
+```
+
+Set `RECALLNEST_REPO` if the repository is not at `~/recallnest`. Each injection is recorded in `data/recall-log/<session>.jsonl`; after the session goes quiet the sweep marks it `missed` (the same signature failed again), `used` (it did not recur and later tool calls succeeded — an upper bound), or `undeterminable`.
+
 ## Headless Smoke Test
 
 If you want a non-interactive acceptance check, run:

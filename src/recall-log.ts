@@ -31,9 +31,17 @@ export interface RecallLogEntry {
   mode?: string;
   resultCount: number;
   results: RecallLogResult[];
-  /** 四态闭环（P2）：used / unused / missed / undeterminable；P0 只落 null */
-  outcome: null;
+  /**
+   * 四态闭环（P1 ⑥，由扫描器在会话静默后判，见 recall-outcome.ts）：null = 还没判。
+   * 报错签名路径机械判 used / missed / undeterminable；第一条消息路径一律 undeterminable（要读者抽样判）；
+   * unused（后文完全没沾边）机械判不出来，留给读者。
+   */
+  outcome: RecallOutcome | null;
+  outcomeReason?: string;
+  judgedAt?: string;
 }
+
+export type RecallOutcome = "used" | "unused" | "missed" | "undeterminable";
 
 export const RECALL_LOG_DIRNAME = "recall-log";
 export const RECALL_LOG_QUERY_MAX = 200;

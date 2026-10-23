@@ -387,6 +387,8 @@ export interface LedgerMeta {
   pass: number;
   machine?: string;
   generatedAt?: string;
+  /** 「疑似又踩（机器抽取）」节的行：本场的具体性报错签名以前在别的会话里出现过（P1 ⑥，ledger-signatures.ts 算） */
+  recurrence?: string[];
 }
 
 function yamlScalar(v: unknown): string {
@@ -442,6 +444,8 @@ export function renderLedgerMarkdown(doc: SessionDoc, summary: SessionSummary, b
     return `- ${e.toolName ?? "tool"} #${e.seq}: ${head}${specific.length ? ` ｜签名：${specific.map((s) => red(s).slice(0, 100)).join(" ‖ ")}` : ""}`;
   });
   sections.push(`## 报错（机器抽取，${summary.toolErrors} 条${summary.errors.length > 20 ? "，只列前 20" : ""}）\n${errLines.length ? errLines.join("\n") : "- （无）"}`);
+  // 待确认：签名一模一样不等于同一个坑，要不要给原条目记一笔由人或当场的 agent 定（D4：pivot 零自动写入）
+  if (meta.recurrence?.length) sections.push(`## 疑似又踩（机器抽取，${meta.recurrence.length} 条，待确认）\n${meta.recurrence.map((l) => `- ${red(l)}`).join("\n")}`);
   const memCounts = new Map<string, number>();
   for (const m of summary.memoryWrites) memCounts.set(m.tool.replace(/^mcp__recallnest__/, ""), (memCounts.get(m.tool.replace(/^mcp__recallnest__/, "")) ?? 0) + 1);
   sections.push(`## 当场写过的记忆（机器抽取）\n${memCounts.size ? [...memCounts.entries()].map(([k, v]) => `- ${k} ×${v}`).join("\n") : "- （无）"}`);
