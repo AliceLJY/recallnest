@@ -353,6 +353,18 @@ export class LockHoldDeadlineError extends Error {
   }
 }
 
+/**
+ * Thrown by withLock(onBusy:"wait") when the wait budget runs out. Callers that treat a timeout as
+ * "try again next round" check the type, not the wording; the message is unchanged because other
+ * callers (dream's transient-error regex) still match on it.
+ */
+export class LockTimeoutError extends Error {
+  constructor(readonly key: string, readonly timeoutMs: number, holder: string | null) {
+    super(`lock '${key}' timed out after ${timeoutMs}ms (held by ${holder ?? "another process"})`);
+    this.name = "LockTimeoutError";
+  }
+}
+
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -397,8 +409,7 @@ export async function withLock<T>(
       }
     }
     if (!acquired) {
-      const holder = describeHolder(lockPath);
-      throw new Error(`lock '${key}' timed out after ${timeoutMs}ms (held by ${holder ?? "another process"})`);
+      throw new LockTimeoutError(key, timeoutMs, describeHolder(lockPath));
     }
   }
 

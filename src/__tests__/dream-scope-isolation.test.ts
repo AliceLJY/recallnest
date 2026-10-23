@@ -118,13 +118,13 @@ function createScopeAwareStore(entries: MemoryEntry[]) {
   let counter = 0;
   const patchedIds: string[] = [];
 
-  const select = (scopeFilter?: string[], mode: ScopeMatchMode = "family") =>
-    stored.filter(e => matchesScopeFilter(e.scope, scopeFilter, mode));
+  const select = (scopeFilter?: string[], mode: ScopeMatchMode = "family", excludeScopes?: string[]) =>
+    stored.filter(e => matchesScopeFilter(e.scope, scopeFilter, mode) && !(excludeScopes ?? []).includes(e.scope));
 
   const store = {
-    async list(scopeFilter?: string[], _category?: string, limit = 20, offset = 0, scopeMatch: ScopeMatchMode = "family") {
+    async list(scopeFilter?: string[], _category?: string, limit = 20, offset = 0, scopeMatch: ScopeMatchMode = "family", excludeScopes?: string[]) {
       // 复刻生产：list 恒返回假空向量
-      return select(scopeFilter, scopeMatch).slice(offset, offset + limit).map(e => ({ ...e, vector: [] as number[] }));
+      return select(scopeFilter, scopeMatch, excludeScopes).slice(offset, offset + limit).map(e => ({ ...e, vector: [] as number[] }));
     },
     async listPage(opts: { scopeFilter?: string[]; limit?: number; offset?: number } = {}) {
       const { scopeFilter, limit = 1000, offset = 0 } = opts;
@@ -184,8 +184,8 @@ function createScopeAwareStore(entries: MemoryEntry[]) {
       }
       return written;
     },
-    async vectorSearch(vec: number[], limit = 5, minScore = 0.3, scopeFilter?: string[], scopeMatch: ScopeMatchMode = "family") {
-      return select(scopeFilter, scopeMatch)
+    async vectorSearch(vec: number[], limit = 5, minScore = 0.3, scopeFilter?: string[], scopeMatch: ScopeMatchMode = "family", excludeScopes?: string[]) {
+      return select(scopeFilter, scopeMatch, excludeScopes)
         .filter(e => e.vector?.length)
         .map(e => ({ entry: e, score: cosineSimilarity(vec, e.vector) }))
         .filter(r => r.score >= minScore)
@@ -253,6 +253,33 @@ describe("dream scope isolation (exact mode threading)", () => {
     // 只验取数面：family 下 gather 能看到 6 行，exact 下只有 3 行。
     expect((await store.list(["memory"], undefined, 500, 0)).length).toBe(6);
     expect((await store.list(["memory"], undefined, 500, 0, "exact")).length).toBe(3);
+  });
+});
+
+describe("家族匹配也挡住 neverDreamScopes 的兄弟 scope（P1 互审 R1 Codex #5）", () => {
+  it("手动 family 跑 memory：pivot 与账本行既不进派生来源，也不被 patch", async () => {
+    const memRows = Array.from({ length: 4 }, (_, i) =>
+      entry({ id: `mem-${i}`, scope: "memory", text: `memory rule chunk ${i}`, vector: [1, 0.02 * i, 0] }));
+    const pivotRows = Array.from({ length: 3 }, (_, i) =>
+      entry({ id: `pivot-${i}`, scope: "memory:pivot", text: `hand-written pivot ${i}`, vector: [1, 0.01 * i, 0] }));
+    const ledgerRows = Array.from({ length: 3 }, (_, i) =>
+      entry({ id: `ledger-${i}`, scope: "memory:ledger", text: `ledger slice ${i}`, vector: [1, 0.015 * i, 0] }));
+    const { store, stored, patchedIds } = createScopeAwareStore([...memRows, ...pivotRows, ...ledgerRows]);
+    const stats = tempStatsPath();
+
+    await runDream({
+      store, llm: mockLLM, embedder: mockEmbedder, scope: "memory",
+      force: true, scopeMatch: "family", activityStatsPath: stats.statsPath,
+    });
+
+    const derivedSources = stored
+      .map(e => { try { return JSON.parse(e.metadata || "{}"); } catch { return {}; } })
+      .filter((m: Record<string, unknown>) => m.cluster_insight === true || m.cross_memory_pattern === true)
+      .flatMap((m: any) => (m?.evolution?.sourceMemories ?? []) as string[]);
+    expect(derivedSources.filter(id => id.startsWith("pivot-") || id.startsWith("ledger-"))).toEqual([]);
+    expect(patchedIds.filter(id => id.startsWith("pivot-") || id.startsWith("ledger-"))).toEqual([]);
+    // 记忆行照常参与（排除兄弟 ≠ 关掉 family 跑）
+    expect(derivedSources.some(id => id.startsWith("mem-")) || patchedIds.some(id => id.startsWith("mem-"))).toBe(true);
   });
 });
 

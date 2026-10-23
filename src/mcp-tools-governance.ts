@@ -24,6 +24,7 @@ import { WorkflowObservationOutcomeSchema } from "./workflow-observation-schema.
 import { PROCESS_READER_ID, recentRecallHits } from "./recall-ledger.js";
 import type { ToolRegistryDeps } from "./mcp-tool-deps.js";
 import { withLock } from "./distill-lock.js";
+import { consolidationScopePolicy } from "./dream-pipeline.js";
 
 export function registerGovernanceTools(deps: ToolRegistryDeps): void {
   const { registerTool, getComponents, conflictStore, workflowObservationStore, getKGExtractor, getKGStore } = deps;
@@ -344,6 +345,18 @@ registerTool(
     apply: z.boolean().default(false).describe("When false, preview only (scan + report without archiving). When true, actually merge/archive."),
   },
   async ({ scope, clusterThreshold, mergeThreshold, maxEntries, apply }) => {
+    // 同 dream 的策略（neverDreamScopes）：名单里的 scope 不合并；家族匹配时排除名单里的兄弟——
+    // 否则 scope=memory 会把会话账本（memory:ledger）、手写提炼池（memory:pivot）一起合并掉（P1 互审 R3 Codex NEW-2）
+    const scopePolicy = consolidationScopePolicy(scope);
+    if (scopePolicy.excluded) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: `⏭️ consolidate_memories skipped: scope "${scope}" is never consolidated (DreamConfig.neverDreamScopes; its rows are owned by their own writer).`,
+        }],
+      };
+    }
+    const scopeOpts = { scopeMatch: "family" as const, excludeScopes: scopePolicy.familyExcludes.length ? scopePolicy.familyExcludes : undefined };
     const { store } = getComponents();
 
     if (!apply) {
@@ -355,7 +368,7 @@ registerTool(
         update: async () => null, // no-op in dry-run
         patchMetadataBatch: async () => 0, // no-op in dry-run（3a 批量写通道，2026-08-14）
       };
-      const engine = new ConsolidationEngine(readOnlyStore, { clusterThreshold, mergeThreshold, maxEntriesPerRun: maxEntries }, getKGStore());
+      const engine = new ConsolidationEngine(readOnlyStore, { clusterThreshold, mergeThreshold, maxEntriesPerRun: maxEntries, ...scopeOpts }, getKGStore());
       const result = await engine.run(scope);
       return {
         content: [{
@@ -371,7 +384,7 @@ registerTool(
     const outcome = await withLock(
       `consolidate-${scope}`,
       async () => {
-        const engine = new ConsolidationEngine(store, { clusterThreshold, mergeThreshold, maxEntriesPerRun: maxEntries }, getKGStore());
+        const engine = new ConsolidationEngine(store, { clusterThreshold, mergeThreshold, maxEntriesPerRun: maxEntries, ...scopeOpts }, getKGStore());
         return engine.run(scope);
       },
       { onBusy: "skip", expireMs: 600_000 },
