@@ -107,6 +107,21 @@ function pickSeed(members: MemoryEntry[]): MemoryEntry {
   return members.reduce((best, m) => (m.importance > best.importance ? m : best), members[0]);
 }
 
+/**
+ * 两种晋升扫描在家族取数时排除的 scope：它们的行在这里永远成不了候选，却会占掉 listLimit（按新近取前 2000 行）的名额——
+ * 会话账本每月约 700 片，几个月后真候选就被挤到 limit 外（P1 互审 R3 Codex NEW-3 / Kimi C5 判定）。
+ * - memory:ledger：账本对账写入（source = scope），没有 transcript 降级标记，也不是 dream 合成行
+ * - memory:pivot：手写提炼池（manual / session_distill 写入，不是 transcript 来源，不会带 downgradedFrom），
+ *   又在 neverDreamScopes 里、不会有合成行
+ * 扫描的 scope 本身就是它们时不排除（那是有意点名）
+ */
+export const PROMOTION_SCAN_EXCLUDED_SCOPES: readonly string[] = ["memory:ledger", "memory:pivot"];
+
+export function promotionScanExcludes(scope: string): string[] | undefined {
+  const out = PROMOTION_SCAN_EXCLUDED_SCOPES.filter((s) => s !== scope);
+  return out.length ? out : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Main scan
 // ---------------------------------------------------------------------------
@@ -119,7 +134,7 @@ export async function scanMemoryPromotions(
   const cfg: PromoteScanConfig = { ...DEFAULT_PROMOTE_SCAN_CONFIG, ...config };
 
   // 1. Load downgraded evidence (events). list() returns empty vectors.
-  const events = await deps.store.list([scope], "events", cfg.listLimit, 0);
+  const events = await deps.store.list([scope], "events", cfg.listLimit, 0, "family", promotionScanExcludes(scope));
 
   // 2. Keep only active, downgraded-from profile/preferences, not-yet-promoted.
   const downgraded = events.filter(
@@ -402,7 +417,7 @@ export async function scanSynthesisPromotions(
 
   // Synthesized insights take the cluster's majority category, so this cannot be narrowed
   // to one category the way the downgraded-evidence scan is.
-  const rows = await deps.store.list([scope], undefined, cfg.listLimit, 0);
+  const rows = await deps.store.list([scope], undefined, cfg.listLimit, 0, "family", promotionScanExcludes(scope));
   const syntheses = rows.filter((e) => isActiveMemory(e.metadata) && isSynthesisRow(e));
   result.scannedSyntheses = syntheses.length;
 

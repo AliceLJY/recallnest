@@ -29,7 +29,7 @@ import { collectScopeInventory, type ScopeInventoryReport } from "./scope-invent
 import { MemoryStore, type MemoryEntry, validateStoragePath } from "./store.js";
 import { readHeartbeats, formatAge } from "./source-heartbeat.js";
 import { dataDir as envDataDir } from "./env-config.js";
-import { SWEEP_HEARTBEAT_FILE, SWEEP_STALE_MS, type SweepHeartbeat } from "./sessions-sweep-run.js";
+import { SWEEP_HEARTBEAT_FILE, SWEEP_STALE_MS, SWEEP_STUCK_MS, SWEEP_UNFINISHED_STARTS_RED, type SweepHeartbeat } from "./sessions-sweep-run.js";
 
 interface CheckResult {
   name: string;
@@ -303,11 +303,22 @@ export function assessContinuityBaseline(
   };
 }
 
+function defaultPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM：进程在，只是不归本用户
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 /**
  * 会话扫描（P1 ④）验活：只在 sources.ledgers.path 显式配置时检查。launchd 每 10 分钟一轮，
- * 心跳超过 SWEEP_STALE_MS（20 分钟）或从没写过 → 红；最近一轮 LLM 全失败 → 黄。
+ * 心跳超过 SWEEP_STALE_MS（20 分钟）或从没写过 → 红；正在跑的一轮超过 SWEEP_STUCK_MS 或接连几轮没跑完 → 红；
+ * 最近一轮 LLM 全失败 → 黄。
  */
-export function checkSessionsSweep(opts: { ledgersConfigured: boolean; heartbeatPath: string; nowMs?: number }): CheckResult | null {
+export function checkSessionsSweep(opts: { ledgersConfigured: boolean; heartbeatPath: string; nowMs?: number; isPidAlive?: (pid: number) => boolean }): CheckResult | null {
   if (!opts.ledgersConfigured) return null;
   const name = "Sessions sweep";
   const fix = "launchctl print gui/$(id -u)/com.recallnest.sessions-sweep；手动跑一轮：bun run src/cli.ts sessions sweep";
@@ -318,17 +329,38 @@ export function checkSessionsSweep(opts: { ledgersConfigured: boolean; heartbeat
   } catch {
     return fail(name, `心跳文件读不了：${opts.heartbeatPath}`, fix);
   }
-  // 上一轮还在跑（本轮因锁跳过）也算活着：取心跳与 busyAt 里较新的那个
-  const last = Math.max(Date.parse(hb.at), hb.busyAt ? Date.parse(hb.busyAt) : Number.NEGATIVE_INFINITY);
-  const age = (opts.nowMs ?? Date.now()) - last;
-  const ago = `${Math.round(age / 60_000)} 分钟前`;
-  if (!Number.isFinite(age) || age > SWEEP_STALE_MS) return fail(name, `上次扫描 ${Number.isFinite(age) ? ago : "时间不明"}（超过 ${SWEEP_STALE_MS / 60_000} 分钟）`, fix);
-  // 一直因锁跳过、最近完成的一轮却在 2 小时之前：上一轮多半卡住了（包装脚本 45 分钟就该杀掉它）
-  const sinceDone = (opts.nowMs ?? Date.now()) - Date.parse(hb.at);
-  if (hb.busyAt && Date.parse(hb.busyAt) > Date.parse(hb.at) && sinceDone > 2 * 3_600_000) return fail(name, `最近完成的一轮在 ${Math.round(sinceDone / 60_000)} 分钟前，之后一直因锁跳过——上一轮可能卡住了`, fix);
-  const detail = hb.busyAt && Date.parse(hb.busyAt) > Date.parse(hb.at)
-    ? `上一轮还在跑（${ago}因锁跳过），最近完成的一轮写账本 ${hb.ledgersWritten} 份`
-    : `上次扫描 ${ago}，写账本 ${hb.ledgersWritten} 份，LLM ${hb.llmCalls} 次`;
+  const now = opts.nowMs ?? Date.now();
+  const mins = (ms: number) => `${Math.round(ms / 60_000)} 分钟`;
+  const doneMs = Date.parse(hb.at); // NaN：一轮都没跑完过（第一轮开始时建的心跳 at 为空）
+  const doneNote = Number.isFinite(doneMs) ? `最近完成的一轮在 ${mins(now - doneMs)}前、写账本 ${hb.ledgersWritten} 份` : "还没有跑完过一轮";
+  // 一轮开始时写 runningSince（跑完清掉）：launchd 在上一轮没完时不起下一轮，长跑期间没有别的心跳（P1 互审 R3 Codex K6）。
+  // 写它的进程已经不在 = 那一轮被杀或崩了，不算在跑
+  const runningMs = hb.runningSince ? Date.parse(hb.runningSince) : Number.NaN;
+  const pidAlive = opts.isPidAlive ?? defaultPidAlive;
+  const running = Number.isFinite(runningMs) && (hb.runningPid === null || hb.runningPid === undefined || pidAlive(hb.runningPid));
+  const starts = hb.startsSinceDone ?? 0;
+  let detail: string;
+  if (running) {
+    // 在跑就不按 20 分钟判旧（一轮可以合法地跑几十分钟），只看这一轮跑了多久、之前有没有接连没跑完
+    const runFor = now - runningMs;
+    if (runFor > SWEEP_STUCK_MS) return fail(name, `这一轮 ${mins(runFor)}前开始、到现在还没跑完（pid ${hb.runningPid ?? "?"}；包装脚本 45 分钟就该杀掉它），可能卡住了；${doneNote}`, fix);
+    if (starts >= SWEEP_UNFINISHED_STARTS_RED) return fail(name, `连续 ${starts} 轮开始了都没跑完（含正在跑的这一轮，之前的被杀或崩溃）；${doneNote}`, fix);
+    if (!Number.isFinite(doneMs)) return pass(name, `第一轮 ${mins(runFor)}前开始、还在跑`);
+    detail = `这一轮 ${mins(runFor)}前开始、还在跑；${doneNote}`;
+  } else {
+    // 手动跑撞上 launchd 那一轮、因锁跳过（busyAt）也算活着：取完成心跳与 busyAt 里较新的那个
+    const last = Math.max(doneMs, hb.busyAt ? Date.parse(hb.busyAt) : Number.NEGATIVE_INFINITY);
+    const age = now - last;
+    const ago = `${mins(age)}前`;
+    const diedNote = Number.isFinite(runningMs) ? `；${hb.runningSince} 开始的那一轮没跑完就退出了（pid ${hb.runningPid ?? "?"} 已不在）` : "";
+    if (!Number.isFinite(age) || age > SWEEP_STALE_MS) return fail(name, `上次扫描 ${Number.isFinite(age) ? ago : "时间不明"}（超过 ${SWEEP_STALE_MS / 60_000} 分钟）${diedNote}`, fix);
+    // 一直因锁跳过、最近完成的一轮却在 2 小时之前：上一轮多半卡住了（包装脚本 45 分钟就该杀掉它）
+    const sinceDone = now - doneMs;
+    if (hb.busyAt && Date.parse(hb.busyAt) > doneMs && sinceDone > SWEEP_STUCK_MS) return fail(name, `最近完成的一轮在 ${mins(sinceDone)}前，之后一直因锁跳过——上一轮可能卡住了`, fix);
+    detail = hb.busyAt && Date.parse(hb.busyAt) > doneMs
+      ? `上一轮还在跑（${ago}因锁跳过），最近完成的一轮写账本 ${hb.ledgersWritten} 份`
+      : `上次扫描 ${ago}，写账本 ${hb.ledgersWritten} 份，LLM ${hb.llmCalls} 次${diedNote}`;
+  }
   if (hb.llmConfigured === false) return warn(name, `${detail}；没配 LLM（sessionsSweep.llm / llm），账本只有机器抽取的两节`, "在 config.json 配 sessionsSweep.llm 或 llm");
   const streak = hb.llmFailStreak ?? (hb.llmCalls > 0 && hb.llmFailures >= hb.llmCalls ? 1 : 0);
   if (streak > 0) return warn(name, `${detail}；LLM 已连续 ${streak} 轮全失败（最近 ${hb.lastLlmFailureAt ?? "时间不明"}），这期间的账本只有机器抽取的两节`, "检查 sessionsSweep.llm / llm 的 key 与额度");

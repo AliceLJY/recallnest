@@ -38,7 +38,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import type { AuditLogger } from "./audit-log.js";
 import { inspectLock, lockPathForKey, withLock } from "./distill-lock.js";
@@ -662,6 +662,8 @@ export interface ApplyResult {
 export interface ApplyContext {
   /** 对账的 scope（默认 "memory"）：插入行的 scope / source、提交时核对、审计都用它 */
   scope?: string;
+  /** 源名（DocReconcileSource.name）：写进日志第一行，撤销据此选源；不给时 scope 是 "memory" 就记记忆文件源，否则不写头 */
+  sourceName?: string;
   runId: string;
   journalPath: string | null;
   /** 下架是否被护栏（上限）拦下；拦下时只插入与恢复（因目标本轮下架而断的合并链也不恢复） */
@@ -854,6 +856,9 @@ export async function applyMemoryReconcile(
   const isoNow = new Date(nowMs).toISOString();
   const journal = new Journal(ctx.journalPath);
   const docScope = ctx.scope ?? MEMORY_DOC_SCOPE;
+  // 日志第一行写明这是哪个源、哪个 scope 的：撤销按它选 scope 与锁，日志被改名、拷走也不选错（P1 互审 R3 Codex NEW-4）
+  const sourceName = ctx.sourceName ?? (docScope === MEMORY_DOC_SCOPE ? MEMORY_DOC_SOURCE.name : null);
+  if (sourceName) journal.write([journalHeader(sourceName, docScope)]);
   const result: ApplyResult = {
     inserted: 0,
     insertSkippedExisting: 0,
@@ -1122,7 +1127,7 @@ export async function reconcileMemoryDocuments(opts: ReconcileOptions): Promise<
     const applied = await applyMemoryReconcile(
       { store: opts.store, embedder: opts.embedder, llm: opts.llm, auditLogger: opts.auditLogger },
       plan,
-      { scope: src.scope, runId, journalPath, retireAllowed: guard === null, forgetWatcher, now },
+      { scope: src.scope, sourceName: src.name, runId, journalPath, retireAllowed: guard === null, forgetWatcher, now },
     );
     if (guard === null && applied.insertErrors.length > 0) {
       guard = { reason: "insert-failed", detail: `${applied.insertPending} 段没插进去（所在文件本轮不下架）：${applied.insertErrors.slice(0, 3).join("；")}` };
@@ -1214,6 +1219,53 @@ export interface UndoResult {
   /** 日志里解析不了的行（比如写到一半崩溃留下的截断尾行） */
   unparsedLines: number;
   undoJournalPath: string;
+  /** 日志里记的 id 此刻那一行不在本次撤销的 scope 里：不动（源选错时不会去改别的源的行） */
+  skippedWrongScope: string[];
+  /** 本次按哪个源撤、怎么定下来的 */
+  source: string;
+  sourceVia: UndoSourceVia;
+}
+
+/** 对账日志第一行：{ journal: "doc-reconcile", v: 1, source, scope }（没有 run / action，旧版读日志时自然跳过） */
+export const JOURNAL_HEADER_KIND = "doc-reconcile";
+
+function journalHeader(source: string, scope: string): object {
+  return { journal: JOURNAL_HEADER_KIND, v: 1, source, scope };
+}
+
+/** 读日志第一个非空行里的头；没有头（P1 之前的日志）返回 null */
+export function readJournalHeader(journalPath: string): { source: string; scope: string } | null {
+  const first = readFileSync(journalPath, "utf-8").split("\n").find((l) => l.trim());
+  if (!first) return null;
+  let rec: Record<string, unknown> | null;
+  try {
+    rec = asRecord(JSON.parse(first));
+  } catch {
+    return null;
+  }
+  if (!rec || rec.journal !== JOURNAL_HEADER_KIND || typeof rec.source !== "string" || typeof rec.scope !== "string") return null;
+  return { source: rec.source, scope: rec.scope };
+}
+
+export type UndoSourceVia = "explicit" | "header" | "filename" | "default";
+
+/**
+ * 撤销按哪个源：显式给的（命令行 --ledgers）优先；其次日志头；再次文件名前缀（没有头的旧日志）；都没有按记忆文件源。
+ * 日志头写的源不在已知清单里就拒绝——不悄悄退回记忆文件源（P1 互审 R3 Codex NEW-4 / Kimi NEW-3）
+ */
+export function resolveUndoSource(journalPath: string, opts: { explicit?: DocReconcileSource; known?: readonly DocReconcileSource[] } = {}): { source: DocReconcileSource; via: UndoSourceVia } {
+  if (opts.explicit) return { source: opts.explicit, via: "explicit" };
+  const known = opts.known?.length ? opts.known : [MEMORY_DOC_SOURCE];
+  const header = readJournalHeader(journalPath);
+  if (header) {
+    const hit = known.find((k) => k.name === header.source && k.scope === header.scope);
+    if (!hit) throw new Error(`日志头写的源 ${header.source}（scope ${header.scope}）不在已知的源里，不撤销`);
+    return { source: hit, via: "header" };
+  }
+  const base = basename(journalPath);
+  const byName = known.find((k) => base.startsWith(`${k.name}-`));
+  if (byName) return { source: byName, via: "filename" };
+  return { source: MEMORY_DOC_SOURCE, via: "default" };
 }
 
 interface UndoRecord {
@@ -1340,10 +1392,10 @@ function expectedFromMarker(meta: Record<string, unknown>, rec: UndoRecord): { b
 export async function undoMemoryReconcile(
   deps: { store: MemoryStore; auditLogger?: Pick<AuditLogger, "log"> | null },
   journalPath: string,
-  opts: { now?: () => number; auditPath?: string; source?: DocReconcileSource } = {},
+  opts: { now?: () => number; auditPath?: string; source?: DocReconcileSource; knownSources?: readonly DocReconcileSource[] } = {},
 ): Promise<UndoResult> {
-  const src = opts.source ?? MEMORY_DOC_SOURCE;
-  const outcome = await underReconcileLocks(() => undoUnlocked(deps, journalPath, { ...opts, scope: src.scope }), src.lockKeys);
+  const { source: src, via } = resolveUndoSource(journalPath, { explicit: opts.source, known: opts.knownSources });
+  const outcome = await underReconcileLocks(async () => ({ ...(await undoUnlocked(deps, journalPath, { ...opts, scope: src.scope })), source: src.name, sourceVia: via }), src.lockKeys);
   if (!outcome.ran) {
     throw new Error(`撤销没执行：${busyDescription(outcome.busy)}正在运行（锁 ${outcome.busy} 被占用），稍后再试`);
   }
@@ -1354,7 +1406,7 @@ async function undoUnlocked(
   deps: { store: MemoryStore; auditLogger?: Pick<AuditLogger, "log"> | null },
   journalPath: string,
   opts: { now?: () => number; auditPath?: string; scope: string },
-): Promise<UndoResult> {
+): Promise<Omit<UndoResult, "source" | "sourceVia">> {
   const { records, unparsed } = readUndoRecords(journalPath);
   const forgets = opts.auditPath ? loadForgetSet(opts.auditPath, opts.scope) : null;
   const nowMs = (opts.now ?? Date.now)();
@@ -1362,7 +1414,7 @@ async function undoUnlocked(
   const undoRun = `undo-${isoNow.replace(/[:.]/g, "-")}`;
   const undoJournalPath = `${journalPath.replace(/\.jsonl$/, "")}.${undoRun}.jsonl`;
   const journal = new Journal(undoJournalPath);
-  const result: UndoResult = {
+  const result: Omit<UndoResult, "source" | "sourceVia"> = {
     restored: 0,
     insertsRetired: 0,
     skippedConflict: [],
@@ -1370,6 +1422,7 @@ async function undoUnlocked(
     skippedForgotten: [],
     unparsedLines: unparsed,
     undoJournalPath,
+    skippedWrongScope: [],
   };
 
   // 本次撤销会撤成不活跃的行：插入的行（改成 archived）与恢复过的行（撤回原来的非活跃状态）。
@@ -1425,6 +1478,11 @@ async function undoUnlocked(
         patchFn: (meta, entry) => {
           const r = byId.get(entry.id)!;
           seen.add(entry.id);
+          // 行不在本次撤销的 scope 里：源选错了（或这个 id 后来被别的写方占了），不动它
+          if (entry.scope !== opts.scope) {
+            result.skippedWrongScope.push(r.id);
+            return meta;
+          }
           const current = journalFields(meta);
           if (r.action !== "retire" && targetsInUse.has(entry.id)) {
             result.skippedDependency.push(r.id);

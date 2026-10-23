@@ -106,6 +106,20 @@ export const DEFAULT_DREAM_CONFIG: DreamConfig = {
   gc: DEFAULT_AUTO_GC_CONFIG,
 };
 
+/**
+ * 巩固（dream、MCP consolidate_memories）对一个 scope 的策略：它本身在 neverDreamScopes 里就不做；家族匹配时
+ * 把名单里的兄弟 scope 排除在取数之外（`memory` 家族带出 memory:pivot / memory:ledger）。两个入口共用这一处，
+ * 免得再出现「dream 挡住了、独立工具没挡」（P1 互审 R3 Codex NEW-2）
+ */
+export function consolidationScopePolicy(
+  scope: string,
+  scopeMatch: ScopeMatchMode = "family",
+  neverScopes: readonly string[] = DEFAULT_DREAM_CONFIG.neverDreamScopes,
+): { excluded: boolean; familyExcludes: string[] } {
+  if (neverScopes.includes(scope)) return { excluded: true, familyExcludes: [] };
+  return { excluded: false, familyExcludes: scopeMatch === "family" ? neverScopes.filter((s) => s !== scope) : [] };
+}
+
 export interface DreamPhaseResult {
   phase: "orient" | "gather" | "consolidate" | "prune";
   detail: string;
@@ -244,7 +258,8 @@ async function runDreamInner(params: {
   // =========================================================================
   // 在写计数门槛**之前**判：策略排除与"今天写得够不够"无关，force 也不该越过它。
   // 放在 runDream 内部 = CLI / weekly / MCP 三条入口同受约束（互审 C2）。
-  if (config.neverDreamScopes.includes(scope)) {
+  const scopePolicy = consolidationScopePolicy(scope, scopeMatch, config.neverDreamScopes);
+  if (scopePolicy.excluded) {
     return {
       ran: false,
       reason: `policy_excluded (${scope} is in neverDreamScopes)`,
@@ -289,7 +304,7 @@ async function runDreamInner(params: {
   // =========================================================================
   // 家族匹配（手动 `dream --scope memory` 不带 --exact-scope）会把 neverDreamScopes 里的兄弟 scope
   // （memory:pivot、memory:ledger）一起取出来——上面的策略闸只看参数本身，挡不住；行级再排除一次（P1 互审 R1 Codex #5）
-  const familyExcludes = scopeMatch === "family" ? config.neverDreamScopes.filter((s) => s !== scope) : [];
+  const familyExcludes = scopePolicy.familyExcludes;
   const entries = await store.list([scope], undefined, config.maxEntriesPerRun, 0, scopeMatch, familyExcludes.length ? familyExcludes : undefined);
   const active = entries.filter(e => isActiveMemory(e.metadata));
   stats.activeMemories = active.length;

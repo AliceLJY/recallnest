@@ -89,12 +89,20 @@ function shortTs(ts: string | null): string {
 
 const MEMORY_WRITE_RE = /(checkpoint_session|store_case|store_memory|store_workflow_pattern)$/;
 
+export interface RenderedTranscript {
+  text: string;
+  /** 削掉的行数（含 droppedUserTurns） */
+  droppedEvents: number;
+  /** 其中削掉的用户发言（只有截到 USER_LINE_CLIP 之后仍超预算才会削） */
+  droppedUserTurns: number;
+}
+
 /**
  * 把事件渲染成给 LLM 读的紧凑文本；超长时从中间削助手发言，首尾保全（开头定任务、结尾定结果）。
  * 最后 TAIL_EVENTS 条前插一行 TAIL_MARKER、这几条不削、其中助手发言放宽到 TAIL_ASSISTANT_CLIP 字：
  * P0 无声场抽检 10 场错漏里 8 场是「没做完」把结尾已做完的事写成待办，原因是结尾被削或被截在 500 字。
  */
-export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOptions = {}): { text: string; droppedEvents: number } {
+export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOptions = {}): RenderedTranscript {
   const o = { ...DEFAULT_RENDER, ...opts };
   // 轮次：一条真人发言到下一条真人发言之间算一轮（maskRestatement 按轮遮）
   const turnOf = new Map<number, number>();
@@ -138,7 +146,10 @@ export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOp
     }
   }
   const tailStart = Math.max(0, lines.length - TAIL_EVENTS);
-  const texts = lines.map((l, i) => (l.masked ? "" : l.render(i >= tailStart)));
+  // 预算裁剪在全部行上做（被遮的行也照对照组那样渲染、占预算、参与保护行的选择），裁完再拿走被遮的行：
+  // 这样遮复述组看到的恰好是对照组看到的减去被遮的那些，不会因为遮掉的行腾出预算而多留对照组削掉的旧发言
+  // （P1 互审 R3 Codex C8：默认 28000 下遮复述组多留了 10 条普通助手发言）
+  const texts = lines.map((l, i) => l.render(i >= tailStart));
   const withMarker = (kept: number[]): string => {
     const out: string[] = [];
     let marked = false;
@@ -151,19 +162,21 @@ export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOp
     }
     return out.join("\n");
   };
-  const all = texts.map((_, i) => i).filter((i) => !lines[i].masked);
+  const all = texts.map((_, i) => i);
+  const visible = (kept: number[]) => kept.filter((i) => !lines[i].masked);
   let total = all.reduce((n, i) => n + texts[i].length + 1, 0);
-  if (total <= o.maxChars) return { text: withMarker(all), droppedEvents: 0 };
+  if (total <= o.maxChars) return { text: withMarker(visible(all)), droppedEvents: 0, droppedUserTurns: 0 };
   // 从中间往两头削权重最低的（助手发言）；结尾 TAIL_EVENTS 条与最后 3 条助手行、3 条报错行不削
   const protectedIdx = new Set<number>();
   for (let i = tailStart; i < lines.length; i++) protectedIdx.add(i);
   for (const w of [1, 2]) {
     let kept = 0;
-    for (let i = lines.length - 1; i >= 0 && kept < 3; i--) if (lines[i].weight === w && !lines[i].masked) { protectedIdx.add(i); kept++; }
+    for (let i = lines.length - 1; i >= 0 && kept < 3; i--) if (lines[i].weight === w) { protectedIdx.add(i); kept++; }
   }
   const order = all.map((i) => ({ i, dist: Math.abs(i - lines.length / 2), w: lines[i].weight })).sort((a, b) => a.w - b.w || a.dist - b.dist);
   const drop = new Set<number>();
   let dropped = 0;
+  let droppedUser = 0;
   for (const { i } of order) {
     if (total <= o.maxChars) break;
     if (lines[i].weight >= 3 || protectedIdx.has(i)) continue;
@@ -172,13 +185,33 @@ export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOp
     dropped++;
   }
   if (total > o.maxChars) {
-    // 还超：用户行不丢，但单条截到 2,000 字（R3 Codex 自评 #4：30,000 字的用户输入会让预算形同虚设）
+    // 还超：用户行单条截到 2,000 字（R3 Codex 自评 #4：30,000 字的用户输入会让预算形同虚设）
     for (const i of all) {
-      if (!drop.has(i) && lines[i].weight >= 3 && texts[i].length > 2000) texts[i] = `${texts[i].slice(0, 2000)}… [用户发言截断 ${texts[i].length - 2000} 字]`;
+      if (drop.has(i) || lines[i].weight < 3 || texts[i].length <= USER_LINE_CLIP) continue;
+      const cut = `${texts[i].slice(0, USER_LINE_CLIP)}… [用户发言截断 ${texts[i].length - USER_LINE_CLIP} 字]`;
+      total -= texts[i].length - cut.length;
+      texts[i] = cut;
     }
   }
-  return { text: withMarker(all.filter((i) => !drop.has(i))), droppedEvents: dropped };
+  if (total > o.maxChars) {
+    // 截完还超（长发言一多就会，R3 Codex NEW-5：30 条 3,000 字 → 60,557 字）：从中段起削用户行，
+    // 第一条用户发言（定任务）与结尾 TAIL_EVENTS 条不削。默认 28,000 下保住的部分最多约 25,000 字，上限因此落得住；
+    // maxChars 再小就可能还超一点，那是保住开头与结尾的代价
+    const firstUser = all.find((i) => lines[i].weight >= 3);
+    for (const { i } of order) {
+      if (total <= o.maxChars) break;
+      if (lines[i].weight < 3 || drop.has(i) || i === firstUser || i >= tailStart) continue;
+      drop.add(i);
+      total -= texts[i].length + 1;
+      dropped++;
+      droppedUser++;
+    }
+  }
+  return { text: withMarker(visible(all.filter((i) => !drop.has(i)))), droppedEvents: dropped, droppedUserTurns: droppedUser };
 }
+
+/** 超预算时用户发言单条截到这么多字 */
+export const USER_LINE_CLIP = 2000;
 
 export const LEDGER_SYSTEM_PROMPT = `你是会话账本的记录员。读一场 AI 助手与用户的对话转录（已压缩：[U#序号 时间] 用户说的话、[A#序号] 助手说的话、[ERR#序号 工具名] 工具报错、[MEM#序号] 当场写过的记忆；「${TAIL_MARKER}」之后是会话结束前的最后几条），写一份事实性的账本，记的是**会话结束时**的状态。
 
@@ -335,7 +368,7 @@ const RETRYABLE_RE = /\b(429|rate.?limit|request limit|timeout|timed out|ECONNRE
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** 调 LLM 生成正文；失败返回 null + 原因，不抛（扫描器要能继续处理下一场） */
-export async function generateLedgerBody(doc: SessionDoc, llm: LLMClient, opts: GenerateLedgerOptions = {}): Promise<{ body: LedgerBody | null; usage: LedgerUsage | null; failure?: string; rendered: { text: string; droppedEvents: number } }> {
+export async function generateLedgerBody(doc: SessionDoc, llm: LLMClient, opts: GenerateLedgerOptions = {}): Promise<{ body: LedgerBody | null; usage: LedgerUsage | null; failure?: string; rendered: RenderedTranscript }> {
   const rendered = renderTranscriptForLLM(doc, opts);
   const t0 = performance.now();
   const retries = opts.retries ?? 3;
@@ -346,7 +379,7 @@ export async function generateLedgerBody(doc: SessionDoc, llm: LLMClient, opts: 
   let lastError = "";
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      result = await llm.chatLongDetailed(systemPrompt, `会话来源：${doc.source}；事件数 ${doc.events.length}${rendered.droppedEvents ? `（已削去 ${rendered.droppedEvents} 条助手发言）` : ""}。\n\n${rendered.text}`, {
+      result = await llm.chatLongDetailed(systemPrompt, `会话来源：${doc.source}；事件数 ${doc.events.length}${rendered.droppedEvents ? `（已削去 ${rendered.droppedEvents} 条${rendered.droppedUserTurns ? `，其中用户发言 ${rendered.droppedUserTurns} 条` : "助手发言"}）` : ""}。\n\n${rendered.text}`, {
         responseFormat: { type: "json_object" },
         tokenLimit: { parameter: "max_tokens", value: opts.maxTokens ?? LEDGER_MAX_TOKENS },
         temperature: 0.1,
@@ -437,10 +470,11 @@ export function renderLedgerMarkdown(doc: SessionDoc, summary: SessionSummary, b
   sections.push(`## 解决了什么\n${body?.solved.length ? body.solved.map((s) => `- ${li(s)}`).join("\n") : "- （未生成）"}`);
   sections.push(`## 决定与否决\n${body?.decisions.length ? body.decisions.map((s) => `- ${li(s)}`).join("\n") : body ? "- （无）" : "- （未生成）"}`);
   // 当场 agent 写的经验已经分流进 pivot / case（收工第五步），这里只列它和指针，不套候选的原话锚点格式
+  // kind 也要压成一行：收工命令的 --body 收任意字符串（P1 互审 R3 Codex K9 / Kimi NEW-1）
   const exp = generator === "agent"
-    ? (body?.experience.length ? body.experience.map((x) => `- ${li(x.text)}${x.kind ? `（${x.kind}）` : ""}`).join("\n") : "- （无）")
+    ? (body?.experience.length ? body.experience.map((x) => `- ${li(x.text)}${x.kind ? `（${li(x.kind)}）` : ""}`).join("\n") : "- （无）")
     : body?.experience.length
-    ? body.experience.map((x) => `- ${li(x.text)}${x.kind ? `（${x.kind}）` : ""} ｜原文：「${li(x.anchor) || "—"}」 ｜src:${sid8}#${x.anchorSeq ?? "?"}${x.anchorVerified ? "" : " ｜anchor:未核"}`).join("\n")
+    ? body.experience.map((x) => `- ${li(x.text)}${x.kind ? `（${li(x.kind)}）` : ""} ｜原文：「${li(x.anchor) || "—"}」 ｜src:${sid8}#${x.anchorSeq ?? "?"}${x.anchorVerified ? "" : " ｜anchor:未核"}`).join("\n")
     : "- （无）";
   sections.push(`## ${generator === "agent" ? "经验（已分流）" : "经验（待确认）"}\n${exp}`);
   sections.push(`## 没做完\n${body?.unfinished.length ? body.unfinished.map((s) => `- ${li(s)}`).join("\n") : "- （无）"}`);
@@ -457,7 +491,8 @@ export function renderLedgerMarkdown(doc: SessionDoc, summary: SessionSummary, b
   const memCounts = new Map<string, number>();
   for (const m of summary.memoryWrites) memCounts.set(m.tool.replace(/^mcp__recallnest__/, ""), (memCounts.get(m.tool.replace(/^mcp__recallnest__/, "")) ?? 0) + 1);
   sections.push(`## 当场写过的记忆（机器抽取）\n${memCounts.size ? [...memCounts.entries()].map(([k, v]) => `- ${k} ×${v}`).join("\n") : "- （无）"}`);
-  if (failure) sections.push(`> 生成失败：${red(failure)}`);
+  // 报错体可能是多行（网关的 HTML 错误页、多行 JSON）：续行会脱出引用块，带「## 」的就成了幻影节（R3 Kimi NEW-1）
+  if (failure) sections.push(`> 生成失败：${li(failure)}`);
   const markdown = `${fm}\n\n${sections.join("\n\n")}\n`;
   return { frontmatter, body, usage, generator, failure, markdown };
 }
