@@ -87,9 +87,9 @@ const silentChunks: string[][] = [];
 silent.forEach((x, i) => { (silentChunks[Math.floor(i / 10)] ??= []).push(`# 会话 ${x.n}\n\n【自动账本】\n${red(x.ledger)}\n\n【对话转录（压缩版）】\n${red(x.transcript)}\n`); });
 silentChunks.forEach((c, i) => writeFileSync(join(outDir, "silent", `silent-for-readers-${i + 1}.md`), c.join("\n\n---\n\n")));
 writeFileSync(join(outDir, "silent", "judge-prompt.md"), `你是账本正确性的读者。每个会话给你【自动账本】和【对话转录（压缩版）】。
-判一道总题：账本的「解决了什么 / 经验 / 没做完」三节，与转录对不对得上？
-- A 基本对：三节说的事转录里都有，没有编造，没有把没做完说成做完。
-- B 有实质错漏：出现了转录里没有的事、把计划写成已完成、把助手建议写成用户决定、或漏掉了这场会话最主要的事。
+判一道总题：账本的各节（解决了什么 / 决定与否决 / 经验 / 没做完）与转录对不对得上？
+- A 基本对：各节说的事转录里都有，没有编造，没有把没做完说成做完、也没有把做完了的写成没做完。
+- B 有实质错漏：出现了转录里没有的事、把计划写成已完成、把已完成写成没做完、把助手建议写成用户决定、或漏掉了这场会话最主要的事。
 - C 看不出：转录太短或被削得太狠，判不了。
 只看给出的材料。输出纯 JSON 数组，每项 {"n": 会话号, "verdict": "A"|"B"|"C", "why": "≤40 字"}。`);
 
@@ -117,5 +117,5 @@ cands.sort((a, b) => h(a.sid8 + a.text) - h(b.sid8 + b.text));
 const picked = cands.slice(0, CAND_N).map((c, i) => ({ ...c, n: i + 1 }));
 writeFileSync(join(outDir, "candidates", "candidates-key.json"), JSON.stringify({ total: cands.length, verifiedTotal: cands.filter((c) => c.anchorVerified).length, picked }, null, 1));
 writeFileSync(join(outDir, "candidates", "candidates-for-readers.md"), picked.map((c) => `## 条目 ${c.n}\n\n【提炼后的记忆】\n${red(c.text)}\n\n【原文证据（当时的对话原话）】\n- ${red(c.anchor)}\n\n【原话前后几句（上下文）】\n${red(c.context) || "（无）"}\n`).join("\n"));
-writeFileSync(join(outDir, "candidates", "judge-prompt.md"), readFileSync(join(outDir, "calib", "judge-prompt.md"), "utf-8").replace("【原文证据】是它所依据的对话原话。", "【原文证据】是它所依据的对话原话，【上下文】是原话前后几句，帮助你判断原话的语境。"));
+if (existsSync(join(outDir, "calib", "judge-prompt.md"))) writeFileSync(join(outDir, "candidates", "judge-prompt.md"), readFileSync(join(outDir, "calib", "judge-prompt.md"), "utf-8").replace("【原文证据】是它所依据的对话原话。", "【原文证据】是它所依据的对话原话，【上下文】是原话前后几句，帮助你判断原话的语境。"));
 console.log(JSON.stringify({ recallChunks: recallChunks.length, silentChunks: silentChunks.length, recallSessions: recallSessions.length, recallItems: recallItems.length, silent: silent.length, candidatesTotal: cands.length, candidatesVerified: cands.filter((c) => c.anchorVerified).length, picked: picked.length }));

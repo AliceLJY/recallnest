@@ -1,8 +1,9 @@
 /**
  * session-ledger — 把一场会话的事件变成一份 markdown 账本（plan.md v3 第 1、2 条的文件形状）。
  *
- * 一场一文件，frontmatter 带 session / source / machine / started / ended / trigger / pass；正文三节：
- * 解决了什么 / 经验（待确认）/ 没做完；文末两节机器抽取（报错清单、当场写过的记忆）不经 LLM。
+ * 一场一文件，frontmatter 带 session / source / machine / started / ended / trigger / pass；正文四节：
+ * 解决了什么 / 决定与否决 / 经验（待确认）/ 没做完；文末两节机器抽取（报错清单、当场写过的记忆）不经 LLM。
+ * 「决定与否决」是 P1 ② 加的（P0 账本召回：checkpoint 的 decisions 只覆盖 45%，决定没有自己的节）。
  *
  * 两层分工（D3）：这里是第二层「服务端 LLM 兜底」——只负责覆盖；质量由当场的 agent（第一层）和人负责。
  * 所以它的产物全部进「待确认」，每条经验必须带原话锚点（逐字摘录 + 事件序号），锚点在转录里找不到的
@@ -28,6 +29,8 @@ export interface LedgerExperience {
 export interface LedgerBody {
   oneLine: string;
   solved: string[];
+  /** 定下的与否决的做法，每条以「定：」或「否：」开头、带理由与谁定的（P1 ②） */
+  decisions: string[];
   experience: LedgerExperience[];
   unfinished: string[];
 }
@@ -58,9 +61,19 @@ export interface RenderTranscriptOptions {
   errorClip?: number;
   /** 回放时隐藏当场写过的记忆（checkpoint / store_case 的输入），否则「账本召回」会被它们灌水 */
   maskMemoryWrites?: boolean;
+  /**
+   * 敏感性比较用（互审 P0 R1 Codex N6）：助手常在写记忆之前先用自然语言复述一遍，maskMemoryWrites 只遮工具输入、
+   * 遮不住复述。打开后，含记忆写入的那一轮（上一条用户发言到下一条用户发言之间）的助手发言全部隐藏——
+   * 这是「复述」的上界（连同一轮里别的助手话一起遮了），只给回放量偏差用，生产不开。
+   */
+  maskRestatement?: boolean;
 }
 
-export const DEFAULT_RENDER: Required<RenderTranscriptOptions> = { maxChars: 28_000, assistantClip: 500, errorClip: 300, maskMemoryWrites: false };
+export const DEFAULT_RENDER: Required<RenderTranscriptOptions> = { maxChars: 28_000, assistantClip: 500, errorClip: 300, maskMemoryWrites: false, maskRestatement: false };
+/** 结尾这么多条事件单独标出、不削、助手发言放宽到 TAIL_ASSISTANT_CLIP 字——结尾定结果（P1 ②：「没做完」要在这里找完成证据） */
+export const TAIL_EVENTS = 10;
+export const TAIL_ASSISTANT_CLIP = 1200;
+export const TAIL_MARKER = `[—— 会话最后 ${TAIL_EVENTS} 条 ——]`;
 export const EXPERIENCE_KINDS = ["坑", "技巧", "决定", "偏好"] as const;
 
 /** 出站前脱敏（互审 R1 Codex #9）：原始转录不该带着凭证去 LLM；先脱敏再截断（#7） */
@@ -73,86 +86,117 @@ function shortTs(ts: string | null): string {
   return ts ? ts.slice(11, 16) : "--:--";
 }
 
-/** 把事件渲染成给 LLM 读的紧凑文本；超长时从中间削助手发言，首尾保全（开头定任务、结尾定结果） */
+const MEMORY_WRITE_RE = /(checkpoint_session|store_case|store_memory|store_workflow_pattern)$/;
+
+/**
+ * 把事件渲染成给 LLM 读的紧凑文本；超长时从中间削助手发言，首尾保全（开头定任务、结尾定结果）。
+ * 最后 TAIL_EVENTS 条前插一行 TAIL_MARKER、这几条不削、其中助手发言放宽到 TAIL_ASSISTANT_CLIP 字：
+ * P0 无声场抽检 10 场错漏里 8 场是「没做完」把结尾已做完的事写成待办，原因是结尾被削或被截在 500 字。
+ */
 export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOptions = {}): { text: string; droppedEvents: number } {
   const o = { ...DEFAULT_RENDER, ...opts };
-  const lines: Array<{ seq: number; text: string; weight: number }> = [];
+  // 轮次：一条真人发言到下一条真人发言之间算一轮（maskRestatement 按轮遮）
+  const turnOf = new Map<number, number>();
+  const turnsWithMemoryWrite = new Set<number>();
+  let turn = 0;
+  for (const e of doc.events) {
+    if (e.kind === "user" && !e.injected) turn++;
+    turnOf.set(e.seq, turn);
+    if (e.kind === "tool_call" && e.toolName && MEMORY_WRITE_RE.test(e.toolName)) turnsWithMemoryWrite.add(turn);
+  }
+  const lines: Array<{ seq: number; weight: number; render: (tail: boolean) => string }> = [];
   const callNames = new Map<string, string>();
   for (const e of doc.events) {
     switch (e.kind) {
       case "user":
         if (e.injected) break;
-        lines.push({ seq: e.seq, text: `[U#${e.seq} ${shortTs(e.ts)}] ${safe(e.text)}`, weight: 3 });
+        lines.push({ seq: e.seq, weight: 3, render: () => `[U#${e.seq} ${shortTs(e.ts)}] ${safe(e.text)}` });
         break;
       case "assistant":
-        lines.push({ seq: e.seq, text: `[A#${e.seq}] ${safe(e.text, o.assistantClip)}`, weight: 1 });
+        if (o.maskRestatement && turnsWithMemoryWrite.has(turnOf.get(e.seq) ?? -1)) break;
+        lines.push({ seq: e.seq, weight: 1, render: (tail) => `[A#${e.seq}] ${safe(e.text, tail ? Math.max(o.assistantClip, TAIL_ASSISTANT_CLIP) : o.assistantClip)}` });
         break;
       case "tool_call":
         if (e.toolCallId && e.toolName) callNames.set(e.toolCallId, e.toolName);
-        if (e.toolName && /(checkpoint_session|store_case|store_memory|store_workflow_pattern)$/.test(e.toolName)) {
-          if (o.maskMemoryWrites) lines.push({ seq: e.seq, text: `[MEM#${e.seq}] （当场写了一条记忆，回放时隐藏）`, weight: 2 });
-          else lines.push({ seq: e.seq, text: `[MEM#${e.seq} ${e.toolName.replace(/^mcp__recallnest__/, "")}] ${e.toolInput ? safe(JSON.stringify(e.toolInput), 800) : ""}`, weight: 2 });
+        if (e.toolName && MEMORY_WRITE_RE.test(e.toolName)) {
+          const name = e.toolName.replace(/^mcp__recallnest__/, "");
+          const input = e.toolInput;
+          if (o.maskMemoryWrites) lines.push({ seq: e.seq, weight: 2, render: () => `[MEM#${e.seq}] （当场写了一条记忆，回放时隐藏）` });
+          else lines.push({ seq: e.seq, weight: 2, render: () => `[MEM#${e.seq} ${name}] ${input ? safe(JSON.stringify(input), 800) : ""}` });
         }
         break;
       case "tool_result":
         if (e.isError && !/interrupted|doesn't want to proceed|rejected/i.test(e.text.slice(0, 300))) {
           const name = e.toolCallId ? callNames.get(e.toolCallId) : undefined;
-          lines.push({ seq: e.seq, text: `[ERR#${e.seq}${name ? ` ${name}` : ""}] ${safe(e.text.replace(/\s+/g, " "), o.errorClip)}`, weight: 2 });
+          lines.push({ seq: e.seq, weight: 2, render: () => `[ERR#${e.seq}${name ? ` ${name}` : ""}] ${safe(e.text.replace(/\s+/g, " "), o.errorClip)}` });
         }
         break;
       default:
         break;
     }
   }
-  let total = lines.reduce((n, l) => n + l.text.length + 1, 0);
-  let dropped = 0;
-  if (total > o.maxChars) {
-    // 从中间往两头削权重最低的（助手发言），但保全最后 3 条助手行与最后 3 条报错行——结尾定结果，
-    // 削掉它们会让「没做完」把已完成的事写成待办（P0 无声场抽检 10 场里 8 场是这个）
-    const protectedIdx = new Set<number>();
-    for (const w of [1, 2]) {
-      let kept = 0;
-      for (let i = lines.length - 1; i >= 0 && kept < 3; i--) if (lines[i].weight === w) { protectedIdx.add(i); kept++; }
+  const tailStart = Math.max(0, lines.length - TAIL_EVENTS);
+  const texts = lines.map((l, i) => l.render(i >= tailStart));
+  const withMarker = (kept: number[]): string => {
+    const out: string[] = [];
+    for (const i of kept) {
+      if (i === tailStart && tailStart > 0) out.push(TAIL_MARKER);
+      out.push(texts[i]);
     }
-    const order = lines.map((l, i) => ({ i, dist: Math.abs(i - lines.length / 2), w: l.weight })).sort((a, b) => a.w - b.w || a.dist - b.dist);
-    const drop = new Set<number>();
-    for (const { i } of order) {
-      if (total <= o.maxChars) break;
-      if (lines[i].weight >= 3 || protectedIdx.has(i)) continue;
-      drop.add(i);
-      total -= lines[i].text.length + 1;
-      dropped++;
-    }
-    let kept = lines.filter((_, i) => !drop.has(i));
-    if (total > o.maxChars) {
-      // 还超：用户行不丢，但单条截到 2,000 字（R3 Codex 自评 #4：30,000 字的用户输入会让预算形同虚设）
-      kept = kept.map((l) => (l.weight >= 3 && l.text.length > 2000 ? { ...l, text: `${l.text.slice(0, 2000)}… [用户发言截断 ${l.text.length - 2000} 字]` } : l));
-    }
-    return { text: kept.map((l) => l.text).join("\n"), droppedEvents: dropped };
+    return out.join("\n");
+  };
+  let total = texts.reduce((n, t) => n + t.length + 1, 0);
+  const all = texts.map((_, i) => i);
+  if (total <= o.maxChars) return { text: withMarker(all), droppedEvents: 0 };
+  // 从中间往两头削权重最低的（助手发言）；结尾 TAIL_EVENTS 条与最后 3 条助手行、3 条报错行不削
+  const protectedIdx = new Set<number>();
+  for (let i = tailStart; i < lines.length; i++) protectedIdx.add(i);
+  for (const w of [1, 2]) {
+    let kept = 0;
+    for (let i = lines.length - 1; i >= 0 && kept < 3; i--) if (lines[i].weight === w) { protectedIdx.add(i); kept++; }
   }
-  return { text: lines.map((l) => l.text).join("\n"), droppedEvents: 0 };
+  const order = lines.map((l, i) => ({ i, dist: Math.abs(i - lines.length / 2), w: l.weight })).sort((a, b) => a.w - b.w || a.dist - b.dist);
+  const drop = new Set<number>();
+  let dropped = 0;
+  for (const { i } of order) {
+    if (total <= o.maxChars) break;
+    if (lines[i].weight >= 3 || protectedIdx.has(i)) continue;
+    drop.add(i);
+    total -= texts[i].length + 1;
+    dropped++;
+  }
+  if (total > o.maxChars) {
+    // 还超：用户行不丢，但单条截到 2,000 字（R3 Codex 自评 #4：30,000 字的用户输入会让预算形同虚设）
+    for (let i = 0; i < texts.length; i++) {
+      if (!drop.has(i) && lines[i].weight >= 3 && texts[i].length > 2000) texts[i] = `${texts[i].slice(0, 2000)}… [用户发言截断 ${texts[i].length - 2000} 字]`;
+    }
+  }
+  return { text: withMarker(all.filter((i) => !drop.has(i))), droppedEvents: dropped };
 }
 
-export const LEDGER_SYSTEM_PROMPT = `你是会话账本的记录员。读一场 AI 助手与用户的对话转录（已压缩：[U#序号 时间] 用户说的话、[A#序号] 助手说的话、[ERR#序号 工具名] 工具报错、[MEM#序号] 当场写过的记忆），写一份事实性的账本。
+export const LEDGER_SYSTEM_PROMPT = `你是会话账本的记录员。读一场 AI 助手与用户的对话转录（已压缩：[U#序号 时间] 用户说的话、[A#序号] 助手说的话、[ERR#序号 工具名] 工具报错、[MEM#序号] 当场写过的记忆；「${TAIL_MARKER}」之后是会话结束前的最后几条），写一份事实性的账本，记的是**会话结束时**的状态。
 
 只写转录里有依据的内容，不推测、不补全、不美化。输出 JSON（UTF-8，中文），字段：
 {
   "oneLine": "一句话说这场会话做了什么（≤40 字）",
   "solved": ["解决了什么 / 做成了什么，每条一句，带关键名词（文件、命令、服务、数字）"],
+  "decisions": ["定下来的做法或否决掉的做法，每条一句，以「定：」或「否：」开头，写清定的是什么、谁定的（用户拍板 / 用户认可了助手的方案 / 助手自己的技术取舍）、理由"],
   "experience": [
     {"text": "一条可复用的经验（坑 / 技巧 / 决定 / 用户偏好），一句话，不超过 60 字",
      "anchor": "转录里逐字摘录的原话（用户或助手说的，≤120 字，不得改写）",
      "anchorSeq": 原话所在的事件序号（整数，取 [U#n] / [A#n] / [ERR#n] 里的 n）,
      "kind": "坑 | 技巧 | 决定 | 偏好"}
   ],
-  "unfinished": ["没做完 / 等人拍板 / 下一步，每条一句"]
+  "unfinished": ["会话结束时仍没做完的事 / 仍在等人拍板的事 / 明说了的下一步，每条一句"]
 }
 规则：
 1. experience 宁缺毋滥：没有真正可复用的就给空数组；一次性的操作细节不算经验。{{EXPERIENCE_RULE}}
 2. anchor 必须是转录里能逐字找到的一段，不要用自己的话转述；找不到原话就不要写这条经验。
 3. 用户明确表达的偏好、否决、决定，用用户自己的话当 anchor。
-4. 不写任何密钥、token、密码；遇到就写 [REDACTED]。
-5. 只输出 JSON，不加解释。`;
+4. unfinished 写之前，先到「${TAIL_MARKER}」之后找完成证据：助手已报告做完、已提交 / 已推送 / 测试通过、或用户已确认的，就不是没做完，写进 solved；中途提过、后来做完了的不写；只是助手的建议、用户没要求做的不写。找不到完成证据、也没人说不做了的，才写进 unfinished。
+5. decisions 不要把助手的建议写成用户的决定；用户没表态的方案不算「定」。被推翻的旧决定写成「否：」并写新决定。没有就给空数组。
+6. 不写任何密钥、token、密码；遇到就写 [REDACTED]。
+7. 只输出 JSON，不加解释。`;
 
 const STRIP_CHAR_RE = /[\s“”"'‘’「」『』。，、；：！？,.;:!?()（）\-—…*_`#>•·\[\]【】]/u;
 
@@ -212,7 +256,7 @@ export function verifyAnchor(doc: SessionDoc, anchor: string, seq: number | null
 
 export function parseLedgerJson(raw: string, doc: SessionDoc): LedgerBody {
   const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-  const parsed = JSON.parse(cleaned) as Partial<{ oneLine: unknown; solved: unknown; experience: unknown; unfinished: unknown }>;
+  const parsed = JSON.parse(cleaned) as Partial<{ oneLine: unknown; solved: unknown; decisions: unknown; experience: unknown; unfinished: unknown }>;
   const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((x) => x.trim()) : []);
   const experience: LedgerExperience[] = [];
   if (Array.isArray(parsed.experience)) {
@@ -227,7 +271,7 @@ export function parseLedgerJson(raw: string, doc: SessionDoc): LedgerBody {
       experience.push({ text: it.text.trim(), anchor, anchorSeq: v.seq, anchorVerified: v.verified, kind });
     }
   }
-  return { oneLine: typeof parsed.oneLine === "string" ? parsed.oneLine.trim() : "", solved: strs(parsed.solved), experience, unfinished: strs(parsed.unfinished) };
+  return { oneLine: typeof parsed.oneLine === "string" ? parsed.oneLine.trim() : "", solved: strs(parsed.solved), decisions: strs(parsed.decisions), experience, unfinished: strs(parsed.unfinished) };
 }
 
 export interface GenerateLedgerOptions extends RenderTranscriptOptions {
@@ -334,6 +378,7 @@ export function renderLedgerMarkdown(doc: SessionDoc, summary: SessionSummary, b
   const sections: string[] = [];
   sections.push(`# ${red(body?.oneLine || `${doc.source} 会话 ${sid8}`)}`);
   sections.push(`## 解决了什么\n${body?.solved.length ? body.solved.map((s) => `- ${red(s)}`).join("\n") : "- （未生成）"}`);
+  sections.push(`## 决定与否决\n${body?.decisions.length ? body.decisions.map((s) => `- ${red(s)}`).join("\n") : body ? "- （无）" : "- （未生成）"}`);
   const exp = body?.experience.length
     ? body.experience.map((x) => `- ${red(x.text)}${x.kind ? `（${x.kind}）` : ""} ｜原文：「${red(x.anchor) || "—"}」 ｜src:${sid8}#${x.anchorSeq ?? "?"}${x.anchorVerified ? "" : " ｜anchor:未核"}`).join("\n")
     : "- （无）";
