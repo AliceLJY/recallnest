@@ -503,7 +503,7 @@ describe("OpenAI-compatible chat completions contract", () => {
     // pointed at the loopback mock.
     return new LLMClient({
       apiKey: "test-key-not-a-real-credential",
-      model: "qwen-turbo",
+      model: "qwen-flash",
       baseURL,
       timeoutMs,
       temperature: 0.1,
@@ -534,7 +534,7 @@ describe("OpenAI-compatible chat completions contract", () => {
     expect(request.url).toBe("/v1/chat/completions");
     expect(request.hasAuthorization).toBe(true);
     expect(request.body).toMatchObject({
-      model: "qwen-turbo",
+      model: "qwen-flash",
       temperature: 0.1,
       max_tokens: 256,
       messages: [
@@ -570,7 +570,7 @@ describe("OpenAI-compatible chat completions contract", () => {
     // recallnest's behaviour rather than the SDK's retry policy.
     const client = new LLMClient({
       apiKey: "test-key-not-a-real-credential",
-      model: "qwen-turbo",
+      model: "qwen-flash",
       baseURL: mock.baseURL,
       timeoutMs: 5_000,
       temperature: 0.1,
@@ -588,7 +588,7 @@ describe("OpenAI-compatible chat completions contract", () => {
     // chatLongDetailed arms its AbortController at timeoutMs * 2.
     const client = new LLMClient({
       apiKey: "test-key-not-a-real-credential",
-      model: "qwen-turbo",
+      model: "qwen-flash",
       baseURL: mock.baseURL,
       timeoutMs: 100,
       temperature: 0.1,
@@ -611,7 +611,7 @@ describe("OpenAI-compatible chat completions contract", () => {
     const client = new LLMClient(
       {
         apiKey: "test-key-not-a-real-credential",
-        model: "qwen-turbo",
+        model: "qwen-flash",
         baseURL: mock.baseURL,
         timeoutMs: 5_000,
         temperature: 0.1,
