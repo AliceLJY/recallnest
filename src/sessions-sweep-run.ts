@@ -8,9 +8,9 @@
  * 每端各自的静默阈值走 `policyBySource`（Alice 10-23 拍板：CC 60 分钟 / 候选 12 小时，其余端 30 分钟 / 6 小时）。
  */
 
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 
 import { LockTimeoutError, withLock } from "./distill-lock.js";
 import type { LLMClient } from "./llm-client.js";
@@ -210,6 +210,11 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
 
   const stateStore = new SessionStateStore(opts.stateDir ?? join(opts.shadowDir!, "session-state"));
   const ledgerRoot = opts.ledgerDir ?? join(opts.shadowDir!, "ledgers");
+  // 影子模式不许落进正式账本目录（目录或它的上级有写入端标记）：否则影子产物会混进正式账本、被对账导入（R5 Codex #3）
+  if (opts.shadowDir && !opts.dryRun) {
+    const marker = findLedgerWriterMarker(ledgerRoot);
+    if (marker) throw new Error(`影子目录 ${ledgerRoot} 落在正式账本目录里（${marker.path}），换一个影子目录`);
+  }
   const sweepLog = opts.logPath ?? (opts.shadowDir ? join(opts.shadowDir, "sweep-log.jsonl") : null);
   // 日志与终端里账本路径的显示基准：影子模式相对 shadowDir（ledgers/2026-10/x.md），正式模式相对账本根的上一级
   const displayBase = opts.shadowDir ?? dirname(ledgerRoot);
@@ -308,10 +313,12 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
     // 收工账本写完之后再没有新事件、候选关着时候选到期，都不会再出账本，记录就永远没人判（P1 互审 R4 Codex #2、Kimi #7）。
     // 转录没变时 decide 走 mtime 快路、不解析（没有 doc），可 recall-log 是别的进程追加的、判完之后还会长：
     // 游标另记「上次判的时候主日志多大」，主日志比那时大就解析一次再判（R4 R3 Codex #2 前半）
-    let judgedLogBytes: number | null = null;
+    let judged: { bytes: number; sid: string } | null = null;
     if (opts.recallLogRoot && !opts.dryRun && JUDGEABLE_ACTIONS.has(decision.action)) {
-      // 大小在判之前取：判的时候又追加进来的行这轮也判了，下一轮看到变大再解析一次，已判的不重判
-      const logBytes = fileSize(join(opts.recallLogRoot, RECALL_LOG_DIRNAME, recallLogFileName(file.sessionId)));
+      // 大小在判之前取：判的时候又追加进来的行这轮也判了，下一轮看到变大再解析一次，已判的不重判。
+      // 日志按解析出的会话 id 命名，它可以和转录文件名不同（文件名不是 UUID 时取内容里的 id）：没解析时用上次判时记下的 id（R5 Codex #5）
+      const logSid = decision.doc?.sessionId ?? state.recallLogSid ?? file.sessionId;
+      const logBytes = fileSize(join(opts.recallLogRoot, RECALL_LOG_DIRNAME, recallLogFileName(logSid)));
       let judgeDoc = decision.doc;
       if (!judgeDoc && logBytes > (state.recallLogBytes ?? 0)) {
         try {
@@ -323,7 +330,8 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
       if (judgeDoc) {
         const counts = judgeRecallLog(opts.recallLogRoot, judgeDoc, new Date(nowMs).toISOString());
         if (counts) for (const [k, v] of Object.entries(counts)) (result.recallOutcomes ??= {})[k] = ((result.recallOutcomes ?? {})[k] ?? 0) + (v ?? 0);
-        judgedLogBytes = logBytes;
+        // 先解析后才知道真实 id 的那一轮（转录没变、按文件名 id 预查到变大），大小按真实 id 重取
+        judged = { sid: judgeDoc.sessionId, bytes: judgeDoc.sessionId === logSid ? logBytes : fileSize(join(opts.recallLogRoot, RECALL_LOG_DIRNAME, recallLogFileName(judgeDoc.sessionId))) };
       }
     }
     if (!opts.dryRun) {
@@ -345,7 +353,10 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
         const kept = agentPath ?? targetPath;
         if (kept) next.ledgerPath = kept;
       }
-      if (judgedLogBytes !== null) next.recallLogBytes = judgedLogBytes;
+      if (judged) {
+        next.recallLogBytes = judged.bytes;
+        next.recallLogSid = judged.sid;
+      }
       stateStore.save(next);
       if (sweepLog) appendFileSync(sweepLog, `${JSON.stringify({ ts: new Date(nowMs).toISOString(), source: file.source, sid8: file.sessionId.slice(0, 8), action: decision.action, reason: decision.reason, userTurns: decision.summary?.userTurns ?? null, rich: decision.summary?.rich ?? null, lastMessageAt: decision.lastMessageAt ?? null, ledger: ledgerPath ? show(ledgerPath) : null, ...usageNote })}\n`);
     }
@@ -467,7 +478,11 @@ export type LedgerCommitResult = { written: true; path: string } | { written: fa
  * 这把锁是本机的 flock，只管得住本机的扫描器与收工命令；另一台机器写、经 Syncthing 同步进来的账本不经过它，
  * 照样可能落在复查与改名之间。跨机靠的是账本目录只许一台机器写（checkLedgerWriter，R4 R3 Codex NEW-2），不是这把锁。
  */
-export async function commitLedger(o: { ledgerRoot: string; doc: SessionDoc; stateLedgerPath?: string; markdown: string; mode: LedgerCommitMode; lockDir?: string; waitMs?: number }): Promise<LedgerCommitResult> {
+export async function commitLedger(o: { ledgerRoot: string; doc: SessionDoc; stateLedgerPath?: string; markdown: string; mode: LedgerCommitMode; lockDir?: string; waitMs?: number; host?: string }): Promise<LedgerCommitResult> {
+  // 落点（或它的上级）归别的机器写：不管从哪条路径进来都不写（R5 Codex #3：影子模式把 --shadow 指到正式目录的上级就能绕过命令层的检查）
+  const marker = findLedgerWriterMarker(o.ledgerRoot);
+  const host = o.host ?? hostname();
+  if (marker && marker.owner !== host) throw new Error(`账本目录归 ${marker.owner || "（标记文件是空的）"} 写（${marker.path}），本机是 ${host}，不写`);
   const key = `${LEDGER_COMMIT_LOCK_PREFIX}${o.doc.sessionId}`;
   try {
     // lock-wait: no store-write inside（锁里只有读账本头、写文件、改名，不碰记忆库）
@@ -494,38 +509,64 @@ export async function commitLedger(o: { ledgerRoot: string; doc: SessionDoc; sta
 /** 账本目录里记「哪台机器写这个目录」的文件（随目录同步到别的机器，别的机器读得到） */
 export const LEDGER_WRITER_FILE = ".writer-host";
 
-export type LedgerWriterCheck = { ok: true; host: string; claimed: boolean } | { ok: false; host: string; owner: string; path: string };
+export type LedgerWriterCheck = { ok: true; host: string } | { ok: false; host: string; owner: string | null; path: string };
+
+/**
+ * 从 dir 往上找最近的写入端标记（dir 不存在就从它最近的现存上级开始，按真实路径解析符号链接）。
+ * 往上找是为了影子目录、符号链接、嵌套目录落进正式账本目录时也认得出来（R5 Codex #3）。
+ */
+export function findLedgerWriterMarker(dir: string): { path: string; owner: string } | null {
+  let d = resolve(dir);
+  while (!existsSync(d) && dirname(d) !== d) d = dirname(d);
+  try {
+    d = realpathSync(d);
+  } catch {
+    /* 读不了就按原路径 */
+  }
+  for (;;) {
+    const p = join(d, LEDGER_WRITER_FILE);
+    if (existsSync(p)) {
+      let owner = "";
+      try {
+        owner = readFileSync(p, "utf-8").trim();
+      } catch {
+        /* 读不了按空的算：谁都对不上 */
+      }
+      return { path: p, owner };
+    }
+    const up = dirname(d);
+    if (up === d) return null;
+    d = up;
+  }
+}
 
 /**
  * 账本目录只许一台机器写（P1 互审 R4 R3 Codex NEW-2）。提交锁是本机 flock，另一台机器写、经 Syncthing 同步进来的
  * 收工账本若落在本机「复查 → 改名」之间，会被扫描结果盖掉——跨机没有锁可拿，只能不让第二台机器写。
- * 第一次正式写的机器（正式扫描或收工命令）在账本目录里留下自己的主机名；之后别的机器上这两条命令一律拒绝，
- * 收工要到写入端去跑。claim=false（dry-run）只查不建。要换写入端：改那个文件。
+ * 标记不会自动认领（R5 Codex #2：两台机器在标记同步过来之前各自认领，就又成了两个写入端）：要在选定的那台上
+ * 显式跑一次 `sessions writer --claim`（安装脚本 install 时调它）。没有标记时，收工命令与正式扫描都拒绝；dry-run 不查。
  */
-export function checkLedgerWriter(ledgerDir: string, opts: { claim: boolean; host?: string }): LedgerWriterCheck {
+export function checkLedgerWriter(ledgerDir: string, opts: { host?: string } = {}): LedgerWriterCheck {
   const host = opts.host ?? hostname();
-  const path = join(ledgerDir, LEDGER_WRITER_FILE);
-  const owner = (): string | null => {
-    try {
-      return readFileSync(path, "utf-8").trim();
-    } catch {
-      return null;
-    }
-  };
-  let who = owner();
-  if (who === null) {
-    if (!opts.claim) return { ok: true, host, claimed: false };
+  const marker = findLedgerWriterMarker(ledgerDir);
+  if (!marker) return { ok: false, host, owner: null, path: join(ledgerDir, LEDGER_WRITER_FILE) };
+  return marker.owner === host ? { ok: true, host } : { ok: false, host, owner: marker.owner, path: marker.path };
+}
+
+/** 显式认领账本目录（`sessions writer --claim`）：没有标记就独占创建；已经是本机照常；别的机器的不动 */
+export function claimLedgerWriter(ledgerDir: string, opts: { host?: string } = {}): (LedgerWriterCheck & { claimed?: boolean }) {
+  const host = opts.host ?? hostname();
+  if (!findLedgerWriterMarker(ledgerDir)) {
     mkdirSync(ledgerDir, { recursive: true });
     try {
-      writeFileSync(path, `${host}\n`, { flag: "wx" });
+      writeFileSync(join(ledgerDir, LEDGER_WRITER_FILE), `${host}\n`, { flag: "wx" });
       return { ok: true, host, claimed: true };
     } catch (error) {
       // 同时有人建了：按它写进去的判；不是这个原因（建不了文件）就照原样报
-      who = owner();
-      if (who === null) throw error;
+      if (!findLedgerWriterMarker(ledgerDir)) throw error;
     }
   }
-  return who === host ? { ok: true, host, claimed: false } : { ok: false, host, owner: who, path };
+  return { ...checkLedgerWriter(ledgerDir, { host }), claimed: false };
 }
 
 function fileSize(path: string): number {
