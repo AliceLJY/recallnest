@@ -154,6 +154,8 @@ export interface SessionState {
    * 不解析）也要解析一次再判（P1 互审 R4 R3 Codex #2 前半）。没有 = 从没判过
    */
   recallLogBytes?: number;
+  /** 上次判 recall-log 时用的会话 id（解析出的，可能和转录文件名不同；R5 Codex #5） */
+  recallLogSid?: string;
 }
 
 export type SweepAction =
