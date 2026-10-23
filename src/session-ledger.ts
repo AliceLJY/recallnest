@@ -328,6 +328,9 @@ export interface GenerateLedgerOptions extends RenderTranscriptOptions {
   retryBaseMs?: number;
 }
 
+/** 账本 JSON 的输出上限：回放（P0 / P1 复测）用的就是 2600，生产对齐它（P1 互审 R1 Kimi #8：此前生产默认 1800） */
+export const LEDGER_MAX_TOKENS = 2600;
+
 const RETRYABLE_RE = /\b(429|rate.?limit|request limit|timeout|timed out|ECONNRESET|ETIMEDOUT|503|502|overloaded)\b/i;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -345,7 +348,7 @@ export async function generateLedgerBody(doc: SessionDoc, llm: LLMClient, opts: 
     try {
       result = await llm.chatLongDetailed(systemPrompt, `会话来源：${doc.source}；事件数 ${doc.events.length}${rendered.droppedEvents ? `（已削去 ${rendered.droppedEvents} 条助手发言）` : ""}。\n\n${rendered.text}`, {
         responseFormat: { type: "json_object" },
-        tokenLimit: { parameter: "max_tokens", value: opts.maxTokens ?? 1800 },
+        tokenLimit: { parameter: "max_tokens", value: opts.maxTokens ?? LEDGER_MAX_TOKENS },
         temperature: 0.1,
       });
       lastError = "";
@@ -369,7 +372,7 @@ export async function generateLedgerBody(doc: SessionDoc, llm: LLMClient, opts: 
   } catch (error) {
     // 坏 JSON 重试一次：把坏输出喂回去让它只修格式（不重新读转录，省 token；修不好就记失败）
     try {
-      const fix = await llm.chatLongDetailed("你只做一件事：把用户给的文本修成合法 JSON（UTF-8），字段与内容一字不改，只修引号、逗号、括号。只输出 JSON。", result.content.slice(0, 12_000), { responseFormat: { type: "json_object" }, tokenLimit: { parameter: "max_tokens", value: opts.maxTokens ?? 1800 }, temperature: 0 });
+      const fix = await llm.chatLongDetailed("你只做一件事：把用户给的文本修成合法 JSON（UTF-8），字段与内容一字不改，只修引号、逗号、括号。只输出 JSON。", result.content.slice(0, 12_000), { responseFormat: { type: "json_object" }, tokenLimit: { parameter: "max_tokens", value: opts.maxTokens ?? LEDGER_MAX_TOKENS }, temperature: 0 });
       if (fix?.content) {
         usage.promptTokens += fix.usage?.promptTokens ?? 0;
         usage.completionTokens += fix.usage?.completionTokens ?? 0;
@@ -402,6 +405,11 @@ function red(s: string): string {
   return redactSecrets(s).text;
 }
 
+/** 列表条目压成一行：条目里带换行再以「## 」「> 」开头会被账本解析当成新节（P1 互审 R1 Kimi #9） */
+function li(s: string): string {
+  return red(s).replace(/\s*\n\s*/g, " / ");
+}
+
 /** 渲染成最终 markdown。body 为 null 时只写机器抽取的两节（`--no-llm` 影子跑法 / LLM 失败） */
 export function renderLedgerMarkdown(doc: SessionDoc, summary: SessionSummary, body: LedgerBody | null, meta: LedgerMeta, usage: LedgerUsage | null, generator: LedgerRender["generator"], failure?: string): LedgerRender {
   const frontmatter: Record<string, unknown> = {
@@ -425,17 +433,17 @@ export function renderLedgerMarkdown(doc: SessionDoc, summary: SessionSummary, b
   const fm = ["---", ...Object.entries(frontmatter).map(([k, v]) => `${k}: ${yamlScalar(v)}`), "---"].join("\n");
   const sid8 = doc.sessionId.replace(/[^A-Za-z0-9]/g, "").slice(0, 8);
   const sections: string[] = [];
-  sections.push(`# ${red(body?.oneLine || `${doc.source} 会话 ${sid8}`)}`);
-  sections.push(`## 解决了什么\n${body?.solved.length ? body.solved.map((s) => `- ${red(s)}`).join("\n") : "- （未生成）"}`);
-  sections.push(`## 决定与否决\n${body?.decisions.length ? body.decisions.map((s) => `- ${red(s)}`).join("\n") : body ? "- （无）" : "- （未生成）"}`);
+  sections.push(`# ${li(body?.oneLine || `${doc.source} 会话 ${sid8}`)}`);
+  sections.push(`## 解决了什么\n${body?.solved.length ? body.solved.map((s) => `- ${li(s)}`).join("\n") : "- （未生成）"}`);
+  sections.push(`## 决定与否决\n${body?.decisions.length ? body.decisions.map((s) => `- ${li(s)}`).join("\n") : body ? "- （无）" : "- （未生成）"}`);
   // 当场 agent 写的经验已经分流进 pivot / case（收工第五步），这里只列它和指针，不套候选的原话锚点格式
   const exp = generator === "agent"
-    ? (body?.experience.length ? body.experience.map((x) => `- ${red(x.text)}${x.kind ? `（${x.kind}）` : ""}`).join("\n") : "- （无）")
+    ? (body?.experience.length ? body.experience.map((x) => `- ${li(x.text)}${x.kind ? `（${x.kind}）` : ""}`).join("\n") : "- （无）")
     : body?.experience.length
-    ? body.experience.map((x) => `- ${red(x.text)}${x.kind ? `（${x.kind}）` : ""} ｜原文：「${red(x.anchor) || "—"}」 ｜src:${sid8}#${x.anchorSeq ?? "?"}${x.anchorVerified ? "" : " ｜anchor:未核"}`).join("\n")
+    ? body.experience.map((x) => `- ${li(x.text)}${x.kind ? `（${x.kind}）` : ""} ｜原文：「${li(x.anchor) || "—"}」 ｜src:${sid8}#${x.anchorSeq ?? "?"}${x.anchorVerified ? "" : " ｜anchor:未核"}`).join("\n")
     : "- （无）";
   sections.push(`## ${generator === "agent" ? "经验（已分流）" : "经验（待确认）"}\n${exp}`);
-  sections.push(`## 没做完\n${body?.unfinished.length ? body.unfinished.map((s) => `- ${red(s)}`).join("\n") : "- （无）"}`);
+  sections.push(`## 没做完\n${body?.unfinished.length ? body.unfinished.map((s) => `- ${li(s)}`).join("\n") : "- （无）"}`);
   // 机器抽取两节
   const errLines = summary.errors.slice(0, 20).map((e) => {
     const sigs = extractErrorSignatures({ problem: e.text.slice(0, 4000) });
@@ -445,7 +453,7 @@ export function renderLedgerMarkdown(doc: SessionDoc, summary: SessionSummary, b
   });
   sections.push(`## 报错（机器抽取，${summary.toolErrors} 条${summary.errors.length > 20 ? "，只列前 20" : ""}）\n${errLines.length ? errLines.join("\n") : "- （无）"}`);
   // 待确认：签名一模一样不等于同一个坑，要不要给原条目记一笔由人或当场的 agent 定（D4：pivot 零自动写入）
-  if (meta.recurrence?.length) sections.push(`## 疑似又踩（机器抽取，${meta.recurrence.length} 条，待确认）\n${meta.recurrence.map((l) => `- ${red(l)}`).join("\n")}`);
+  if (meta.recurrence?.length) sections.push(`## 疑似又踩（机器抽取，${meta.recurrence.length} 条，待确认）\n${meta.recurrence.map((l) => `- ${li(l)}`).join("\n")}`);
   const memCounts = new Map<string, number>();
   for (const m of summary.memoryWrites) memCounts.set(m.tool.replace(/^mcp__recallnest__/, ""), (memCounts.get(m.tool.replace(/^mcp__recallnest__/, "")) ?? 0) + 1);
   sections.push(`## 当场写过的记忆（机器抽取）\n${memCounts.size ? [...memCounts.entries()].map(([k, v]) => `- ${k} ×${v}`).join("\n") : "- （无）"}`);

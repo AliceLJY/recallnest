@@ -1538,7 +1538,7 @@ program
 program
   .command("ingest")
   .description("导入对话记录到索引")
-  .option("-s, --source <source>", "数据源: cc / codex / gemini / kimi / memory / desktop / minis / all", "all")
+  .option("-s, --source <source>", "数据源: cc / codex / gemini / kimi / memory / ledgers / desktop / minis / all", "all")
   .option("-l, --limit <n>", "限制处理文件数（调试用）")
   .option("-v, --verbose", "详细输出")
   .option("--no-dedup", "跳过向量去重")
@@ -1778,38 +1778,42 @@ program
         }
       }
 
-      // 会话账本（ledgers/YYYY-MM/<sid8>.md）：记忆文件对账只认顶层 *.md，账本走自己的源与 scope memory:ledger。
-      // 只在 sources.ledgers.path 显式配置时跑（P1 ①，2026-10-23）
-      const ledgerSource = config.sources.ledgers;
-      if (ledgerSource && ledgerSource.path !== "auto") {
-        const ledgerDir = resolveSourcePath(ledgerSource.path, "ledgers");
-        const paths = checkReconcilePaths(config);
-        if (!paths.ok) {
-          console.log(`  ⚠️ Ledgers: 对账没有执行——${paths.reason}`);
+    }
+
+    // 会话账本（ledgers/YYYY-MM/<sid8>.md）：记忆文件对账只认顶层 *.md，账本走自己的源与 scope memory:ledger。
+    // 只在 sources.ledgers.path 显式配置时跑（P1 ①，2026-10-23）；`--source ledgers` 可单跑（P1 互审 R1 Kimi #7）
+    const ledgerSource = config.sources.ledgers;
+    if (plan.ledgers && (!ledgerSource || ledgerSource.path === "auto")) {
+      // 只在点名 --source ledgers 时说一声；--source all 而没配账本是常态，不打扰
+      if (source === "ledgers") console.log("  ⚠️ Ledgers: 没有显式配置 sources.ledgers.path，账本对账没有执行");
+    } else if (plan.ledgers && ledgerSource) {
+      const ledgerDir = resolveSourcePath(ledgerSource.path, "ledgers");
+      const paths = checkReconcilePaths(config);
+      if (!paths.ok) {
+        console.log(`  ⚠️ Ledgers: 对账没有执行——${paths.reason}`);
+        memoryReconcileAlert = true;
+      } else if (!existsSync(ledgerDir)) {
+        console.log(`  ℹ️  Ledgers: 账本目录还不存在（${ledgerDir}），跳过`);
+      } else {
+        try {
+          const outcome = await reconcileMemoryDocuments({
+            store,
+            embedder,
+            llm: effectiveLlm,
+            auditLogger: createAuditLogger(),
+            memDir: ledgerDir,
+            dataDir: paths.dataDir,
+            explicitPath: true,
+            apply: true,
+            source: LEDGER_DOC_SOURCE,
+          });
+          results.push({ ...reconcileToIngestResult(outcome), source: "ledgers" });
+          console.log(`  ✅ Ledgers: ${formatReconcileSummary(outcome)}`);
+          if (outcome.journalPath) console.log(`     对账日志: ${outcome.journalPath}`);
+          if (outcome.alert) memoryReconcileAlert = true;
+        } catch (err) {
+          console.log(`  ❌ Ledgers: 对账出错——${err instanceof Error ? err.message : String(err)}`);
           memoryReconcileAlert = true;
-        } else if (!existsSync(ledgerDir)) {
-          console.log(`  ℹ️  Ledgers: 账本目录还不存在（${ledgerDir}），跳过`);
-        } else {
-          try {
-            const outcome = await reconcileMemoryDocuments({
-              store,
-              embedder,
-              llm: effectiveLlm,
-              auditLogger: createAuditLogger(),
-              memDir: ledgerDir,
-              dataDir: paths.dataDir,
-              explicitPath: true,
-              apply: true,
-              source: LEDGER_DOC_SOURCE,
-            });
-            results.push({ ...reconcileToIngestResult(outcome), source: "ledgers" });
-            console.log(`  ✅ Ledgers: ${formatReconcileSummary(outcome)}`);
-            if (outcome.journalPath) console.log(`     对账日志: ${outcome.journalPath}`);
-            if (outcome.alert) memoryReconcileAlert = true;
-          } catch (err) {
-            console.log(`  ❌ Ledgers: 对账出错——${err instanceof Error ? err.message : String(err)}`);
-            memoryReconcileAlert = true;
-          }
         }
       }
     }
@@ -1871,7 +1875,7 @@ program
     );
     console.log();
     if (memoryReconcileAlert) {
-      console.log("⚠️ 记忆对账需要人看（见上面 Memory: 行），以退出码 3 结束");
+      console.log("⚠️ 记忆 / 账本对账需要人看（见上面 Memory: / Ledgers: 行），以退出码 3 结束");
       process.exitCode = 3;
     }
   });
@@ -3033,6 +3037,11 @@ sessionsCmd
   .option("--trigger <name>", "frontmatter 的 trigger：manual-收工 | precompact", "manual-收工")
   .option("--roots <spec>", "到哪找转录：local（默认，找不到再找 truth）| truth | source=dir,...")
   .action(async (options) => {
+    if (options.trigger !== "manual-收工" && options.trigger !== "precompact") {
+      console.error(`❌ --trigger 只认 manual-收工 或 precompact，收到 ${String(options.trigger)}`);
+      process.exitCode = 2;
+      return;
+    }
     const { writeSessionLedgerNow } = await import("./sessions-sweep-run.js");
     const { discoverTranscripts, truthRoots } = await import("./sessions-sweep.js");
     const config = loadConfig();
@@ -3172,6 +3181,8 @@ sessionsCmd
       const outcome = await withLock("sessions-sweep", () => runSweep(runOpts), { onBusy: "skip", expireMs: 2 * 3_600_000 });
       if (!outcome.ran) {
         console.log("上一轮扫描还在跑（锁 sessions-sweep 被占），本轮跳过");
+        const { touchHeartbeatBusy } = await import("./sessions-sweep-run.js");
+        touchHeartbeatBusy(join(dataDir, SWEEP_HEARTBEAT_FILE)); // 长跑期间 doctor 看 busyAt，不误判扫描死了
         process.exitCode = 5; // 包装脚本：既不算失败、也不清零失败计数
         return;
       }

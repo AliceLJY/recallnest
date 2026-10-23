@@ -103,6 +103,19 @@ export interface SweepHeartbeat {
    */
   llmFailStreak: number;
   lastLlmFailureAt: string | null;
+  /** 这轮有没有配 LLM（没配时账本只有机器抽取的两节，doctor 要报黄，P1 互审 R1 Kimi #6） */
+  llmConfigured: boolean;
+  /** 上一轮还在跑、本轮因锁跳过的时刻（长跑期间 doctor 不该判死，Kimi #6） */
+  busyAt?: string | null;
+}
+
+/** 锁被占、本轮跳过：在心跳上记一笔 busyAt（不改其余字段） */
+export function touchHeartbeatBusy(path: string, nowIso = new Date().toISOString()): void {
+  const prev = readHeartbeat(path);
+  if (!prev) return;
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, `${JSON.stringify({ ...prev, busyAt: nowIso })}\n`);
+  renameSync(tmp, path);
 }
 
 /** 由上一份心跳与本轮结果算出新的失败连击 */
@@ -181,11 +194,16 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
       keepAgentUpto = decision.lastMessageAt ?? decision.doc.endedAt ?? null;
       decision = { ...decision, action: "up-to-date", reason: "收工账本之后没有新的用户发言，保留当场写的账本" };
     }
+    // 上次 LLM 失败、退避还没到：这轮不再调（P1 互审 R1 Kimi #1）
+    if ((decision.action === "ledger" || decision.action === "ledger+candidates" || decision.action === "candidates") && state.llmRetryAt && nowMs < Date.parse(state.llmRetryAt)) {
+      decision = { ...decision, action: "up-to-date", reason: `LLM 上次失败，${state.llmRetryAt} 之后重试` };
+    }
     // 候选关着时：「ledger+candidates」降成只写账本（候选记已处理，不再到期）；只剩候选到期的「candidates」不重生成
     if (!candidatesOn && decision.action === "candidates") decision = { ...decision, reason: `${decision.reason}（候选关闭，只记已处理）` };
     actions[decision.action] = (actions[decision.action] ?? 0) + 1;
     const needsLedger = decision.action === "ledger" || decision.action === "ledger+candidates" || (decision.action === "candidates" && candidatesOn);
     let ledgerPath: string | undefined;
+    let llmFailedThisPass = false;
     let usageNote: Record<string, unknown> = {};
     if (needsLedger && decision.doc && !opts.dryRun) {
       if (opts.llm && opts.llmDelayMs && result.llmCalls > 0) await new Promise((r) => setTimeout(r, opts.llmDelayMs));
@@ -204,12 +222,16 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
         usageNote = { generator: render.generator, tokens: render.usage ? [render.usage.promptTokens, render.usage.completionTokens] : null, wallMs: render.usage?.wallMs ?? null, failure: render.failure ? redactSecrets(render.failure).text.slice(0, 300) : undefined, candidates: includeCandidates, experience: render.body?.experience.length ?? 0, anchorsUnverified: render.body?.experience.filter((x) => !x.anchorVerified).length ?? 0 };
       }
       const target = targetPath ?? join(ledgerRoot, ledgerRelPath(decision.doc.sessionId, decision.lastMessageAt ?? decision.doc.endedAt ?? new Date(nowMs).toISOString()));
+      llmFailedThisPass = !!opts.llm && render.generator === "llm-failed";
       // 等 LLM 的这段时间里收工命令可能已经写了当场账本：提交前再看一眼，盖住就放弃这次生成（P1 互审 R1 Codex #2）
       if (agentLedgerCovers(target, decision.doc)) {
         keepAgentUpto = decision.lastMessageAt ?? decision.doc.endedAt ?? null;
+        llmFailedThisPass = false;
         actions[decision.action] = (actions[decision.action] ?? 1) - 1;
         actions["up-to-date"] = (actions["up-to-date"] ?? 0) + 1;
         decision = { ...decision, action: "up-to-date", reason: "生成期间收工账本已写入，放弃本次生成" };
+      } else if (llmFailedThisPass && existsSync(target)) {
+        // LLM 失败：已有账本不拿残版盖（之后按退避重试）；还没有账本时才写机器抽取版，报错签名照样进索引
       } else {
         ledgerPath = target;
         mkdirSync(dirname(ledgerPath), { recursive: true });
@@ -228,7 +250,17 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
       if (counts) for (const [k, v] of Object.entries(counts)) (result.recallOutcomes ??= {})[k] = ((result.recallOutcomes ?? {})[k] ?? 0) + (v ?? 0);
     }
     if (!opts.dryRun) {
-      const next = applyDecision(state, file, decision, nowMs, policy, ledgerPath);
+      // LLM 失败：游标不推进（processedUpto / pass / 候选状态都留在原处），记退避——下一次在 30 分钟 × 2^(n-1)、封顶 6 小时后
+      const next = llmFailedThisPass
+        ? { ...state, path: file.path, lastSweepAt: new Date(nowMs).toISOString(), lastAction: decision.action, notIdleSince: null, ...(ledgerPath ? { ledgerPath } : {}) }
+        : applyDecision(state, file, decision, nowMs, policy, ledgerPath);
+      if (llmFailedThisPass) {
+        next.llmFailCount = (state.llmFailCount ?? 0) + 1;
+        next.llmRetryAt = new Date(nowMs + Math.min(30 * 60_000 * 2 ** (next.llmFailCount - 1), 6 * 3_600_000)).toISOString();
+      } else if (needsLedger && (decision.action === "ledger" || decision.action === "ledger+candidates" || decision.action === "candidates")) {
+        next.llmRetryAt = null;
+        next.llmFailCount = 0;
+      }
       if (keepAgentUpto) {
         next.processedUpto = keepAgentUpto;
         next.candidateDone = true;
@@ -245,7 +277,7 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
   result.wallMs = Math.round(performance.now() - t0);
   if (opts.heartbeatPath && !opts.dryRun) {
     const at = new Date().toISOString();
-    const hb: SweepHeartbeat = { at, wallMs: result.wallMs, discovered: result.discovered, actions: result.actions, ledgersWritten: result.ledgersWritten.length, llmCalls: result.llmCalls, llmFailures: result.llmFailures, ...nextLlmFailState(readHeartbeat(opts.heartbeatPath), result, at) };
+    const hb: SweepHeartbeat = { at, wallMs: result.wallMs, discovered: result.discovered, actions: result.actions, ledgersWritten: result.ledgersWritten.length, llmCalls: result.llmCalls, llmFailures: result.llmFailures, ...nextLlmFailState(readHeartbeat(opts.heartbeatPath), result, at), llmConfigured: !!opts.llm, busyAt: null };
     result.heartbeat = hb;
     mkdirSync(dirname(opts.heartbeatPath), { recursive: true });
     const tmp = `${opts.heartbeatPath}.tmp-${process.pid}`;

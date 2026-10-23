@@ -143,6 +143,12 @@ export interface SessionState {
   skipReason?: string;
   /** 上一轮写出的账本文件（影子模式下是样例路径） */
   ledgerPath?: string;
+  /**
+   * 上一次生成账本时 LLM 失败（P1 互审 R1 Kimi #1）：游标没推进，到这个时刻之后重试；连续失败次数决定退避长度。
+   * 有它在时 mtime 没变也要重新判（否则 processedUpto 已有的会话永远 up-to-date、残版账本不再补）。
+   */
+  llmRetryAt?: string | null;
+  llmFailCount?: number;
 }
 
 export type SweepAction =
@@ -240,7 +246,7 @@ export function decide(
   const starving = !!state.notIdleSince && nowMs - Date.parse(state.notIdleSince) >= policy.candidateAfterMinutes * 60_000;
   if (!candidateDue && !starving && nowMs - file.mtimeMs < idleMs) return { action: "not-idle", reason: `mtime ${Math.round((nowMs - file.mtimeMs) / 60_000)}min ago < ${policy.idleMinutes}` };
   const mtimeUnchanged = state.lastMtimeMs !== null && state.lastMtimeMs === file.mtimeMs;
-  if (mtimeUnchanged && !candidateDue) {
+  if (mtimeUnchanged && !candidateDue && !state.llmRetryAt) {
     if (state.processedUpto) return { action: "up-to-date", reason: "mtime unchanged, candidates done or not due" };
     if (state.skipReason) return { action: "unchanged", reason: `still ${state.skipReason}` };
   }

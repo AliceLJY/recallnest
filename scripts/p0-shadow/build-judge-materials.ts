@@ -14,7 +14,7 @@ const replayDir = process.argv[2];
 const outDir = process.argv[3];
 const CAND_N = Number(process.argv[4] ?? 40);
 if (!replayDir || !outDir) throw new Error("usage: build-judge-materials.ts <replayDir> <outDir> [candN]");
-const index = JSON.parse(readFileSync(join(replayDir, "replay-index.json"), "utf-8")) as { picks: Array<{ group: string; source: string; sessionId: string; sid8: string; endedAt: string | null }> };
+const index = JSON.parse(readFileSync(join(replayDir, "replay-index.json"), "utf-8")) as { maskRestatement?: boolean; picks: Array<{ group: string; source: string; sessionId: string; sid8: string; endedAt: string | null }> };
 const disc = discoverTranscripts(truthRoots(), { sinceMs: Date.now() - 40 * 86_400_000 });
 const byId = new Map(disc.files.map((f) => [f.sessionId, f]));
 const red = (s: string) => redactSecrets(s).text;
@@ -78,7 +78,8 @@ for (const p of silentPicks) {
   const f = byId.get(p.sessionId); const md = ledgerFor(p);
   if (!f || !md) continue;
   const doc = parseSessionFile(f.path, { source: f.source });
-  const t = renderTranscriptForLLM(doc, { maxChars: 9_000, assistantClip: 260, errorClip: 160, maskMemoryWrites: true });
+  // 判官看的转录和账本作者看的一样遮（遮复述的实验组也遮），否则判官比作者多看一段（P1 互审 R1 Kimi #8）
+  const t = renderTranscriptForLLM(doc, { maxChars: 9_000, assistantClip: 260, errorClip: 160, maskMemoryWrites: true, maskRestatement: !!index.maskRestatement });
   silent.push({ n: 0, sid8: p.sid8, ledger: red(ledgerBodyOnly(md)), transcript: red(t.text) });
 }
 silent.sort((a, b) => h(a.sid8) - h(b.sid8)).forEach((x, i) => (x.n = i + 1));
