@@ -1,11 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { checkSessionsSweep } from "../doctor.js";
 import type { LLMClient } from "../llm-client.js";
-import { nextLlmFailState, policyFor, readHeartbeat, runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE, SWEEP_STALE_MS, touchHeartbeatBusy, writeSessionLedgerNow } from "../sessions-sweep-run.js";
+import { commitLedger, LEDGER_COMMIT_LOCK_PREFIX, ledgerTargetPath, markHeartbeatRunning, nextLlmFailState, policyFor, readHeartbeat, runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE, SWEEP_STALE_MS, SWEEP_STUCK_MS, touchHeartbeatBusy, writeSessionLedgerNow } from "../sessions-sweep-run.js";
+import { acquireLock, lockPathForKey, releaseLock } from "../distill-lock.js";
+import type { SessionDoc } from "../session-events.js";
 import { appendFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { discoverTranscripts, SessionStateStore } from "../sessions-sweep.js";
@@ -392,5 +394,227 @@ describe("doctor：会话扫描验活", () => {
     // 本轮空轮（0 次调用）但之前的故障没恢复：仍黄
     write(NOW - 2 * MIN, { llmCalls: 0, llmFailures: 0, llmFailStreak: 2 });
     expect(checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: hbPath, nowMs: NOW })?.status).toBe("warn");
+  });
+});
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const holdCommitLock = (sid: string, lockDir: string) => {
+  const cfg = { lockPath: lockPathForKey(`${LEDGER_COMMIT_LOCK_PREFIX}${sid}`, lockDir), expireMs: 60_000 };
+  expect(acquireLock(cfg)).toBe(true);
+  return () => releaseLock(cfg);
+};
+const agentBodyR3 = { oneLine: "收工当场写", solved: ["当场写的"], decisions: [], experience: [], unfinished: [] };
+
+describe("账本提交锁：扫描器与收工命令都在同一把会话锁里「重读 → 判断 → 改名」（R3 Codex C2/K4、NEW-1）", () => {
+  it("扫描器生成完要等提交锁；持锁方在锁里写下当场账本，扫描器拿到锁后复查发现、不盖", async () => {
+    const e = env();
+    const lockDir = join(e.root, "locks");
+    const sid = "aeae1111-0000-4000-8000-000000000111";
+    writeCC(e.cc, sid, 90);
+    const file = discoverTranscripts([{ source: "cc", dir: e.cc }]).files[0];
+    const release = holdCommitLock(sid, lockDir);
+    let llmDone = false;
+    const inner = fakeLLM();
+    const llm = { chatLongDetailed: async (...a: unknown[]) => { const r = await (inner.llm.chatLongDetailed as (...x: unknown[]) => Promise<unknown>)(...a); llmDone = true; return r; } } as unknown as LLMClient;
+    const p = runSweep({ roots: [{ source: "cc", dir: e.cc }], ledgerDir: e.ledgerDir, stateDir: e.stateDir, llm, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false, nowMs: NOW, lockDir });
+    while (!llmDone) await sleep(5);
+    await sleep(200);
+    const target = join(e.ledgerDir, "2026-10", "aeae1111.md");
+    // LLM 早就返回了，提交还在等锁
+    expect(existsSync(target)).toBe(false);
+    // 持锁方（另一个进程里的收工命令）在锁里写下当场账本：这里用另一把锁目录模拟「它已经在临界区里」
+    const manual = await writeSessionLedgerNow({ file, ledgerDir: e.ledgerDir, stateDir: join(e.root, "cli-state"), trigger: "manual-收工", body: agentBodyR3, nowMs: NOW, lockDir: join(e.root, "other-locks") });
+    expect(manual.path).toBe(target);
+    const md = readFileSync(target, "utf-8");
+    release();
+    const res = await p;
+    expect(res.ledgersWritten).toEqual([]);
+    expect(res.actions["up-to-date"]).toBe(1);
+    expect(readFileSync(target, "utf-8")).toBe(md);
+  });
+
+  it("收工命令带正文的那份也要等提交锁（无条件写，但不插进扫描器的复查与改名之间）", async () => {
+    const e = env();
+    const lockDir = join(e.root, "locks");
+    const sid = "aeae2222-0000-4000-8000-000000000222";
+    writeCC(e.cc, sid, 5);
+    const file = discoverTranscripts([{ source: "cc", dir: e.cc }]).files[0];
+    const release = holdCommitLock(sid, lockDir);
+    let settled = false;
+    const p = writeSessionLedgerNow({ file, ledgerDir: e.ledgerDir, stateDir: e.stateDir, trigger: "manual-收工", body: agentBodyR3, nowMs: NOW, lockDir }).then((r) => { settled = true; return r; });
+    await sleep(200);
+    expect(settled).toBe(false);
+    expect(existsSync(join(e.ledgerDir, "2026-10", "aeae2222.md"))).toBe(false);
+    release();
+    const r = await p;
+    expect(r.written).toBe(true);
+    expect(readFileSync(r.path, "utf-8")).toContain("generator: agent");
+  });
+
+  it("收工命令没给正文、等 LLM 期间另一次带正文的收工写进来：LLM 版不盖它（R3 Codex NEW-1）", async () => {
+    const e = env();
+    const lockDir = join(e.root, "locks");
+    writeCC(e.cc, "aeae3333-0000-4000-8000-000000000333", 5);
+    const file = discoverTranscripts([{ source: "cc", dir: e.cc }]).files[0];
+    const inner = fakeLLM();
+    const racing = {
+      chatLongDetailed: async (...a: unknown[]) => {
+        await writeSessionLedgerNow({ file, ledgerDir: e.ledgerDir, stateDir: e.stateDir, trigger: "manual-收工", body: agentBodyR3, nowMs: NOW, lockDir });
+        return (inner.llm.chatLongDetailed as (...x: unknown[]) => Promise<unknown>)(...a);
+      },
+    } as unknown as LLMClient;
+    const r = await writeSessionLedgerNow({ file, ledgerDir: e.ledgerDir, stateDir: e.stateDir, trigger: "manual-收工", llm: racing, nowMs: NOW, lockDir });
+    expect(r.written).toBe(false);
+    expect(r.skipped).toBe("agent-ledger");
+    const md = readFileSync(r.path, "utf-8");
+    expect(md).toContain("generator: agent");
+    expect(md).toContain("# 收工当场写");
+  });
+
+  it("没给正文、当场账本还管着这场：不调 LLM、不动账本", async () => {
+    const e = env();
+    writeCC(e.cc, "aeae4444-0000-4000-8000-000000000444", 5);
+    const file = discoverTranscripts([{ source: "cc", dir: e.cc }]).files[0];
+    const first = await writeSessionLedgerNow({ file, ledgerDir: e.ledgerDir, stateDir: e.stateDir, trigger: "manual-收工", body: agentBodyR3, nowMs: NOW });
+    const md = readFileSync(first.path, "utf-8");
+    const { llm, calls } = fakeLLM();
+    const r = await writeSessionLedgerNow({ file, ledgerDir: e.ledgerDir, stateDir: e.stateDir, trigger: "manual-收工", llm, nowMs: NOW + MIN });
+    expect(r).toMatchObject({ written: false, skipped: "agent-ledger", path: first.path });
+    expect(calls()).toBe(0);
+    expect(readFileSync(first.path, "utf-8")).toBe(md);
+  });
+
+  it("提交锁等不到：扫描器这一轮不写、游标不推进、不记退避，下一轮照常写", async () => {
+    const e = env();
+    const lockDir = join(e.root, "locks");
+    const sid = "aeae5555-0000-4000-8000-000000000555";
+    writeCC(e.cc, sid, 90);
+    const { llm } = fakeLLM();
+    const base = { roots: [{ source: "cc" as const, dir: e.cc }], ledgerDir: e.ledgerDir, stateDir: e.stateDir, llm, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false, lockDir, commitWaitMs: 100 };
+    const release = holdCommitLock(sid, lockDir);
+    const a = await runSweep({ ...base, nowMs: NOW });
+    release();
+    expect(a.ledgersWritten).toEqual([]);
+    const key = readdirSync(e.stateDir)[0].replace(/\.json$/, "");
+    const st = new SessionStateStore(e.stateDir).load(key)!;
+    expect(st.processedUpto).toBeNull();
+    expect(st.pass).toBe(0);
+    expect(st.llmRetryAt ?? null).toBeNull();
+    const b = await runSweep({ ...base, nowMs: NOW + 10 * MIN });
+    expect(b.ledgersWritten).toEqual([join(e.ledgerDir, "2026-10", "aeae5555.md")]);
+  });
+
+  it("commitLedger：fallback 模式已有账本就不写；agent 模式无条件写", async () => {
+    const e = env();
+    const lockDir = join(e.root, "locks");
+    const doc = { sessionId: "aeae6666-0000-4000-8000-000000000666", startedAt: "2026-10-23T10:00:00.000Z", endedAt: "2026-10-23T11:00:00.000Z", events: [] } as unknown as SessionDoc;
+    const w1 = await commitLedger({ ledgerRoot: e.ledgerDir, doc, markdown: "v1\n", mode: "fallback", lockDir });
+    expect(w1.written).toBe(true);
+    const w2 = await commitLedger({ ledgerRoot: e.ledgerDir, doc, markdown: "v2\n", mode: "fallback", lockDir });
+    expect(w2).toMatchObject({ written: false, reason: "exists" });
+    expect(readFileSync(w1.path, "utf-8")).toBe("v1\n");
+    const w3 = await commitLedger({ ledgerRoot: e.ledgerDir, doc, markdown: "v3\n", mode: "agent", lockDir });
+    expect(w3.written).toBe(true);
+    expect(readFileSync(w1.path, "utf-8")).toBe("v3\n");
+    expect(readdirSync(dirname(w1.path))).toEqual(["aeae6666.md"]);
+  });
+});
+
+describe("跨三个月份、本机没有游标：找得到中间那个月的账本（R3 Codex C3 / K5）", () => {
+  const sid = "afaf1111-0000-4000-8000-000000000111";
+  const head = (session: string) => `---\nsession: ${session}\ngenerator: llm\ncovered_upto: "2026-10-15T00:00:00.000Z"\n---\n\n# x\n`;
+  it("ledgerTargetPath：开始月、结束月都没有，扫到 10 月那份（核 session 对得上才算）", () => {
+    const e = env();
+    const doc = { sessionId: sid, startedAt: "2026-09-30T23:00:00.000Z", endedAt: "2026-11-01T01:00:00.000Z", events: [] } as unknown as SessionDoc;
+    mkdirSync(join(e.ledgerDir, "2026-10"), { recursive: true });
+    // 同一个 sid8、别的会话：不算
+    writeFileSync(join(e.ledgerDir, "2026-10", "afaf1111.md"), head("afaf1111-ffff-4000-8000-000000000999"));
+    expect(ledgerTargetPath(e.ledgerDir, doc)).toBe(join(e.ledgerDir, "2026-11", "afaf1111.md"));
+    writeFileSync(join(e.ledgerDir, "2026-10", "afaf1111.md"), head(sid));
+    expect(ledgerTargetPath(e.ledgerDir, doc)).toBe(join(e.ledgerDir, "2026-10", "afaf1111.md"));
+  });
+
+  it("runSweep：另一台机在 10 月写过账本，本机没游标、会话 11 月续聊 → 写回 10 月那份，不另起 11 月", async () => {
+    const e = env();
+    const line = (at: string, role: "user" | "assistant", text: string) => `${JSON.stringify(role === "user"
+      ? { type: "user", sessionId: sid, timestamp: at, message: { role: "user", content: text } }
+      : { type: "assistant", sessionId: sid, timestamp: at, message: { role: "assistant", content: [{ type: "text", text }] } })}\n`;
+    const path = join(e.cc, "-Users-x", `${sid}.jsonl`);
+    mkdirSync(join(e.cc, "-Users-x"), { recursive: true });
+    appendFileSync(path, line("2026-09-30T23:50:00.000Z", "user", "九月底开的头"));
+    for (let i = 0; i < 4; i++) {
+      appendFileSync(path, line(`2026-10-15T10:0${i}:00.000Z`, "user", `十月问 ${i}`));
+      appendFileSync(path, line(`2026-10-15T10:0${i}:30.000Z`, "assistant", `十月答 ${i}`));
+    }
+    utimesSync(path, new Date("2026-10-15T10:04:00.000Z"), new Date("2026-10-15T10:04:00.000Z"));
+    const { llm } = fakeLLM();
+    const base = { roots: [{ source: "cc" as const, dir: e.cc }], ledgerDir: e.ledgerDir, llm, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false, sinceDays: 0 };
+    const a = await runSweep({ ...base, stateDir: join(e.root, "machine-a"), nowMs: Date.parse("2026-10-15T13:00:00.000Z") });
+    expect(a.ledgersWritten).toEqual([join(e.ledgerDir, "2026-10", "afaf1111.md")]);
+    appendFileSync(path, line("2026-11-01T00:30:00.000Z", "user", "十一月接着问"));
+    appendFileSync(path, line("2026-11-01T00:31:00.000Z", "assistant", "接着答"));
+    utimesSync(path, new Date("2026-11-01T00:31:00.000Z"), new Date("2026-11-01T00:31:00.000Z"));
+    const b = await runSweep({ ...base, stateDir: join(e.root, "machine-b"), nowMs: Date.parse("2026-11-01T03:00:00.000Z") });
+    expect(b.ledgersWritten).toEqual([join(e.ledgerDir, "2026-10", "afaf1111.md")]);
+    expect(existsSync(join(e.ledgerDir, "2026-11"))).toBe(false);
+    expect(existsSync(join(e.ledgerDir, "2026-09"))).toBe(false);
+  });
+});
+
+describe("一轮开始就写「在跑」心跳，doctor 不在长跑时假红（R3 Codex K6）", () => {
+  it("runSweep 开头记 runningSince 与本进程 pid，跑完清掉、开始轮数归零", async () => {
+    const e = env();
+    writeCC(e.cc, "agag1111-0000-4000-8000-000000000111", 90);
+    let seen: ReturnType<typeof readHeartbeat> = null;
+    const inner = fakeLLM();
+    const llm = { chatLongDetailed: async (...a: unknown[]) => { seen = readHeartbeat(e.heartbeatPath); return (inner.llm.chatLongDetailed as (...x: unknown[]) => Promise<unknown>)(...a); } } as unknown as LLMClient;
+    const r = await runSweep({ roots: [{ source: "cc", dir: e.cc }], ledgerDir: e.ledgerDir, stateDir: e.stateDir, heartbeatPath: e.heartbeatPath, llm, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false, nowMs: NOW });
+    const during = seen as ReturnType<typeof readHeartbeat>;
+    expect(during?.runningSince).toBeTruthy();
+    expect(during?.runningPid).toBe(process.pid);
+    expect(during?.startsSinceDone).toBe(1);
+    expect(during?.at).toBe("");
+    // 在跑的那一刻 doctor：第一轮还在跑 → 绿
+    expect(r.heartbeat?.runningSince).toBeNull();
+    expect(r.heartbeat?.startsSinceDone).toBe(0);
+    expect(readHeartbeat(e.heartbeatPath)?.runningSince).toBeNull();
+  });
+
+  describe("doctor 判活", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rn-sweep-doctor-run-"));
+    const hbPath = join(dir, "hb.json");
+    const write = (extra: Record<string, unknown>) => writeFileSync(hbPath, JSON.stringify({ at: new Date(NOW - 40 * MIN).toISOString(), wallMs: 10, discovered: 3, actions: {}, ledgersWritten: 1, llmCalls: 2, llmFailures: 0, llmFailStreak: 0, lastLlmFailureAt: null, llmConfigured: true, ...extra }));
+    const check = (alive: boolean) => checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: hbPath, nowMs: NOW, isPidAlive: () => alive });
+    it("这一轮 30 分钟前开始、还在跑（上次完成在 40 分钟前）：绿", () => {
+      write({ runningSince: new Date(NOW - 30 * MIN).toISOString(), runningPid: 4242, startsSinceDone: 1 });
+      expect(check(true)?.status).toBe("pass");
+      expect(check(true)?.message).toContain("还在跑");
+    });
+    it("跑了超过 2 小时：红", () => {
+      write({ at: new Date(NOW - 200 * MIN).toISOString(), runningSince: new Date(NOW - SWEEP_STUCK_MS - MIN).toISOString(), runningPid: 4242, startsSinceDone: 1 });
+      expect(check(true)?.status).toBe("fail");
+    });
+    it("连续 3 轮开始了都没跑完（含正在跑的）：红", () => {
+      write({ runningSince: new Date(NOW - 5 * MIN).toISOString(), runningPid: 4242, startsSinceDone: 3 });
+      expect(check(true)?.status).toBe("fail");
+      write({ runningSince: new Date(NOW - 5 * MIN).toISOString(), runningPid: 4242, startsSinceDone: 2 });
+      expect(check(true)?.status).toBe("pass");
+    });
+    it("写 runningSince 的进程已经不在：不算在跑，按上次完成判旧", () => {
+      write({ runningSince: new Date(NOW - 30 * MIN).toISOString(), runningPid: 4242, startsSinceDone: 1 });
+      const r = check(false);
+      expect(r?.status).toBe("fail");
+      expect(r?.message).toContain("没跑完就退出了");
+      write({ at: new Date(NOW - 5 * MIN).toISOString(), runningSince: new Date(NOW - 30 * MIN).toISOString(), runningPid: 4242, startsSinceDone: 1 });
+      expect(check(false)?.status).toBe("pass");
+    });
+    it("第一轮还在跑（没有完成过）：绿；第一轮的进程没了：红", () => {
+      const first = join(dir, "first.json");
+      markHeartbeatRunning(first, { nowIso: new Date(NOW - 10 * MIN).toISOString(), pid: 4242, llmConfigured: true });
+      expect(readHeartbeat(first)?.at).toBe("");
+      const checkFirst = (alive: boolean) => checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: first, nowMs: NOW, isPidAlive: () => alive });
+      expect(checkFirst(true)?.status).toBe("pass");
+      expect(checkFirst(false)?.status).toBe("fail");
+    });
   });
 });

@@ -57,6 +57,7 @@ import { isTranscriptScope } from "./memory-boundaries.js";
 import { maybeRunGc } from "./auto-gc.js";
 import {
   formatReconcileSummary,
+  MEMORY_DOC_SOURCE,
   reconcileMemoryDocuments,
   undoMemoryReconcile,
   type ReconcileOutcome,
@@ -1989,7 +1990,7 @@ program
   .description("记忆文件对账：让 memory 源的文档切片与现行记忆文件一一对应（默认只看计划，不写库）")
   .option("--apply", "执行：插入 → 恢复 → 下架")
   .option("--max-retire <n>", "本次下架上限（默认 max(300, 活跃文档切片数的 25%)，也可用 RECALLNEST_MEMORY_RECONCILE_MAX_RETIRE）")
-  .option("--undo <journal>", "按对账日志（data/reconcile-journals/*.jsonl）逐条撤销；ledger-reconcile-*.jsonl 自动按账本源撤")
+  .option("--undo <journal>", "按对账日志（data/reconcile-journals/*.jsonl）逐条撤销；按日志第一行写的源撤（旧日志看文件名），--ledgers 显式指定账本源")
   .option("--ledgers", "对会话账本目录（sources.ledgers.path，scope memory:ledger）而不是记忆文件目录")
   .option("--json", "以 JSON 输出计划与结果")
   .action(async (options) => {
@@ -2008,16 +2009,19 @@ program
       const journalPath = resolve(String(options.undo));
       let r: Awaited<ReturnType<typeof undoMemoryReconcile>>;
       try {
-        // 日志文件名带源名（memory-reconcile-* / ledger-reconcile-*）：按它选 scope 与锁，不靠人记得加 --ledgers
-        const undoSource = basename(journalPath).startsWith(`${LEDGER_DOC_SOURCE.name}-`) ? LEDGER_DOC_SOURCE : undefined;
-        r = await undoMemoryReconcile({ store, auditLogger: createAuditLogger() }, journalPath, { auditPath: join(paths.dataDir, "audit.jsonl"), source: undoSource });
+        // 按哪个源撤：--ledgers 显式优先，其次日志第一行写的源，再次文件名前缀（没有头的旧日志），都没有按记忆文件；
+        // 撤销只动 scope 对得上的行（P1 互审 R3 Codex NEW-4 / Kimi NEW-3）
+        r = await undoMemoryReconcile({ store, auditLogger: createAuditLogger() }, journalPath, { auditPath: join(paths.dataDir, "audit.jsonl"), source: options.ledgers ? LEDGER_DOC_SOURCE : undefined, knownSources: [MEMORY_DOC_SOURCE, LEDGER_DOC_SOURCE] });
       } catch (err) {
         console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
         process.exitCode = 2;
         return;
       }
       const ids8 = (ids: string[]) => `${ids.slice(0, 20).map((id) => id.slice(0, 8)).join(" ")}${ids.length > 20 ? ` …（共 ${ids.length}）` : ""}`;
-      console.log(`撤销完成：写回 ${r.restored} 条，本轮插入的 ${r.insertsRetired} 条改为下架，期间被改过而跳过 ${r.skippedConflict.length} 条，合并链依赖未满足而保留 ${r.skippedDependency.length} 条，文字已被 forget 而保留非活跃 ${r.skippedForgotten.length} 条`);
+      const viaLabel = { explicit: "--ledgers 指定", header: "日志头", filename: "日志文件名", default: "默认" }[r.sourceVia];
+      console.log(`按源 ${r.source} 撤销（${viaLabel}）`);
+      console.log(`撤销完成：写回 ${r.restored} 条，本轮插入的 ${r.insertsRetired} 条改为下架，期间被改过而跳过 ${r.skippedConflict.length} 条，合并链依赖未满足而保留 ${r.skippedDependency.length} 条，文字已被 forget 而保留非活跃 ${r.skippedForgotten.length} 条，不在这个源的 scope 里而没动 ${r.skippedWrongScope.length} 条`);
+      if (r.skippedWrongScope.length > 0) console.log(`  ⚠️ 不在 scope 里的 id（前 8 位，源多半选错了）: ${ids8(r.skippedWrongScope)}`);
       if (r.skippedConflict.length > 0) console.log(`  被改过而跳过的 id（前 8 位）: ${ids8(r.skippedConflict)}`);
       if (r.skippedDependency.length > 0) console.log(`  保留的合并链成员 id（它原来指向的那一行已不活跃、或本次撤销会把它撤掉，撤了会断链）: ${ids8(r.skippedDependency)}`);
       if (r.skippedForgotten.length > 0) console.log(`  文字已被 forget、没撤回活跃的 id: ${ids8(r.skippedForgotten)}`);
@@ -3091,6 +3095,10 @@ sessionsCmd
       body,
       llm,
     });
+    if (r.skipped === "agent-ledger") {
+      console.log(`✅ 这场已有当场写的账本、之后没有新的用户发言，没用 LLM 版去盖它：${r.path}`);
+      return;
+    }
     if (!r.written) {
       console.error(`❌ 没写账本（正文生成失败：${r.failure ?? r.generator}）；已有的账本与游标都没动，扫描器之后会补。要当场写就加 --body 给正文`);
       process.exitCode = 3;

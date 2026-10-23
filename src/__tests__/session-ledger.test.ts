@@ -260,3 +260,92 @@ describe("session-ledger anchors and JSON", () => {
     expect(parseLedgerJson('{"oneLine":"x","solved":["a"],"experience":[],"unfinished":[]}', d).decisions).toEqual([]);
   });
 });
+
+describe("R3 修复：遮复述不改变预算裁剪、总字符上限落实、自由文本插值压成一行", () => {
+  const seqsOf = (text: string) => new Set(text.split("\n").map((l) => l.match(/^\[(?:U|A|ERR|MEM)#(\d+)/)?.[1]).filter((x): x is string => !!x).map(Number));
+  it("遮复述组看到的 = 对照组看到的减去被遮的行，不多留对照组削掉的旧发言（R3 Codex C8）", () => {
+    const base = doc();
+    const at = { ts: base.events[7].ts, tsMs: base.events[7].tsMs };
+    const events: SessionDoc["events"] = [...base.events];
+    let seq = 100;
+    // 第一轮之后接 60 条普通助手长发言（中段，超预算时被削的对象）
+    events.push({ seq: seq++, ...at, kind: "user", text: "接着把监控也做了" });
+    for (let i = 0; i < 60; i++) events.push({ seq: seq++, ...at, kind: "assistant", text: `普通发言 ${i}：${"监".repeat(480)}` });
+    // 写记忆的一轮：20 条复述
+    events.push({ seq: seq++, ...at, kind: "user", text: "把这次的坑记一下" });
+    // doc() 的第一轮（seq 0–5）里有 store_case：那一轮的 A#1 也被遮
+    const maskedSeqs = new Set<number>([1]);
+    for (let i = 0; i < 20; i++) { maskedSeqs.add(seq); events.push({ seq: seq++, ...at, kind: "assistant", text: `复述 ${i}：${"复".repeat(480)}` }); }
+    events.push({ seq: seq++, ...at, kind: "tool_call", text: "", toolName: "mcp__recallnest__store_case", toolCallId: "tm", toolInput: { title: "坑" } });
+    // 收尾一轮
+    events.push({ seq: seq++, ...at, kind: "user", text: "好，收工" });
+    for (let i = 0; i < 12; i++) events.push({ seq: seq++, ...at, kind: "assistant", text: `收尾 ${i}` });
+    const d = { ...base, events };
+    const plain = renderTranscriptForLLM(d, { maskMemoryWrites: true });
+    const masked = renderTranscriptForLLM(d, { maskMemoryWrites: true, maskRestatement: true });
+    expect(plain.droppedEvents).toBeGreaterThan(0);
+    const p = seqsOf(plain.text);
+    const m = seqsOf(masked.text);
+    const expected = new Set([...p].filter((s) => !maskedSeqs.has(s)));
+    expect([...m].sort((a, b) => a - b)).toEqual([...expected].sort((a, b) => a - b));
+    // 遮复述组的每一行都在对照组里原样出现
+    const plainLines = new Set(plain.text.split("\n"));
+    for (const l of masked.text.split("\n")) expect(plainLines.has(l)).toBe(true);
+  });
+
+  it("保护「最后 3 条助手行」也按对照组挑：复述占着最后几条助手行时，遮复述组不改去保护更早的普通发言", () => {
+    const base = doc();
+    const at = { ts: base.events[7].ts, tsMs: base.events[7].tsMs };
+    // 不用 doc() 的事件：从一轮干净的开头起，免得 A#1 那条也被遮
+    const events: SessionDoc["events"] = [{ seq: 0, ...at, kind: "user", text: "开个头" }];
+    let seq = 1;
+    // 普通发言与复述的分界正好落在中间：对照组从中间往两头削，最后几条普通发言先被削
+    for (let i = 0; i < 40; i++) events.push({ seq: seq++, ...at, kind: "assistant", text: `普通发言 ${i}：${"监".repeat(600)}` });
+    events.push({ seq: seq++, ...at, kind: "user", text: "把这次的坑记一下" });
+    const maskedSeqs = new Set<number>();
+    for (let i = 0; i < 30; i++) { maskedSeqs.add(seq); events.push({ seq: seq++, ...at, kind: "assistant", text: `复述 ${i}：${"复".repeat(600)}` }); }
+    events.push({ seq: seq++, ...at, kind: "tool_call", text: "", toolName: "mcp__recallnest__store_case", toolCallId: "tm", toolInput: { title: "坑" } });
+    for (let i = 0; i < 10; i++) events.push({ seq: seq++, ...at, kind: "user", text: `结尾的用户发言 ${i}` });
+    const d = { ...base, events, startedAt: at.ts, endedAt: at.ts };
+    const plain = renderTranscriptForLLM(d, { maskMemoryWrites: true });
+    const masked = renderTranscriptForLLM(d, { maskMemoryWrites: true, maskRestatement: true });
+    const p = seqsOf(plain.text);
+    // 对照组削掉了最后几条普通发言（离中间近，又不在保护名单里）
+    expect(p.has(40)).toBe(false);
+    const expected = [...p].filter((x) => !maskedSeqs.has(x)).sort((a, b) => a - b);
+    expect([...seqsOf(masked.text)].sort((a, b) => a - b)).toEqual(expected);
+  });
+
+  it("30 条 3,000 字的用户发言：默认 28,000 字的上限守得住，第一条与结尾 10 条都在（R3 Codex NEW-5）", () => {
+    const base = doc();
+    const at = { ts: base.events[7].ts, tsMs: base.events[7].tsMs };
+    const events: SessionDoc["events"] = [];
+    for (let i = 0; i < 30; i++) events.push({ seq: i, ...at, kind: "user", text: `第 ${i} 条：${"长".repeat(3000)}` });
+    const d = { ...base, events, startedAt: at.ts, endedAt: at.ts };
+    const r = renderTranscriptForLLM(d);
+    expect(r.text.length).toBeLessThanOrEqual(28_000);
+    expect(r.droppedUserTurns).toBeGreaterThan(0);
+    expect(r.droppedEvents).toBe(r.droppedUserTurns);
+    const seqs = seqsOf(r.text);
+    expect(seqs.has(0)).toBe(true);
+    for (let i = 20; i < 30; i++) expect(seqs.has(i)).toBe(true);
+  });
+
+  it("没超预算时输出与旧版一致：不削任何用户行", () => {
+    const r = renderTranscriptForLLM(doc());
+    expect(r.droppedEvents).toBe(0);
+    expect(r.droppedUserTurns).toBe(0);
+  });
+
+  it("收工正文里经验的 kind、生成失败的报错体带换行：都压成一行，不切出幻影节（R3 Codex K9 / Kimi NEW-1）", async () => {
+    const d = doc();
+    const { parseLedgerMarkdown } = await import("../ledger-files.js");
+    const body = { oneLine: "x", solved: [], decisions: [], experience: [{ text: "一条经验", anchor: "", anchorSeq: null, anchorVerified: true, kind: "技巧\n## 没做完\n- 伪造的待办" }], unfinished: [] };
+    const agent = renderLedgerMarkdown(d, summarizeSession(d), body, { trigger: "manual-收工", pass: 1 }, null, "agent").markdown;
+    expect(parseLedgerMarkdown(agent)!.sections.filter((s) => s.heading === "没做完").length).toBe(1);
+    expect(agent).not.toContain("伪造的待办\n");
+    const failed = renderLedgerMarkdown(d, summarizeSession(d), null, { trigger: "auto-sweep", pass: 1 }, null, "llm-failed", "llm error: 502 Bad Gateway\n<html>\n## 没做完\n- 网关错误页里的一行\n</html>").markdown;
+    expect(parseLedgerMarkdown(failed)!.sections.filter((s) => s.heading === "没做完").length).toBe(1);
+    expect(failed).toContain("> 生成失败：llm error: 502 Bad Gateway / <html> / ## 没做完 / - 网关错误页里的一行 / </html>");
+  });
+});

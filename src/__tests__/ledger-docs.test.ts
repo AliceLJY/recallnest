@@ -19,6 +19,8 @@ import {
   guardStatePath,
   loadMemoryScopeRows,
   MEMORY_DOC_SCOPE,
+  MEMORY_DOC_SOURCE,
+  readJournalHeader,
   reconcileMemoryDocuments,
   rowState,
   undoMemoryReconcile,
@@ -290,6 +292,51 @@ describe("账本对账 真实 LanceDB", () => {
     const undo = await undoMemoryReconcile({ store, auditLogger: createAuditLogger(auditPath) }, r.journalPath!, { auditPath, source: LEDGER_DOC_SOURCE });
     expect(undo.skippedDependency).toContain(target.id);
     expect(rowState((await loadMemoryScopeRows(store, LEDGER_DOC_SCOPE)).find((x) => x.id === target.id)!.meta).status).toBe("active");
+  });
+
+  it("日志第一行写明源与 scope；日志改名之后撤销照样按账本源撤（R3 Codex NEW-4 / Kimi NEW-3）", async () => {
+    writeFileSync(join(ledgerDir, "2026-10", "aaaa0001.md"), ledgerMd({ session: "aaaa0001-x" }));
+    writeFileSync(join(ledgerDir, "2026-10", "bbbb0002.md"), ledgerMd({ session: "bbbb0002-x", solved: ["另一场会话做成的事"] }));
+    await run("ledger");
+    rmSync(join(ledgerDir, "2026-10", "bbbb0002.md"));
+    const r = await run("ledger");
+    expect(r.applied!.retired).toBe(2);
+    expect(readJournalHeader(r.journalPath!)).toEqual({ source: LEDGER_DOC_SOURCE.name, scope: LEDGER_DOC_SCOPE });
+    const renamed = join(dataDir, "拷出来的日志.jsonl");
+    writeFileSync(renamed, readFileSync(r.journalPath!));
+    const undo = await undoMemoryReconcile({ store, auditLogger: createAuditLogger(auditPath) }, renamed, { auditPath, knownSources: [MEMORY_DOC_SOURCE, LEDGER_DOC_SOURCE] });
+    expect(undo).toMatchObject({ source: LEDGER_DOC_SOURCE.name, sourceVia: "header", restored: 2, skippedWrongScope: [] });
+    expect((await activeRows(LEDGER_DOC_SCOPE)).length).toBe(4);
+  });
+
+  it("源选错（显式给了记忆文件源去撤账本日志）：账本行一条不动，记进 skippedWrongScope", async () => {
+    writeFileSync(join(ledgerDir, "2026-10", "aaaa0001.md"), ledgerMd({ session: "aaaa0001-x" }));
+    writeFileSync(join(ledgerDir, "2026-10", "bbbb0002.md"), ledgerMd({ session: "bbbb0002-x", solved: ["另一场会话做成的事"] }));
+    await run("ledger");
+    rmSync(join(ledgerDir, "2026-10", "bbbb0002.md"));
+    const r = await run("ledger");
+    const undo = await undoMemoryReconcile({ store, auditLogger: createAuditLogger(auditPath) }, r.journalPath!, { auditPath, source: MEMORY_DOC_SOURCE });
+    expect(undo.sourceVia).toBe("explicit");
+    expect(undo.restored).toBe(0);
+    expect(undo.skippedWrongScope.length).toBe(2);
+    expect((await activeRows(LEDGER_DOC_SCOPE)).length).toBe(2);
+  });
+
+  it("没有日志头的旧日志按文件名选源；头里写的源不认识就拒绝，不退回记忆文件源", async () => {
+    writeFileSync(join(ledgerDir, "2026-10", "aaaa0001.md"), ledgerMd({ session: "aaaa0001-x" }));
+    writeFileSync(join(ledgerDir, "2026-10", "bbbb0002.md"), ledgerMd({ session: "bbbb0002-x", solved: ["另一场会话做成的事"] }));
+    await run("ledger");
+    rmSync(join(ledgerDir, "2026-10", "bbbb0002.md"));
+    const r = await run("ledger");
+    const lines = readFileSync(r.journalPath!, "utf-8").split("\n");
+    const old = join(dataDir, "reconcile-journals", "ledger-reconcile-旧格式.jsonl");
+    writeFileSync(old, lines.slice(1).join("\n"));
+    expect(readJournalHeader(old)).toBeNull();
+    const undo = await undoMemoryReconcile({ store, auditLogger: createAuditLogger(auditPath) }, old, { auditPath, knownSources: [MEMORY_DOC_SOURCE, LEDGER_DOC_SOURCE] });
+    expect(undo).toMatchObject({ source: LEDGER_DOC_SOURCE.name, sourceVia: "filename", restored: 2 });
+    const unknown = join(dataDir, "unknown.jsonl");
+    writeFileSync(unknown, [JSON.stringify({ journal: "doc-reconcile", v: 1, source: "chat-reconcile", scope: "memory:chat" }), ...lines.slice(1)].join("\n"));
+    await expect(undoMemoryReconcile({ store, auditLogger: createAuditLogger(auditPath) }, unknown, { auditPath, knownSources: [MEMORY_DOC_SOURCE, LEDGER_DOC_SOURCE] })).rejects.toThrow("不在已知的源里");
   });
 
   it("锁按源分开：记忆文件对账正在跑时账本照跑，账本对账自己的锁被占才跳过", async () => {
