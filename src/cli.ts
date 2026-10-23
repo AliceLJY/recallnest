@@ -3033,6 +3033,35 @@ sessionsCmd
     else console.log(`发现 ${out.files} 个转录（${Object.entries(by).map(([k, v]) => `${k} ${v}`).join("，")}），stat ${out.statCalls} 次，${out.wallMs} ms${r.missingRoots.length ? `；缺目录：${r.missingRoots.join(" ")}` : ""}`);
   });
 
+/** 收工命令 / 正式扫描遇到账本目录不归本机写时的那一行（没有标记 = 还没认领写入端；R5 Codex #2） */
+function ledgerWriterRefusal(w: { host: string; owner: string | null; path: string }, where: string): string {
+  if (w.owner === null) return `❌ 账本目录还没有写入端（${w.path} 不存在）：在要当写入端的那台机器上、仓库根目录下跑一次 bun run src/cli.ts sessions writer --claim`;
+  return `❌ 账本目录只由 ${w.owner || "（标记文件是空的）"} 写（${w.path}），本机是 ${w.host}：${where}。确实要换写入端，先停掉旧写入端的扫描，再改那个文件`;
+}
+
+sessionsCmd
+  .command("writer")
+  .description("看账本目录归哪台机器写；--claim 把本机认领成写入端（没有标记时才建；安装脚本 install 时调）")
+  .option("--claim", "认领：标记不存在就写本机主机名")
+  .action(async (options) => {
+    const { checkLedgerWriter, claimLedgerWriter } = await import("./sessions-sweep-run.js");
+    const config = loadConfig();
+    const ledgerSource = config.sources.ledgers;
+    if (!ledgerSource || ledgerSource.path === "auto") {
+      console.error("❌ 需要在 config.json 里显式配置 sources.ledgers.path（账本落点）");
+      process.exitCode = 2;
+      return;
+    }
+    const dir = resolveSourcePath(ledgerSource.path, "ledgers");
+    const r = options.claim ? claimLedgerWriter(dir) : checkLedgerWriter(dir);
+    if (r.ok) {
+      console.log(`✅ 账本目录 ${dir} 归本机（${r.host}）写${"claimed" in r && r.claimed ? "，刚认领" : ""}`);
+      return;
+    }
+    console.error(ledgerWriterRefusal(r, "本机不是写入端"));
+    process.exitCode = 2;
+  });
+
 sessionsCmd
   .command("ledger")
   .description("当场为一场会话写账本（收工第五步：和扫描器同一格式、同一落点；正文优先用 --body 给的）")
@@ -3063,9 +3092,9 @@ sessionsCmd
       return;
     }
     const { checkLedgerWriter } = await import("./sessions-sweep-run.js");
-    const writer = checkLedgerWriter(resolveSourcePath(ledgerSource.path, "ledgers"), { claim: true });
+    const writer = checkLedgerWriter(resolveSourcePath(ledgerSource.path, "ledgers"));
     if (!writer.ok) {
-      console.error(`❌ 账本目录只由 ${writer.owner || "（标记文件是空的）"} 写（${writer.path}），本机是 ${writer.host}：到那台机器上、仓库根目录下跑这条命令。确实要换写入端，改那个文件`);
+      console.error(ledgerWriterRefusal(writer, "到那台机器上、仓库根目录下跑这条命令"));
       process.exitCode = 2;
       return;
     }
@@ -3172,11 +3201,11 @@ sessionsCmd
         return;
       }
       ledgerDir = resolveSourcePath(ledgerSource.path, "ledgers");
-      // 账本目录只许一台机器写（本机提交锁管不到 Syncthing 同步进来的写入）；dry-run 只查不认领
+      // 账本目录只许一台机器写（本机提交锁管不到 Syncthing 同步进来的写入）；dry-run 什么都不写，只在标记是别的机器时拒绝
       const { checkLedgerWriter } = await import("./sessions-sweep-run.js");
-      const writer = checkLedgerWriter(ledgerDir, { claim: !options.dryRun });
-      if (!writer.ok) {
-        console.error(`❌ 账本目录只由 ${writer.owner || "（标记文件是空的）"} 写（${writer.path}），本机是 ${writer.host}：正式扫描只在那台机器上跑。确实要换写入端，改那个文件`);
+      const writer = checkLedgerWriter(ledgerDir);
+      if (!writer.ok && !(options.dryRun && writer.owner === null)) {
+        console.error(ledgerWriterRefusal(writer, "正式扫描只在那台机器上跑"));
         process.exitCode = 2;
         return;
       }

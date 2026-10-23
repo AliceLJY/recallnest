@@ -59,9 +59,11 @@ export function recurrenceSignatures(errorText: string): Map<string, string> {
 /**
  * 报错头以 CC 钩子拦截的前缀开头（「PreToolUse:Bash hook error: …」）。只给读旧账本用：474f50b 之前写的账本对拦截报错
  * 照样写签名，而抽取会把这个前缀抽掉（P1 互审 R4 R3 Codex #6 / Kimi NEW-5）。只认开头：新账本只给第一行不像拦截的报错写签名，
- * 第一行不含拦截字样，以它起头的报错头也就不会以拦截前缀开头——新账本上这一关一条都不会挡（读写两侧仍同形）
+ * 第一行不含拦截字样，以它起头的报错头也就不会以拦截前缀开头——新账本上这一关一条都不会挡（读写两侧仍同形）。
+ * 除钩子报错外，RM-GUARD、makoto、「blocked by hook」「cannot determine the safety」这几种拦截起头的也认（R6 Codex NEW-8），
+ * 开头允许最多 3 个非单词字符（「[RM-GUARD]」的方括号）
  */
-const HOOK_PREFIX_RE = /^(?:Pre|Post)ToolUse\w*:\S*\s+hook error\b/i;
+const HOOK_PREFIX_RE = /^\W{0,3}(?:(?:Pre|Post)ToolUse\w*:\S*\s+hook error|RM-GUARD|makoto\b|blocked by hook|cannot determine the safety)/i;
 
 /** 账本 markdown 的报错节里记下的签名（「｜签名：a ‖ b」），按同一规则过滤 */
 export function ledgerFileSignatures(md: string): Map<string, string> {

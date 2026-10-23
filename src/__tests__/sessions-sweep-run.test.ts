@@ -1,14 +1,14 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { checkSessionsSweep, sweepHeartbeatPath } from "../doctor.js";
 import type { LLMClient } from "../llm-client.js";
-import { checkLedgerWriter, commitLedger, LEDGER_COMMIT_LOCK_PREFIX, LEDGER_WRITER_FILE, ledgerTargetPath, markHeartbeatRunning, nextLlmFailState, policyFor, readBusyAt, readHeartbeat, runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE, SWEEP_STALE_MS, SWEEP_STUCK_MS, touchHeartbeatBusy, writeSessionLedgerNow } from "../sessions-sweep-run.js";
+import { checkLedgerWriter, claimLedgerWriter, commitLedger, LEDGER_COMMIT_LOCK_PREFIX, LEDGER_WRITER_FILE, ledgerTargetPath, markHeartbeatRunning, nextLlmFailState, policyFor, readBusyAt, readHeartbeat, runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE, SWEEP_STALE_MS, SWEEP_STUCK_MS, touchHeartbeatBusy, writeSessionLedgerNow } from "../sessions-sweep-run.js";
 import { acquireLock, LockTimeoutError, lockPathForKey, releaseLock, withLock } from "../distill-lock.js";
 import type { SessionDoc } from "../session-events.js";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, symlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { discoverTranscripts, SessionStateStore } from "../sessions-sweep.js";
 import { listLedgerFiles } from "../ledger-files.js";
@@ -388,6 +388,9 @@ describe("sessions ledger / 正式 sweep 不在仓库数据目录下跑就拒绝
   it("写账本时抛错（这里用一份没有时间戳的转录）：收工命令接住、退出 3、只打一行原因，不吐调用栈（R4 Kimi #4）", () => {
     const cfg2 = join(root, "config-ledgers.json");
     writeFileSync(cfg2, JSON.stringify({ dbPath: dbDir, sources: { ledgers: { path: join(root, "ledgers"), glob: "**/*.md" } } }));
+    // 本机先认领成写入端（R5 起收工命令不再自动认领）
+    mkdirSync(join(root, "ledgers"), { recursive: true });
+    writeFileSync(join(root, "ledgers", LEDGER_WRITER_FILE), `${require("node:os").hostname()}\n`);
     const ccDir = join(root, "cc", "-Users-x");
     mkdirSync(ccDir, { recursive: true });
     const sid = "abcd9999-0000-4000-8000-000000000999";
@@ -723,19 +726,29 @@ describe("R4 R3 修复：锁忙不改写主心跳、doctor 按配置找心跳、
       process.chdir(prev);
     }
   });
-  it("checkLedgerWriter：第一个正式写的认领；同一台照常；别的机器拒绝；dry-run 只查不建（R3 Codex NEW-2）", () => {
+  it("checkLedgerWriter 只查不建；claimLedgerWriter 显式认领：没有标记才建、同一台照常、别的机器不动（R3 Codex NEW-2、R5 Codex #2）", () => {
     const dir = join(mkdtempSync(join(tmpdir(), "rn-writer-")), "ledgers");
-    expect(checkLedgerWriter(dir, { claim: false, host: "mini" })).toEqual({ ok: true, host: "mini", claimed: false });
+    expect(checkLedgerWriter(dir, { host: "mini" })).toEqual({ ok: false, host: "mini", owner: null, path: join(dir, LEDGER_WRITER_FILE) });
     expect(existsSync(join(dir, LEDGER_WRITER_FILE))).toBe(false);
-    expect(checkLedgerWriter(dir, { claim: true, host: "mini" })).toEqual({ ok: true, host: "mini", claimed: true });
+    expect(claimLedgerWriter(dir, { host: "mini" })).toEqual({ ok: true, host: "mini", claimed: true });
     expect(readFileSync(join(dir, LEDGER_WRITER_FILE), "utf-8")).toBe("mini\n");
-    expect(checkLedgerWriter(dir, { claim: true, host: "mini" })).toEqual({ ok: true, host: "mini", claimed: false });
-    expect(checkLedgerWriter(dir, { claim: true, host: "macbook" })).toEqual({ ok: false, host: "macbook", owner: "mini", path: join(dir, LEDGER_WRITER_FILE) });
-    expect(checkLedgerWriter(dir, { claim: false, host: "macbook" }).ok).toBe(false);
+    expect(claimLedgerWriter(dir, { host: "mini" })).toEqual({ ok: true, host: "mini", claimed: false });
+    expect(checkLedgerWriter(dir, { host: "mini" })).toEqual({ ok: true, host: "mini" });
+    expect(claimLedgerWriter(dir, { host: "macbook" })).toMatchObject({ ok: false, host: "macbook", owner: "mini", claimed: false });
+    expect(realpathSync(dir)).toBe(dirname((claimLedgerWriter(dir, { host: "macbook" }) as { path: string }).path));
+    expect(checkLedgerWriter(dir, { host: "macbook" }).ok).toBe(false);
+    expect(readFileSync(join(dir, LEDGER_WRITER_FILE), "utf-8")).toBe("mini\n");
     // 标记文件不是账本：不进账本列表（对账导入与签名索引都按它）
     expect(listLedgerFiles(dir)).toEqual([]);
   });
-  it("命令层：账本目录归别的机器写时，收工命令与正式扫描都退出 2；没有标记时收工命令认领本机、dry-run 扫描不建标记", () => {
+  it("两台机器各自的副本都还没有标记（Syncthing 还没同步过来）：收工命令与正式扫描都不会自己认领（R5 Codex #2 的反例）", () => {
+    const mini = join(mkdtempSync(join(tmpdir(), "rn-writer-a-")), "ledgers");
+    const mac = join(mkdtempSync(join(tmpdir(), "rn-writer-b-")), "ledgers");
+    expect(checkLedgerWriter(mini, { host: "mac-mini.local" }).ok).toBe(false);
+    expect(checkLedgerWriter(mac, { host: "mac.local" }).ok).toBe(false);
+    expect(existsSync(join(mini, LEDGER_WRITER_FILE)) || existsSync(join(mac, LEDGER_WRITER_FILE))).toBe(false);
+  });
+  it("命令层：没有标记时收工命令与正式扫描都退出 2 并提示怎么认领、dry-run 照跑不建标记；writer --claim 认领本机；标记归别的机器时两条命令都拒绝", () => {
     const cli = join(import.meta.dir, "..", "cli.ts");
     const root = mkdtempSync(join(tmpdir(), "rn-writer-cli-"));
     const dbDir = join(root, "repo-data", "lancedb");
@@ -746,21 +759,65 @@ describe("R4 R3 修复：锁忙不改写主心跳、doctor 按配置找心跳、
     mkdirSync(emptyCC);
     const env = { ...process.env, LOCAL_MEMORY_CONFIG: cfg, RECALLNEST_DATA_DIR: join(root, "repo-data") };
     const run = (args: string[]) => spawnSync("bun", ["run", cli, ...args], { cwd: root, encoding: "utf-8", env });
-    // 没有标记：dry-run 扫描不认领
+    const ledgerCmd = ["sessions", "ledger", "--session", "nope0000", "--roots", `cc=${emptyCC}`];
+    const sweepCmd = ["sessions", "sweep", "--no-llm", "--roots", `cc=${emptyCC}`];
+    for (const args of [ledgerCmd, sweepCmd]) {
+      const r = run(args);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain("还没有写入端");
+      expect(r.stderr).toContain("sessions writer --claim");
+    }
     const dry = run(["sessions", "sweep", "--dry-run", "--no-llm", "--roots", `cc=${emptyCC}`]);
     expect(dry.status).toBe(0);
     expect(existsSync(join(ledgers, LEDGER_WRITER_FILE))).toBe(false);
-    // 收工命令认领本机（之后才去找转录，找不到退出 2）
-    const first = run(["sessions", "ledger", "--session", "nope0000", "--roots", `cc=${emptyCC}`]);
-    expect(first.stderr).toContain("找不到");
+    const claim = run(["sessions", "writer", "--claim"]);
+    expect(claim.status).toBe(0);
     expect(readFileSync(join(ledgers, LEDGER_WRITER_FILE), "utf-8").trim()).toBe(require("node:os").hostname());
-    // 换成别的机器的标记：两条命令都拒绝
+    // 认领之后收工命令过了这一关（往下找转录，找不到退出 2）
+    expect(run(ledgerCmd).stderr).toContain("找不到");
+    // 换成别的机器的标记：两条命令都拒绝，writer --claim 也不改它
     writeFileSync(join(ledgers, LEDGER_WRITER_FILE), "some-other-host\n");
-    for (const args of [["sessions", "ledger", "--session", "nope0000", "--roots", `cc=${emptyCC}`], ["sessions", "sweep", "--no-llm", "--roots", `cc=${emptyCC}`]]) {
+    for (const args of [ledgerCmd, sweepCmd, ["sessions", "writer", "--claim"], ["sessions", "sweep", "--dry-run", "--no-llm", "--roots", `cc=${emptyCC}`]]) {
       const r = run(args);
       expect(r.status).toBe(2);
       expect(r.stderr).toContain("只由 some-other-host 写");
     }
+    expect(readFileSync(join(ledgers, LEDGER_WRITER_FILE), "utf-8")).toBe("some-other-host\n");
+  });
+  it("影子模式与提交层都核落点：--shadow 指到正式账本目录的上级、符号链接或嵌套目录都写不进去（R5 Codex #3 的反例）", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rn-writer-shadow-"));
+    const shared = join(root, "shared");
+    const ledgers = join(shared, "ledgers");
+    mkdirSync(ledgers, { recursive: true });
+    writeFileSync(join(ledgers, LEDGER_WRITER_FILE), "some-other-host\n");
+    const e = env();
+    writeCC(e.cc, "fefe0001-0000-4000-8000-000000000001", 90);
+    const base = { roots: [{ source: "cc" as const, dir: e.cc }], llm: fakeLLM().llm, nowMs: NOW, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false };
+    await expect(runSweep({ ...base, shadowDir: shared })).rejects.toThrow("落在正式账本目录里");
+    // 符号链接指过去也一样
+    const link = join(root, "link");
+    symlinkSync(shared, link);
+    await expect(runSweep({ ...base, shadowDir: link })).rejects.toThrow("落在正式账本目录里");
+    // 嵌在正式目录里面
+    await expect(runSweep({ ...base, shadowDir: join(ledgers, "2026-10") })).rejects.toThrow("落在正式账本目录里");
+    // 符号链接指到正式目录里的子目录（落点本身还不存在，要从链接解析出真实路径再往上找）
+    mkdirSync(join(ledgers, "2026-09"));
+    const link2 = join(root, "link2");
+    symlinkSync(join(ledgers, "2026-09"), link2);
+    await expect(runSweep({ ...base, shadowDir: link2 })).rejects.toThrow("落在正式账本目录里");
+    // 标记就是本机：影子模式照样不许落进正式目录
+    const own = join(root, "own");
+    mkdirSync(join(own, "ledgers"), { recursive: true });
+    writeFileSync(join(own, "ledgers", LEDGER_WRITER_FILE), `${require("node:os").hostname()}\n`);
+    await expect(runSweep({ ...base, shadowDir: own })).rejects.toThrow("落在正式账本目录里");
+    expect(readdirSync(ledgers).sort()).toEqual([LEDGER_WRITER_FILE, "2026-09"].sort());
+    expect(readdirSync(join(ledgers, "2026-09"))).toEqual([]);
+    // dry-run 什么都不写，照跑
+    expect((await runSweep({ ...base, shadowDir: shared, dryRun: true })).ledgersWritten).toEqual([]);
+    // 直接调提交层：落点归别的机器，不写
+    const doc = { source: "cc", sessionId: "fefe0001-0000-4000-8000-000000000001", filePath: "/x", malformedLines: 0, startedAt: "2026-10-23T10:00:00.000Z", endedAt: "2026-10-23T10:30:00.000Z", lastUserAt: null, events: [] } as unknown as SessionDoc;
+    await expect(commitLedger({ ledgerRoot: ledgers, doc, markdown: "x", mode: "agent", host: "mac-mini.local" })).rejects.toThrow("归 some-other-host 写");
+    await expect(commitLedger({ ledgerRoot: ledgers, doc, markdown: "x", mode: "agent", host: "some-other-host", lockDir: join(root, "locks") })).resolves.toMatchObject({ written: true });
   });
   it("提交锁等不到时抛的是 LockTimeoutError（带锁名），报错文字不变", async () => {
     const lockDir = mkdtempSync(join(tmpdir(), "rn-locktimeout-"));
@@ -779,5 +836,42 @@ describe("R4 R3 修复：锁忙不改写主心跳、doctor 按配置找心跳、
     } finally {
       releaseLock(cfgLock);
     }
+  });
+});
+
+describe("R6 修复（Codex R5 复核 #3）：提交层按最终落点的真实路径核写入端，影子提交碰到任何标记都不写", () => {
+  it("影子账本根下的月目录是指向正式目录的符号链接：根上找不到标记，最终落点上找得到，不写", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rn-writer-monthlink-"));
+    const formal = join(root, "formal");
+    mkdirSync(join(formal, "2026-10"), { recursive: true });
+    writeFileSync(join(formal, LEDGER_WRITER_FILE), "some-other-host\n");
+    const shadowLedgers = join(root, "shadow", "ledgers");
+    mkdirSync(shadowLedgers, { recursive: true });
+    symlinkSync(join(formal, "2026-10"), join(shadowLedgers, "2026-10"));
+    const doc = { source: "cc", sessionId: "fefe0002-0000-4000-8000-000000000002", filePath: "/x", malformedLines: 0, startedAt: "2026-10-23T10:00:00.000Z", endedAt: "2026-10-23T10:30:00.000Z", lastUserAt: null, events: [] } as unknown as SessionDoc;
+    const lockDir = join(root, "locks");
+    await expect(commitLedger({ ledgerRoot: shadowLedgers, doc, markdown: "x", mode: "agent", host: "mac-mini.local", lockDir })).rejects.toThrow("归 some-other-host 写");
+    expect(readdirSync(join(formal, "2026-10"))).toEqual([]);
+    // 标记是本机：正式提交照写，影子提交不写
+    const ownFormal = join(root, "own-formal");
+    mkdirSync(join(ownFormal, "2026-10"), { recursive: true });
+    writeFileSync(join(ownFormal, LEDGER_WRITER_FILE), "mac-mini.local\n");
+    const ownShadow = join(root, "own-shadow", "ledgers");
+    mkdirSync(ownShadow, { recursive: true });
+    symlinkSync(join(ownFormal, "2026-10"), join(ownShadow, "2026-10"));
+    await expect(commitLedger({ ledgerRoot: ownShadow, doc, markdown: "x", mode: "agent", host: "mac-mini.local", lockDir, shadow: true })).rejects.toThrow("影子");
+    expect(readdirSync(join(ownFormal, "2026-10"))).toEqual([]);
+    await expect(commitLedger({ ledgerRoot: ownFormal, doc, markdown: "x", mode: "agent", host: "mac-mini.local", lockDir })).resolves.toMatchObject({ written: true });
+    // runSweep 影子模式：月目录链进本机的正式目录，同样不写
+    const e = env();
+    writeCC(e.cc, "fefe0003-0000-4000-8000-000000000003", 90);
+    const hostFormal = join(root, "host-formal");
+    mkdirSync(join(hostFormal, "2026-10"), { recursive: true });
+    writeFileSync(join(hostFormal, LEDGER_WRITER_FILE), `${require("node:os").hostname()}\n`);
+    const shadowDir = join(root, "sweep-shadow");
+    mkdirSync(join(shadowDir, "ledgers"), { recursive: true });
+    symlinkSync(join(hostFormal, "2026-10"), join(shadowDir, "ledgers", "2026-10"));
+    await expect(runSweep({ roots: [{ source: "cc", dir: e.cc }], llm: fakeLLM().llm, nowMs: NOW, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false, shadowDir, lockDir })).rejects.toThrow("影子");
+    expect(readdirSync(join(hostFormal, "2026-10"))).toEqual([]);
   });
 });

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, mock } from "bun:test";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +18,7 @@ import {
   sigKey,
 } from "../ledger-signatures.js";
 import { judgeEntry, judgeRecallLog, recallOutcomeFileName, type RecallOutcomeRecord } from "../recall-outcome.js";
+import * as recallOutcome from "../recall-outcome.js";
 import { buildRecallLogEntry, RECALL_LOG_DIRNAME, recallLogFileName } from "../recall-log.js";
 import type { SessionDoc } from "../session-events.js";
 import { runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE, writeSessionLedgerNow } from "../sessions-sweep-run.js";
@@ -347,5 +348,136 @@ describe("R4 R3 修复：判完之后追加的 recall-log、旧 mtime 账本进�
     addToIndex(idx, { session: "s1-x", ended: "2026-10-23T00:00:00.000Z", file: "a.md", title: `修好了 ${fake} 那个配置` }, recurrenceSignatures(STORE_CASE_ERR));
     expect(JSON.stringify(idx)).not.toContain(fake);
     expect(Object.values(idx.sigs)[0].refs[0].title).toContain("修好了");
+  });
+});
+
+describe("R5 修复（Codex R1 #5）：转录文件名不是会话 id 时，补判看的是解析出的那个 id 的 recall-log", () => {
+  it("export.jsonl 里记的会话是另一个 UUID：判完之后追加的记录下一轮照判", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rn-sig-sidmismatch-"));
+    const cc = join(root, "projects");
+    const dataDir = join(root, "data");
+    const sid = "abcd0010-0000-4000-8000-000000000010";
+    const p = ccWithError(cc, sid, 90, STORE_CASE_ERR);
+    const renamed = join(cc, "-Users-x", "export.jsonl");
+    writeFileSync(renamed, readFileSync(p));
+    utimesSync(renamed, statSync(p).mtime, statSync(p).mtime);
+    // 原文件挪走（同一场会话只留 export.jsonl 一份）
+    writeFileSync(p, "");
+    utimesSync(p, new Date(NOW - 400 * MIN), new Date(NOW - 400 * MIN));
+    const files = discoverTranscripts([{ source: "cc", dir: cc }]).files.filter((f) => f.path === renamed);
+    expect(files.map((f) => f.sessionId)).toEqual(["export"]);
+    const query = [...recurrenceSignatures(STORE_CASE_ERR).values()][0];
+    const end = NOW - 90 * MIN;
+    appendRecallLog(dataDir, buildRecallLogEntry({ sessionId: sid, operation: "error-signature", query, results: [], now: end - 9 * MIN }));
+    const base = { roots: [{ source: "cc" as const, dir: cc }], ledgerDir: join(root, "ledgers"), stateDir: join(dataDir, "state"), recallLogRoot: dataDir, llm: fakeLLM, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false };
+    const r1 = await runSweep({ ...base, nowMs: NOW });
+    expect(Object.values(r1.recallOutcomes ?? {}).reduce((a, b) => a + b, 0)).toBe(1);
+    await runSweep({ ...base, nowMs: NOW + 24 * 60 * MIN });
+    appendRecallLog(dataDir, buildRecallLogEntry({ sessionId: sid, operation: "error-signature", query, results: [], now: end - 8 * MIN }));
+    const r3 = await runSweep({ ...base, nowMs: NOW + 48 * 60 * MIN });
+    expect(Object.values(r3.recallOutcomes ?? {}).reduce((a, b) => a + b, 0)).toBe(1);
+    expect(readFileSync(join(dataDir, RECALL_LOG_DIRNAME, recallOutcomeFileName(sid)), "utf-8").trim().split("\n").length).toBe(2);
+    // 游标是 R5 之前写的（没有 recallLogSid）、按文件名 id 预查到的日志恰好也长了：解析后按真实 id 重取大小记进游标，
+    // 否则记下的是文件名 id 那份的大小，真实 id 那份没长到它那么大之前，新追加的都不会被发现
+    const statePath = join(dataDir, "state", "cc__export.json");
+    const st = JSON.parse(readFileSync(statePath, "utf-8")) as Record<string, unknown>;
+    delete st.recallLogSid;
+    st.recallLogBytes = 0;
+    writeFileSync(statePath, JSON.stringify(st));
+    writeFileSync(join(dataDir, RECALL_LOG_DIRNAME, recallLogFileName("export")), `${JSON.stringify({ pad: "x".repeat(5000) })}\n`);
+    await runSweep({ ...base, nowMs: NOW + 49 * 60 * MIN });
+    const after = JSON.parse(readFileSync(statePath, "utf-8")) as { recallLogSid?: string; recallLogBytes?: number };
+    expect(after.recallLogSid).toBe(sid);
+    expect(after.recallLogBytes).toBe(statSync(join(dataDir, RECALL_LOG_DIRNAME, recallLogFileName(sid))).size);
+    appendRecallLog(dataDir, buildRecallLogEntry({ sessionId: sid, operation: "error-signature", query, results: [], now: end - 7 * MIN }));
+    const r5 = await runSweep({ ...base, nowMs: NOW + 50 * 60 * MIN });
+    expect(Object.values(r5.recallOutcomes ?? {}).reduce((a, b) => a + b, 0)).toBe(1);
+  });
+});
+
+describe("R6 修复（Codex R5 复核 NEW-8）：旧账本里其他拦截前缀起头的报错头也不收签名", () => {
+  const legacyLine = (head: string) =>
+    `---\nsession: s\n---\n# t\n## 报错（机器抽取，1 条）\n- Bash #0: ${head} ｜签名：error: Error: Operation not permitted on /tmp/review-target\n`;
+  it.each([
+    "[RM-GUARD] blocked: Error: Operation not permitted on /tmp/review-target",
+    "makoto: Error: Operation not permitted on /tmp/review-target",
+    "blocked by hook: Error: Operation not permitted on /tmp/review-target",
+  ])("报错头 %s → 不收签名", (head) => {
+    expect([...ledgerFileSignatures(legacyLine(head)).keys()]).toEqual([]);
+  });
+  it("同一个签名挂在真报错头下照收（反向校准）", () => {
+    expect([...ledgerFileSignatures(legacyLine("Error: Operation not permitted on /tmp/review-target")).keys()].length).toBe(1);
+  });
+});
+
+describe("R6 修复（Codex R5 复核 #5 / NEW-6）：旧游标补记真实会话 id、日志大小在判之前按真实 id 取", () => {
+  /** export.jsonl 里记的会话是 sid；跑完第一轮（判过 1 条）后把游标改成 R5 之前的样子：没有 recallLogSid、recallLogBytes=0 */
+  async function legacyCursorSetup(tag: string) {
+    const root = mkdtempSync(join(tmpdir(), `rn-sig-r6-${tag}-`));
+    const cc = join(root, "projects");
+    const dataDir = join(root, "data");
+    const sid = "abcd0011-0000-4000-8000-000000000011";
+    const p = ccWithError(cc, sid, 90, STORE_CASE_ERR);
+    const renamed = join(cc, "-Users-x", "export.jsonl");
+    writeFileSync(renamed, readFileSync(p));
+    utimesSync(renamed, statSync(p).mtime, statSync(p).mtime);
+    writeFileSync(p, "");
+    utimesSync(p, new Date(NOW - 400 * MIN), new Date(NOW - 400 * MIN));
+    const query = [...recurrenceSignatures(STORE_CASE_ERR).values()][0];
+    const end = NOW - 90 * MIN;
+    const append = (minBefore: number) => appendRecallLog(dataDir, buildRecallLogEntry({ sessionId: sid, operation: "error-signature", query, results: [], now: end - minBefore * MIN }));
+    append(9);
+    const base = { roots: [{ source: "cc" as const, dir: cc }], ledgerDir: join(root, "ledgers"), stateDir: join(dataDir, "state"), recallLogRoot: dataDir, llm: fakeLLM, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false };
+    const r1 = await runSweep({ ...base, nowMs: NOW });
+    expect(Object.values(r1.recallOutcomes ?? {}).reduce((a, b) => a + b, 0)).toBe(1);
+    const statePath = join(dataDir, "state", "cc__export.json");
+    const st = JSON.parse(readFileSync(statePath, "utf-8")) as Record<string, unknown>;
+    st.candidateDone = true;
+    delete st.recallLogSid;
+    st.recallLogBytes = 0;
+    writeFileSync(statePath, JSON.stringify(st));
+    // 文件名 id 那份日志不存在：按它预查永远是 0
+    expect(existsSync(join(dataDir, RECALL_LOG_DIRNAME, recallLogFileName("export")))).toBe(false);
+    const total = (r: { recallOutcomes?: Record<string, number> }) => Object.values(r.recallOutcomes ?? {}).reduce((a, b) => a + b, 0);
+    return { dataDir, sid, base, statePath, append, total };
+  }
+  it("旧游标没有 recallLogSid：下一轮解析一次、判掉真实 id 日志里新追加的、记下真实 id（#5）", async () => {
+    const { dataDir, sid, base, statePath, append, total } = await legacyCursorSetup("migrate");
+    append(8);
+    const r2 = await runSweep({ ...base, nowMs: NOW + 24 * 60 * MIN });
+    expect(r2.actions["up-to-date"]).toBe(1);
+    expect(total(r2)).toBe(1);
+    const after = JSON.parse(readFileSync(statePath, "utf-8")) as { recallLogSid?: string; recallLogBytes?: number };
+    expect(after.recallLogSid).toBe(sid);
+    expect(after.recallLogBytes).toBe(statSync(join(dataDir, RECALL_LOG_DIRNAME, recallLogFileName(sid))).size);
+    // 记下 id 之后不再每轮解析：日志没长就判 0 条
+    expect(total(await runSweep({ ...base, nowMs: NOW + 25 * 60 * MIN }))).toBe(0);
+  });
+  it("判的时候另一进程追加了一行：游标记的是判之前的大小，下一轮照判那一行（NEW-6）", async () => {
+    const { base, statePath, append, total } = await legacyCursorSetup("race");
+    append(8);
+    // 判的时候另一进程追加：把 judgeRecallLog 换成「照常判完再追加一行」的直通包装（其余导出原样；跑完关掉追加，包装留着也是直通）
+    const real = { ...recallOutcome };
+    let calls = 0;
+    let appendDuringJudge = true;
+    mock.module("../recall-outcome.js", () => ({
+      ...real,
+      judgeRecallLog: (...args: Parameters<typeof real.judgeRecallLog>) => {
+        const r = real.judgeRecallLog(...args);
+        calls++;
+        if (appendDuringJudge) append(7);
+        return r;
+      },
+    }));
+    let r2: Awaited<ReturnType<typeof runSweep>>;
+    try {
+      r2 = await runSweep({ ...base, nowMs: NOW + 24 * 60 * MIN });
+    } finally {
+      appendDuringJudge = false;
+    }
+    expect(calls).toBe(1);
+    expect(total(r2)).toBe(1);
+    expect((JSON.parse(readFileSync(statePath, "utf-8")) as { recallLogSid?: string }).recallLogSid).toBe("abcd0011-0000-4000-8000-000000000011");
+    expect(total(await runSweep({ ...base, nowMs: NOW + 25 * 60 * MIN }))).toBe(1);
   });
 });

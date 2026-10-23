@@ -64,6 +64,11 @@ case "${1:-}" in
       echo "❌ config.json 没有显式配置 sources.ledgers.path，不安装（例：\"ledgers\": {\"path\": \"~/Downloads/sync-bridge/cc-memory/ledgers\", \"glob\": \"**/*.md\", \"description\": \"会话账本\"}）"
       exit 2
     fi
+    # 账本目录只许一台机器写：install 就是选定本机当写入端的那一步（标记已归别的机器时拒绝安装）
+    if ! (cd "$REPO" && bun run src/cli.ts sessions writer --claim); then
+      echo "❌ 本机不能当账本目录的写入端，不安装"
+      exit 2
+    fi
     mkdir -p "$REPO/logs"
     write_plist
     plutil -lint "$PLIST" >/dev/null

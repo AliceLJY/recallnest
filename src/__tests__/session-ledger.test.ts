@@ -458,3 +458,98 @@ describe("R4 R3 修复：用户原话核对看否定、引用与贴回；emoji �
     expect(verifyAnchor(d, "以后全部使用中文回答", null, { userOnly: true }).verified).toBe(false);
   });
 });
+
+describe("R5 修复（Codex R1 #1 / #4）：当前分句里的拒绝、Markdown 引用与代码、不误降用户真说的", () => {
+  const userSays = (text: string, anchor: string) => {
+    const d = doc();
+    d.events[6].text = text;
+    return verifyAnchor(d, anchor, null, { userOnly: true }).verified;
+  };
+  it("拒绝说法在当前分句里、离锚点超过 4 个字：核不到（#1 第一例）", () => {
+    expect(userSays("我不同意你刚才说的以后全部使用中文回答", "以后全部使用中文回答")).toBe(false);
+  });
+  it("Markdown 引用行、代码块、行内代码里的话：核不到（#1 第二例）", () => {
+    expect(userSays("同事的建议如下：\n> 以后全部使用中文回答\n我还没决定。", "以后全部使用中文回答")).toBe(false);
+    expect(userSays("配置里写的是：\n```\n以后全部使用中文回答\n```\n先别动", "以后全部使用中文回答")).toBe(false);
+    expect(userSays("文档里有一句 `以后全部使用中文回答` 你看看", "以后全部使用中文回答")).toBe(false);
+  });
+  it("肯定说法里的否定字、针对别的事项的不同意：不误降（#4 前两例）", () => {
+    expect(userSays("没问题以后全部使用中文回答", "以后全部使用中文回答")).toBe(true);
+    expect(userSays("不错不过以后全部使用中文回答", "以后全部使用中文回答")).toBe(true);
+    expect(userSays("我不同意删库，以后全部使用中文回答", "以后全部使用中文回答")).toBe(true);
+    expect(userSays("我不同意删库但以后全部使用中文回答", "以后全部使用中文回答")).toBe(true);
+    expect(userSays("以后全部使用中文回答，我反对用英文", "以后全部使用中文回答")).toBe(true);
+    // 光秃秃的「不同意 / 反对」照旧管着相邻分句
+    expect(userSays("我不同意，以后全部使用中文回答", "以后全部使用中文回答")).toBe(false);
+    expect(userSays("以后全部使用中文回答，这个我反对", "以后全部使用中文回答")).toBe(false);
+  });
+  it("方案最早出自助手、用户随后明说采用：算用户拍板；只是贴回或复述、没说采用：不算（#4 第三例）", () => {
+    const d = doc();
+    d.events[1].text = "建议以后全部使用中文回答";
+    d.events[6].text = "我决定采用这个方案，以后全部使用中文回答";
+    expect(verifyAnchor(d, "以后全部使用中文回答", null, { userOnly: true }).verified).toBe(true);
+    d.events[6].text = "以后全部使用中文回答 —— 你上面这句我再看看";
+    expect(verifyAnchor(d, "以后全部使用中文回答", null, { userOnly: true }).verified).toBe(false);
+    d.events[6].text = "我还没决定，以后全部使用中文回答";
+    expect(verifyAnchor(d, "以后全部使用中文回答", null, { userOnly: true }).verified).toBe(false);
+  });
+});
+
+describe("R6 修复（Codex R5 复核 #1 / #4 / NEW-7）：指代词接拒绝、犹豫与转述不算采纳、连词后的拍板、引号只看本行", () => {
+  const A = "以后全部使用中文回答";
+  const userSays = (text: string) => {
+    const d = doc();
+    d.events[6].text = text;
+    return verifyAnchor(d, A, null, { userOnly: true }).verified;
+  };
+  const afterSuggestion = (text: string) => {
+    const d = doc();
+    d.events[1].text = `建议${A}`;
+    d.events[6].text = text;
+    return verifyAnchor(d, A, null, { userOnly: true }).verified;
+  };
+  it("锚点之后的「反对 / 不同意」接指代词：核不到（#1 第一例）", () => {
+    expect(userSays(`${A}，我反对这个建议`)).toBe(false);
+    expect(userSays(`${A}，我不同意这样`)).toBe(false);
+    // 接的是别的事项照旧核得到
+    expect(userSays(`${A}，我反对用英文`)).toBe(true);
+  });
+  it("采纳说法所在分句里有否定或犹豫、锚点后说「只是你的建议」：不算用户拍板（#1 第二例）", () => {
+    expect(afterSuggestion(`我还没决定是否采用这个方案，${A}只是你的建议`)).toBe(false);
+    expect(afterSuggestion(`我在考虑要不要采用，${A}`)).toBe(false);
+    expect(afterSuggestion(`我决定采用，${A}，你建议的这个先待定`)).toBe(false);
+    // 下面每句只撞一关：采纳分句里只有否定字 / 只有犹豫词 / 锚点后只说「只是你的建议」
+    expect(afterSuggestion(`我没说采用这个方案，${A}`)).toBe(false);
+    expect(afterSuggestion(`我考虑采用这个方案，${A}`)).toBe(false);
+    expect(afterSuggestion(`我决定采用这个方案，${A}只是你的建议`)).toBe(false);
+  });
+  it("采纳词前同一分句里有「你」（转述对方）、锚点后「还在考虑」：不算用户拍板（#1 第三例）", () => {
+    expect(afterSuggestion(`你刚才说你决定了${A}，我还在考虑`)).toBe(false);
+    expect(afterSuggestion(`你刚才说你决定了${A}`)).toBe(false);
+    expect(afterSuggestion(`我决定采用这个方案，${A}，我再想想`)).toBe(false);
+  });
+  it("前半截的「反对」与锚点之间有连词或采纳说法：不误降（#4）", () => {
+    expect(userSays(`我反对删库而且我决定${A}`)).toBe(true);
+    expect(userSays(`我反对删库另外${A}`)).toBe(true);
+    // 没有连词、只有采纳说法
+    expect(userSays(`我反对删库我决定${A}`)).toBe(true);
+    // 「你决定的」是转述，不算用户的采纳
+    expect(userSays(`我不同意你决定的${A}`)).toBe(false);
+  });
+  it("前文没配对的引号不污染后面的行（NEW-7）", () => {
+    expect(userSays(`文档里多打了一个「。\n另外，我明确决定${A}`)).toBe(true);
+    // 同一行里的引号照旧算
+    expect(userSays(`他原话是「${A}」`)).toBe(false);
+  });
+  it("前几轮的结论照旧成立", () => {
+    expect(userSays(`我不同意${A}`)).toBe(false);
+    expect(userSays(`我不同意，${A}`)).toBe(false);
+    expect(userSays(`同事的建议如下：\n> ${A}`)).toBe(false);
+    expect(userSays(`我明确决定${A}`)).toBe(true);
+    expect(userSays(`不错，${A}`)).toBe(true);
+    expect(userSays(`没问题${A}`)).toBe(true);
+    expect(userSays(`我不同意删库，${A}`)).toBe(true);
+    expect(userSays(`${A}，我反对用英文`)).toBe(true);
+    expect(afterSuggestion(`我决定采用这个方案，${A}`)).toBe(true);
+  });
+});
