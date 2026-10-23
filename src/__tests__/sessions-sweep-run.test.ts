@@ -838,3 +838,40 @@ describe("R4 R3 修复：锁忙不改写主心跳、doctor 按配置找心跳、
     }
   });
 });
+
+describe("R6 修复（Codex R5 复核 #3）：提交层按最终落点的真实路径核写入端，影子提交碰到任何标记都不写", () => {
+  it("影子账本根下的月目录是指向正式目录的符号链接：根上找不到标记，最终落点上找得到，不写", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rn-writer-monthlink-"));
+    const formal = join(root, "formal");
+    mkdirSync(join(formal, "2026-10"), { recursive: true });
+    writeFileSync(join(formal, LEDGER_WRITER_FILE), "some-other-host\n");
+    const shadowLedgers = join(root, "shadow", "ledgers");
+    mkdirSync(shadowLedgers, { recursive: true });
+    symlinkSync(join(formal, "2026-10"), join(shadowLedgers, "2026-10"));
+    const doc = { source: "cc", sessionId: "fefe0002-0000-4000-8000-000000000002", filePath: "/x", malformedLines: 0, startedAt: "2026-10-23T10:00:00.000Z", endedAt: "2026-10-23T10:30:00.000Z", lastUserAt: null, events: [] } as unknown as SessionDoc;
+    const lockDir = join(root, "locks");
+    await expect(commitLedger({ ledgerRoot: shadowLedgers, doc, markdown: "x", mode: "agent", host: "mac-mini.local", lockDir })).rejects.toThrow("归 some-other-host 写");
+    expect(readdirSync(join(formal, "2026-10"))).toEqual([]);
+    // 标记是本机：正式提交照写，影子提交不写
+    const ownFormal = join(root, "own-formal");
+    mkdirSync(join(ownFormal, "2026-10"), { recursive: true });
+    writeFileSync(join(ownFormal, LEDGER_WRITER_FILE), "mac-mini.local\n");
+    const ownShadow = join(root, "own-shadow", "ledgers");
+    mkdirSync(ownShadow, { recursive: true });
+    symlinkSync(join(ownFormal, "2026-10"), join(ownShadow, "2026-10"));
+    await expect(commitLedger({ ledgerRoot: ownShadow, doc, markdown: "x", mode: "agent", host: "mac-mini.local", lockDir, shadow: true })).rejects.toThrow("影子");
+    expect(readdirSync(join(ownFormal, "2026-10"))).toEqual([]);
+    await expect(commitLedger({ ledgerRoot: ownFormal, doc, markdown: "x", mode: "agent", host: "mac-mini.local", lockDir })).resolves.toMatchObject({ written: true });
+    // runSweep 影子模式：月目录链进本机的正式目录，同样不写
+    const e = env();
+    writeCC(e.cc, "fefe0003-0000-4000-8000-000000000003", 90);
+    const hostFormal = join(root, "host-formal");
+    mkdirSync(join(hostFormal, "2026-10"), { recursive: true });
+    writeFileSync(join(hostFormal, LEDGER_WRITER_FILE), `${require("node:os").hostname()}\n`);
+    const shadowDir = join(root, "sweep-shadow");
+    mkdirSync(join(shadowDir, "ledgers"), { recursive: true });
+    symlinkSync(join(hostFormal, "2026-10"), join(shadowDir, "ledgers", "2026-10"));
+    await expect(runSweep({ roots: [{ source: "cc", dir: e.cc }], llm: fakeLLM().llm, nowMs: NOW, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false, shadowDir, lockDir })).rejects.toThrow("影子");
+    expect(readdirSync(join(hostFormal, "2026-10"))).toEqual([]);
+  });
+});

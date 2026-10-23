@@ -289,7 +289,7 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
       llmFailedThisPass = !!opts.llm && render.generator === "llm-failed";
       // 提交走会话锁、锁内重读账本头：等 LLM 的这段时间里收工命令写进来的当场账本不会被盖掉（P1 互审 R1 Codex #2、R3 C2/K4）。
       // LLM 失败时只在还没有账本时写机器抽取版（报错签名照样进索引），已有的不拿残版盖、之后按退避重试
-      const commit = await commitLedger({ ledgerRoot, doc: decision.doc, stateLedgerPath: state.ledgerPath, markdown: render.markdown, mode: llmFailedThisPass ? "fallback" : "generated", lockDir: opts.lockDir, waitMs: opts.commitWaitMs });
+      const commit = await commitLedger({ ledgerRoot, doc: decision.doc, stateLedgerPath: state.ledgerPath, markdown: render.markdown, mode: llmFailedThisPass ? "fallback" : "generated", lockDir: opts.lockDir, waitMs: opts.commitWaitMs, shadow: !!opts.shadowDir });
       if (commit.written) {
         ledgerPath = commit.path;
         result.ledgersWritten.push(ledgerPath);
@@ -320,7 +320,8 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
       const logSid = decision.doc?.sessionId ?? state.recallLogSid ?? file.sessionId;
       const logBytes = fileSize(join(opts.recallLogRoot, RECALL_LOG_DIRNAME, recallLogFileName(logSid)));
       let judgeDoc = decision.doc;
-      if (!judgeDoc && logBytes > (state.recallLogBytes ?? 0)) {
+      // 游标是 R5 之前写的（没有 recallLogSid）：文件名 id 可能不是会话 id，按它预查到的日志永远不长，解析一次拿到真实 id 记下（R6 Codex #5）
+      if (!judgeDoc && (logBytes > (state.recallLogBytes ?? 0) || state.recallLogSid === undefined)) {
         try {
           judgeDoc = parseSessionFile(file.path, { source: file.source });
         } catch (error) {
@@ -328,10 +329,13 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
         }
       }
       if (judgeDoc) {
+        // 先解析后才知道真实 id 的那一轮（转录没变、按文件名 id 预查），大小按真实 id 重取——也要在判之前取：
+        // 判完再取，判的时候别的进程追加的行这轮没判、大小却记进了游标，之后再也不会判（R6 Codex NEW-6）
+        const sid = judgeDoc.sessionId;
+        const bytes = sid === logSid ? logBytes : fileSize(join(opts.recallLogRoot, RECALL_LOG_DIRNAME, recallLogFileName(sid)));
         const counts = judgeRecallLog(opts.recallLogRoot, judgeDoc, new Date(nowMs).toISOString());
         if (counts) for (const [k, v] of Object.entries(counts)) (result.recallOutcomes ??= {})[k] = ((result.recallOutcomes ?? {})[k] ?? 0) + (v ?? 0);
-        // 先解析后才知道真实 id 的那一轮（转录没变、按文件名 id 预查到变大），大小按真实 id 重取
-        judged = { sid: judgeDoc.sessionId, bytes: judgeDoc.sessionId === logSid ? logBytes : fileSize(join(opts.recallLogRoot, RECALL_LOG_DIRNAME, recallLogFileName(judgeDoc.sessionId))) };
+        judged = { sid, bytes };
       }
     }
     if (!opts.dryRun) {
@@ -478,17 +482,18 @@ export type LedgerCommitResult = { written: true; path: string } | { written: fa
  * 这把锁是本机的 flock，只管得住本机的扫描器与收工命令；另一台机器写、经 Syncthing 同步进来的账本不经过它，
  * 照样可能落在复查与改名之间。跨机靠的是账本目录只许一台机器写（checkLedgerWriter，R4 R3 Codex NEW-2），不是这把锁。
  */
-export async function commitLedger(o: { ledgerRoot: string; doc: SessionDoc; stateLedgerPath?: string; markdown: string; mode: LedgerCommitMode; lockDir?: string; waitMs?: number; host?: string }): Promise<LedgerCommitResult> {
+export async function commitLedger(o: { ledgerRoot: string; doc: SessionDoc; stateLedgerPath?: string; markdown: string; mode: LedgerCommitMode; lockDir?: string; waitMs?: number; host?: string; shadow?: boolean }): Promise<LedgerCommitResult> {
   // 落点（或它的上级）归别的机器写：不管从哪条路径进来都不写（R5 Codex #3：影子模式把 --shadow 指到正式目录的上级就能绕过命令层的检查）
-  const marker = findLedgerWriterMarker(o.ledgerRoot);
   const host = o.host ?? hostname();
-  if (marker && marker.owner !== host) throw new Error(`账本目录归 ${marker.owner || "（标记文件是空的）"} 写（${marker.path}），本机是 ${host}，不写`);
+  assertWritableLedgerDir(o.ledgerRoot, host, o.shadow);
   const key = `${LEDGER_COMMIT_LOCK_PREFIX}${o.doc.sessionId}`;
   try {
     // lock-wait: no store-write inside（锁里只有读账本头、写文件、改名，不碰记忆库）
     const outcome = await withLock(key, async (): Promise<LedgerCommitResult> => {
       // 锁内重新定位：等锁期间对方可能已在别的月份目录写了这场的账本
       const path = ledgerTargetPath(o.ledgerRoot, o.doc, o.stateLedgerPath);
+      // 最终落点所在目录再核一次（按真实路径往上找）：根下的月目录可以是指向正式目录的符号链接，根上找不到标记（R6 Codex #3）
+      assertWritableLedgerDir(dirname(path), host, o.shadow);
       if (o.mode !== "agent" && agentLedgerCovers(path, o.doc)) return { written: false, path, reason: "agent-ledger" };
       if (o.mode === "fallback" && existsSync(path)) return { written: false, path, reason: "exists" };
       mkdirSync(dirname(path), { recursive: true });
@@ -504,6 +509,14 @@ export async function commitLedger(o: { ledgerRoot: string; doc: SessionDoc; sta
     if (!(error instanceof LockTimeoutError && error.key === key)) throw error;
   }
   return { written: false, path: ledgerTargetPath(o.ledgerRoot, o.doc, o.stateLedgerPath), reason: "busy" };
+}
+
+/** 归别的机器写的目录不写；影子提交（shadow）碰到任何标记都不写，本机的也算——影子产物不许混进正式账本（R6 Codex #3） */
+function assertWritableLedgerDir(dir: string, host: string, shadow?: boolean): void {
+  const marker = findLedgerWriterMarker(dir);
+  if (!marker) return;
+  if (shadow) throw new Error(`影子账本的落点 ${dir} 在正式账本目录里（${marker.path}），不写`);
+  if (marker.owner !== host) throw new Error(`账本目录归 ${marker.owner || "（标记文件是空的）"} 写（${marker.path}），本机是 ${host}，不写`);
 }
 
 /** 账本目录里记「哪台机器写这个目录」的文件（随目录同步到别的机器，别的机器读得到） */
