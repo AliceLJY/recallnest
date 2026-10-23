@@ -35,6 +35,22 @@ function runSeq(root: string, codes: number[]): number[] {
 }
 const tgCount = (root: string) => (existsSync(join(root, "tg.log")) ? readFileSync(join(root, "tg.log"), "utf-8").split("<<<END>>>").length - 1 : 0);
 
+describe("sessions-sweep.sh 看门狗", () => {
+  it("正常跑完不留攥着输出管道的 sleep：经管道跑也立刻返回（CI 上原先每次等满超时）", () => {
+    const root = sandbox();
+    writeFileSync(join(root, "next-code"), "0");
+    const t0 = Date.now();
+    // 经 `| cat` 跑：管道的读端要等所有持有写端的进程都退出才拿到 EOF——孤儿 sleep 会让它等满 SESSIONS_SWEEP_TIMEOUT
+    const r = spawnSync("/bin/bash", ["-c", `/bin/bash "${join(root, "repo", "scripts", "sessions-sweep.sh")}" | cat`], {
+      env: { HOME: join(root, "home"), PATH: `${join(root, "bin")}:/usr/bin:/bin`, SESSIONS_SWEEP_NOTIFY: join(root, "notify"), SESSIONS_SWEEP_TIMEOUT: "20" },
+      encoding: "utf-8",
+      timeout: 30_000,
+    });
+    expect(r.status).toBe(0);
+    expect(Date.now() - t0).toBeLessThan(10_000);
+  }, 40_000);
+});
+
 describe("sessions-sweep.sh 失败计数", () => {
   it("连续 3 次真失败才报一条；成功清零", () => {
     const root = sandbox();

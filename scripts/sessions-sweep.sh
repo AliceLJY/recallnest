@@ -45,7 +45,14 @@ TIMEOUT="${SESSIONS_SWEEP_TIMEOUT:-2700}"
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') sessions sweep ===" >> "$LOG_FILE"
 bun run src/cli.ts sessions sweep >> "$LOG_FILE" 2>&1 &
 PID=$!
-( sleep "$TIMEOUT" && kill "$PID" 2>/dev/null ) &
+# 看门狗被 kill 时要连它的 sleep 一起收掉：只杀子 shell 的话 sleep 成孤儿、继续攥着继承来的输出管道，
+# 调用方（测试、手动 | 管道）要等它睡满才拿到 EOF，launchd 下每轮也留一个睡 45 分钟的孤儿
+(
+  sleep "$TIMEOUT" &
+  SLEEPER=$!
+  trap 'kill "$SLEEPER" 2>/dev/null; exit 0' TERM
+  wait "$SLEEPER" && kill "$PID" 2>/dev/null
+) >/dev/null 2>&1 &
 WATCH=$!
 wait "$PID"
 EXIT_CODE=$?
