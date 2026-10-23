@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 
 import type { SessionDoc } from "../session-events.js";
 import { summarizeSession } from "../session-events.js";
-import { parseLedgerJson, renderLedgerMarkdown, renderTranscriptForLLM, verifyAnchor } from "../session-ledger.js";
+import { LEDGER_SYSTEM_PROMPT, parseLedgerJson, renderLedgerMarkdown, renderTranscriptForLLM, TAIL_ASSISTANT_CLIP, TAIL_EVENTS, TAIL_MARKER, verifyAnchor } from "../session-ledger.js";
 
 function doc(): SessionDoc {
   const t = (s: number) => ({ ts: new Date(Date.UTC(2026, 9, 20, 10, 0, s)).toISOString(), tsMs: Date.UTC(2026, 9, 20, 10, 0, s) });
@@ -22,6 +22,8 @@ function doc(): SessionDoc {
 describe("session-ledger rendering for the LLM", () => {
   it("includes user turns, clipped assistant text, tool errors and memory writes; masks writes on request", () => {
     const d = doc();
+    // 把 A#1 推出结尾那 TAIL_EVENTS 条（结尾的助手发言放宽，不按 assistantClip 截）
+    for (let i = 0; i < TAIL_EVENTS; i++) d.events.push({ seq: 8 + i, ts: d.events[7].ts, tsMs: d.events[7].tsMs, kind: "user", text: `后续 ${i}` });
     const r = renderTranscriptForLLM(d, { assistantClip: 20 });
     expect(r.text).toContain("[U#0 10:00] 帮我把 bot");
     expect(r.text).toContain("[A#1] 好的，先看现状。");
@@ -40,6 +42,61 @@ describe("session-ledger rendering for the LLM", () => {
     expect(r.droppedEvents).toBeGreaterThan(0);
     expect(r.text).toContain("[U#0");
     expect(r.text).toContain("[U#6");
+  });
+});
+
+describe("session-ledger 结尾保全（P1 ②）", () => {
+  function longDoc(n: number): SessionDoc {
+    const d = doc();
+    for (let i = 0; i < n; i++) d.events.push({ seq: 8 + i, ts: d.events[7].ts, tsMs: d.events[7].tsMs, kind: i % 2 ? "assistant" : "user", text: i % 2 ? `第 ${i} 条助手：${"做".repeat(1500)}` : `第 ${i} 条用户` });
+    return d;
+  }
+  it("超过 TAIL_EVENTS 条时在结尾前插标记；不超过时不插", () => {
+    const short = renderTranscriptForLLM(doc());
+    expect(short.text).not.toContain(TAIL_MARKER);
+    const long = renderTranscriptForLLM(longDoc(20));
+    const lines = long.text.split("\n");
+    const at = lines.indexOf(TAIL_MARKER);
+    expect(at).toBeGreaterThan(0);
+    expect(lines.length - at - 1).toBe(TAIL_EVENTS);
+  });
+  it("结尾的助手发言放宽到 TAIL_ASSISTANT_CLIP，中段照旧按 assistantClip 截", () => {
+    const r = renderTranscriptForLLM(longDoc(20), { assistantClip: 100 });
+    const tail = r.text.split(TAIL_MARKER)[1];
+    const head = r.text.split(TAIL_MARKER)[0];
+    const tailA = tail.split("\n").find((l) => l.startsWith("[A#"))!;
+    const headA = head.split("\n").filter((l) => l.startsWith("[A#")).at(-1)!;
+    expect(tailA.length).toBeGreaterThan(TAIL_ASSISTANT_CLIP);
+    expect(tailA.length).toBeLessThan(TAIL_ASSISTANT_CLIP + 40);
+    expect(headA.length).toBeLessThan(160);
+  });
+  it("超预算时结尾那几条一条不削，削的是中段助手发言", () => {
+    const d = longDoc(30);
+    const r = renderTranscriptForLLM(d, { maxChars: 5000 }); // 紧到中段助手全削完还超，逼到结尾
+    expect(r.droppedEvents).toBeGreaterThan(0);
+    const tail = r.text.split(TAIL_MARKER)[1].split("\n").filter(Boolean);
+    expect(tail.length).toBe(TAIL_EVENTS);
+    const lastSeqs = d.events.slice(-TAIL_EVENTS).map((e) => e.seq);
+    for (const seq of lastSeqs) expect(r.text).toMatch(new RegExp(`\\[[UA]#${seq}[ \\]]`));
+  });
+  it("maskRestatement：含记忆写入的那一轮助手发言全遮，别的轮不动；不开时照常", () => {
+    const d = doc();
+    // seq 6 是新一轮的真人发言；给 store_case 那一轮（seq 0–5）补一句复述
+    d.events.splice(5, 0, { seq: 99, ts: d.events[4].ts, tsMs: d.events[4].tsMs, kind: "assistant", text: "我把这个坑记成一条 case：柠檬清理会删日志子目录" });
+    const plain = renderTranscriptForLLM(d, { maskMemoryWrites: true });
+    expect(plain.text).toContain("柠檬清理会删日志子目录");
+    expect(plain.text).toContain("[A#1]");
+    const masked = renderTranscriptForLLM(d, { maskMemoryWrites: true, maskRestatement: true });
+    expect(masked.text).not.toContain("柠檬清理会删日志子目录");
+    expect(masked.text).not.toContain("[A#1]");
+    expect(masked.text).toContain("[A#7] 记下了");
+    expect(masked.text).toContain("[U#0");
+  });
+  it("prompt 让「没做完」去结尾找完成证据，并要求决定写清谁定的", () => {
+    expect(LEDGER_SYSTEM_PROMPT).toContain(TAIL_MARKER);
+    expect(LEDGER_SYSTEM_PROMPT).toContain("unfinished 写之前，先到");
+    expect(LEDGER_SYSTEM_PROMPT).toContain("\"decisions\"");
+    expect(LEDGER_SYSTEM_PROMPT).toContain("不要把助手的建议写成用户的决定");
   });
 });
 
@@ -118,7 +175,11 @@ describe("session-ledger anchors and JSON", () => {
     expect(md).toContain("trigger: auto-sweep");
     expect(md).toContain("experience_pending: 2");
     expect(md).toContain("anchors_unverified: 1");
-    for (const h of ["## 解决了什么", "## 经验（待确认）", "## 没做完", "## 报错（机器抽取，1 条）", "## 当场写过的记忆（机器抽取）"]) expect(md).toContain(h);
+    const heads = ["## 解决了什么", "## 决定与否决", "## 经验（待确认）", "## 没做完", "## 报错（机器抽取，1 条）", "## 当场写过的记忆（机器抽取）"];
+    for (const h of heads) expect(md).toContain(h);
+    // 节的先后：决定与否决紧跟解决了什么
+    expect(heads.map((h) => md.indexOf(h))).toEqual([...heads.map((h) => md.indexOf(h))].sort((a, b) => a - b));
+    expect(md).toMatch(/## 决定与否决\n- （无）\n/); // 生成了但没有决定：写（无），不写（未生成）
     expect(md).toContain("｜src:cfe4de46#6");
     expect(md).toContain("｜anchor:未核");
     expect(md).toContain("- store_case ×1");
@@ -130,6 +191,16 @@ describe("session-ledger anchors and JSON", () => {
     const out = renderLedgerMarkdown(d, summarizeSession(d), null, { trigger: "auto-sweep", pass: 1 }, null, "none");
     expect(out.markdown).toContain("generator: none");
     expect(out.markdown).toContain("- （未生成）");
+    expect(out.markdown).toMatch(/## 决定与否决\n- （未生成）\n/);
     expect(out.markdown).toContain("Bash #3: zsh: command not found");
+  });
+  it("决定与否决：解析 decisions、过滤空项，渲染成一节", () => {
+    const d = doc();
+    const body = parseLedgerJson('{"oneLine":"x","solved":[],"decisions":["定：日志一律放 ops-logs（用户拍板，柠檬会清 Library/Logs 子目录）"," ",3,"否：放 Library/Logs（会被清）"],"experience":[],"unfinished":[]}', d);
+    expect(body.decisions).toEqual(["定：日志一律放 ops-logs（用户拍板，柠檬会清 Library/Logs 子目录）", "否：放 Library/Logs（会被清）"]);
+    const md = renderLedgerMarkdown(d, summarizeSession(d), body, { trigger: "auto-sweep", pass: 1 }, null, "llm").markdown;
+    expect(md).toContain("## 决定与否决\n- 定：日志一律放 ops-logs（用户拍板，柠檬会清 Library/Logs 子目录）\n- 否：放 Library/Logs（会被清）\n");
+    // 旧格式（没有 decisions 字段）照样能解析
+    expect(parseLedgerJson('{"oneLine":"x","solved":["a"],"experience":[],"unfinished":[]}', d).decisions).toEqual([]);
   });
 });
