@@ -45,7 +45,7 @@ export interface LocalMemoryConfig {
    * - llm：给扫描单独配一个 LLM（不配就用上面的 llm）。账本生成一场一两万 token，和导入抢同一把 key 会互相拖累；
    * - idleMinutes / candidateAfterMinutes：按端覆盖（cc / codex / kimi / antigravity），不配走 CLI 默认
    *   （CC 60 / 720，其余 30 / 360，Alice 2026-10-23 拍板）；
-   * - candidates：出不出经验候选节（D2 第二步），默认 false，P1 ⑥ 打开。
+   * - candidates：出不出经验候选节（D2 第二步），默认出（P1 ⑥），写 false 关掉。
    */
   sessionsSweep?: {
     llm?: { apiKey: string; model: string; baseURL: string };

@@ -16,6 +16,9 @@ import { redactSecrets } from "./pii-detector.js";
 import { buildLedger, renderLedgerMarkdown, type GenerateLedgerOptions, type LedgerBody, type LedgerMeta } from "./session-ledger.js";
 import { parseSessionFile, summarizeSession, type SessionDoc, type SessionSource } from "./session-events.js";
 import { applyDecision, decide, DEFAULT_POLICY, discoverTranscripts, ledgerRelPath, SessionStateStore, type RootSpec, type SweepAction, type SweepPolicy, type TranscriptFile } from "./sessions-sweep.js";
+import { addToIndex, buildSignatureIndex, ledgerFileSignatures, lookupSignatures, recurrenceLines, recurrenceSignatures, writeSignatureIndex, type SignatureIndex } from "./ledger-signatures.js";
+import type { SessionSummary } from "./session-events.js";
+import { judgeRecallLog } from "./recall-outcome.js";
 
 export interface SweepRunOptions {
   roots: RootSpec[];
@@ -29,6 +32,10 @@ export interface SweepRunOptions {
   logPath?: string;
   /** 每轮结束写一份心跳（doctor 据此判「上次 sweep 多久前」）；不给就不写 */
   heartbeatPath?: string;
+  /** 账本签名索引的落点（报错召回的 hook 读它，P1 ⑥）；不给就不写。本轮写了账本、或文件还不存在时才写 */
+  signatureIndexPath?: string;
+  /** recall-log 所在的数据目录（<dir>/recall-log/<sid>.jsonl）；给了就在会话静默后判四态（P1 ⑥） */
+  recallLogRoot?: string;
   policy?: Partial<SweepPolicy>;
   /** 按端覆盖 policy（在 policy 之上再叠一层） */
   policyBySource?: Partial<Record<SessionSource, Partial<SweepPolicy>>>;
@@ -64,6 +71,8 @@ export interface SweepRunResult {
   llmCompletionTokens: number;
   llmFailures: number;
   wallMs: number;
+  /** 本轮判出的 recall-log 四态计数 */
+  recallOutcomes?: Record<string, number>;
   /** 写了心跳时带回本轮心跳（CLI 据此定退出码） */
   heartbeat?: SweepHeartbeat;
 }
@@ -142,6 +151,9 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
     if (sweepLog) mkdirSync(dirname(sweepLog), { recursive: true });
   }
   const candidatesOn = opts.candidates ?? true;
+  // 签名索引：第一次要写账本时从账本目录建一次，之后每写一份就地更新（P1 ⑥ 复发节）
+  let sigIndex: SignatureIndex | null = null;
+  const getIndex = (): SignatureIndex => (sigIndex ??= buildSignatureIndex(ledgerRoot));
 
   const actions = {} as Record<SweepAction, number>;
   const result: SweepRunResult = { discovered: disc.files.length, statCalls: disc.statCalls, discoveryWallMs: disc.wallMs, missingRoots: disc.missingRoots, actions, ledgersWritten: [], llmCalls: 0, llmPromptTokens: 0, llmCompletionTokens: 0, llmFailures: 0, wallMs: 0 };
@@ -180,7 +192,8 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
       const pass = decision.action === "candidates" ? state.pass : state.pass + 1;
       // D2 两步：第一次静默只写事实账本，候选到期（ledger+candidates / candidates）才出经验
       const includeCandidates = candidatesOn && decision.action !== "ledger";
-      const render = await buildLedger(decision.doc, { trigger: opts.trigger ?? "auto-sweep", pass, machine: file.machine, generatedAt: new Date(nowMs).toISOString() }, opts.llm, { ...opts.render, includeCandidates });
+      const recurrence = recurrenceFor(getIndex(), decision.doc, decision.summary ?? summarizeSession(decision.doc));
+      const render = await buildLedger(decision.doc, { trigger: opts.trigger ?? "auto-sweep", pass, machine: file.machine, generatedAt: new Date(nowMs).toISOString(), recurrence }, opts.llm, { ...opts.render, includeCandidates });
       if (opts.llm) {
         result.llmCalls++;
         if (render.usage) {
@@ -206,7 +219,13 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
         renameSync(tmp, ledgerPath);
         result.ledgersWritten.push(ledgerPath);
         produced++;
+        addToIndex(getIndex(), { session: decision.doc.sessionId, ended: decision.doc.endedAt ?? "", file: relative(ledgerRoot, ledgerPath), title: render.body?.oneLine ?? "" }, ledgerFileSignatures(render.markdown));
       }
+    }
+    // 会话已经静默够久（走到了出账本 / 保留收工账本这一步）：判它 recall-log 里还没判的记录
+    if (opts.recallLogRoot && !opts.dryRun && decision.doc && (needsLedger || keepAgentUpto)) {
+      const counts = judgeRecallLog(opts.recallLogRoot, decision.doc, new Date(nowMs).toISOString());
+      if (counts) for (const [k, v] of Object.entries(counts)) (result.recallOutcomes ??= {})[k] = ((result.recallOutcomes ?? {})[k] ?? 0) + (v ?? 0);
     }
     if (!opts.dryRun) {
       const next = applyDecision(state, file, decision, nowMs, policy, ledgerPath);
@@ -220,6 +239,9 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
     }
     if (needsLedger) log(`${decision.action.padEnd(18)} ${file.source.padEnd(11)} ${file.sessionId.slice(0, 8)} ${decision.reason}${ledgerPath ? ` → ${show(ledgerPath)}` : ""}`);
   }
+  if (opts.signatureIndexPath && !opts.dryRun && (result.ledgersWritten.length > 0 || !existsSync(opts.signatureIndexPath))) {
+    writeSignatureIndex(opts.signatureIndexPath, getIndex());
+  }
   result.wallMs = Math.round(performance.now() - t0);
   if (opts.heartbeatPath && !opts.dryRun) {
     const at = new Date().toISOString();
@@ -231,6 +253,14 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
     renameSync(tmp, opts.heartbeatPath);
   }
   return result;
+}
+
+/** 本场的具体性报错签名里，以前在别的会话（结束早于本场）出现过的那些 → 账本「疑似又踩」节的行 */
+export function recurrenceFor(index: SignatureIndex, doc: SessionDoc, summary: SessionSummary): string[] {
+  const sigs = new Map<string, string>();
+  for (const e of summary.errors) for (const [k, v] of recurrenceSignatures(e.text)) if (!sigs.has(k)) sigs.set(k, v);
+  if (sigs.size === 0) return [];
+  return recurrenceLines(lookupSignatures(index, sigs, { excludeSession: doc.sessionId, beforeIso: doc.endedAt ?? undefined }));
 }
 
 /** 只读账本文件开头的 frontmatter（≤4KB），取 generator / covered_upto；不是账本或读不了返回 null */
@@ -310,12 +340,13 @@ export async function writeSessionLedgerNow(o: WriteLedgerNowOptions): Promise<{
   const nowMs = o.nowMs ?? Date.now();
   const doc = parseSessionFile(o.file.path, { source: o.file.source });
   if (!doc.endedAt) throw new Error(`转录里没有带时间的事件：${o.file.path}`);
-  const meta: LedgerMeta = { trigger: o.trigger, pass: 0, machine: o.file.machine, generatedAt: new Date(nowMs).toISOString() };
+  const summary = summarizeSession(doc);
+  const meta: LedgerMeta = { trigger: o.trigger, pass: 0, machine: o.file.machine, generatedAt: new Date(nowMs).toISOString(), recurrence: recurrenceFor(buildSignatureIndex(o.ledgerDir), doc, summary) };
   const store = new SessionStateStore(o.stateDir);
   const state = store.load(store.fresh(o.file).key) ?? store.fresh(o.file);
   meta.pass = state.pass + 1;
   const render = o.body
-    ? renderLedgerMarkdown(doc, summarizeSession(doc), o.body, meta, null, "agent")
+    ? renderLedgerMarkdown(doc, summary, o.body, meta, null, "agent")
     : await buildLedger(doc, meta, o.llm ?? null, { ...o.render, includeCandidates: false });
   const path = ledgerTargetPath(o.ledgerDir, doc, state.ledgerPath);
   // 没给正文、LLM 又没生成出来：不盖已有账本、不推进游标，交给扫描器之后补（P1 互审 R1 Codex #4）

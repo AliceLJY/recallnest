@@ -3102,7 +3102,7 @@ sessionsCmd
   .option("--sources <list>", "只扫这些端：cc,codex,kimi,antigravity")
   .option("--limit <n>", "本轮最多生成多少份账本（0 = 不限）", "0")
   .option("--no-llm", "不调 LLM，只出机器抽取版账本（影子期先量覆盖与游标）")
-  .option("--candidates", "出经验候选节（正式模式默认看 config sessionsSweep.candidates，影子模式默认出）")
+  .option("--candidates", "出经验候选节（默认出；正式模式下 config sessionsSweep.candidates: false 可关）")
   .option("--no-candidates", "不出经验候选节")
   .option("--mask-memory-writes", "回放用：隐藏当场写过的记忆，免得账本召回被灌水")
   .option("--now <iso>", "把「现在」定在某个时刻（回放用）")
@@ -3113,6 +3113,7 @@ sessionsCmd
   .option("--json", "结尾输出 JSON 汇总")
   .action(async (options) => {
     const { runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE, SWEEP_HEARTBEAT_FILE } = await import("./sessions-sweep-run.js");
+    const { SIGNATURE_INDEX_FILE } = await import("./ledger-signatures.js");
     const config = loadConfig();
     const sweepCfg = config.sessionsSweep ?? {};
     const formal = !options.shadow;
@@ -3141,12 +3142,13 @@ sessionsCmd
         candidateAfterMinutes: options.candidateAfterMinutes !== undefined ? Number(options.candidateAfterMinutes) : (sweepCfg.candidateAfterMinutes?.[src] ?? p.candidateAfterMinutes),
       };
     }
-    const candidates = options.candidates !== undefined ? Boolean(options.candidates) : formal ? Boolean(sweepCfg.candidates) : true;
+    // 经验候选节（D2 第二步）：默认出；config sessionsSweep.candidates: false 可关（P1 ⑥，候选精度复测 30 / 40 过线）
+    const candidates = options.candidates !== undefined ? Boolean(options.candidates) : formal ? sweepCfg.candidates !== false : true;
     const dataDir = resolve(envDataDir());
     const runOpts: Parameters<typeof runSweep>[0] = {
       roots: parseRootsOption(options.roots ?? (formal ? "truth" : "local")),
       ...(formal
-        ? { ledgerDir, stateDir: join(dataDir, "session-state"), logPath: join(dataDir, "logs", "sessions-sweep.jsonl"), heartbeatPath: join(dataDir, SWEEP_HEARTBEAT_FILE) }
+        ? { ledgerDir, stateDir: join(dataDir, "session-state"), logPath: join(dataDir, "logs", "sessions-sweep.jsonl"), heartbeatPath: join(dataDir, SWEEP_HEARTBEAT_FILE), signatureIndexPath: join(dataDir, SIGNATURE_INDEX_FILE), recallLogRoot: dataDir }
         : { shadowDir: options.shadow.replace(/^~\//, `${require("node:os").homedir()}/`) }),
       policy: { minUserTurns: Number(options.minUserTurns) },
       policyBySource,
