@@ -105,7 +105,9 @@ export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOp
     turnOf.set(e.seq, turn);
     if (e.kind === "tool_call" && e.toolName && MEMORY_WRITE_RE.test(e.toolName)) turnsWithMemoryWrite.add(turn);
   }
-  const lines: Array<{ seq: number; weight: number; render: (tail: boolean) => string }> = [];
+  // masked：遮复述的实验组里被遮的行。它先占着位置把「结尾 10 行」定下来再拿走——否则遮掉之后更早的旧发言会滑进结尾、
+  // 拿到放宽的 1200 字，实验组反而看到对照组看不到的内容（P1 互审 R1 Codex #8）
+  const lines: Array<{ seq: number; weight: number; masked?: boolean; render: (tail: boolean) => string }> = [];
   const callNames = new Map<string, string>();
   for (const e of doc.events) {
     switch (e.kind) {
@@ -114,8 +116,7 @@ export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOp
         lines.push({ seq: e.seq, weight: 3, render: () => `[U#${e.seq} ${shortTs(e.ts)}] ${safe(e.text)}` });
         break;
       case "assistant":
-        if (o.maskRestatement && turnsWithMemoryWrite.has(turnOf.get(e.seq) ?? -1)) break;
-        lines.push({ seq: e.seq, weight: 1, render: (tail) => `[A#${e.seq}] ${safe(e.text, tail ? Math.max(o.assistantClip, TAIL_ASSISTANT_CLIP) : o.assistantClip)}` });
+        lines.push({ seq: e.seq, weight: 1, masked: o.maskRestatement && turnsWithMemoryWrite.has(turnOf.get(e.seq) ?? -1), render: (tail) => `[A#${e.seq}] ${safe(e.text, tail ? Math.max(o.assistantClip, TAIL_ASSISTANT_CLIP) : o.assistantClip)}` });
         break;
       case "tool_call":
         if (e.toolCallId && e.toolName) callNames.set(e.toolCallId, e.toolName);
@@ -137,26 +138,30 @@ export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOp
     }
   }
   const tailStart = Math.max(0, lines.length - TAIL_EVENTS);
-  const texts = lines.map((l, i) => l.render(i >= tailStart));
+  const texts = lines.map((l, i) => (l.masked ? "" : l.render(i >= tailStart)));
   const withMarker = (kept: number[]): string => {
     const out: string[] = [];
+    let marked = false;
     for (const i of kept) {
-      if (i === tailStart && tailStart > 0) out.push(TAIL_MARKER);
+      if (!marked && i >= tailStart && tailStart > 0) {
+        out.push(TAIL_MARKER);
+        marked = true;
+      }
       out.push(texts[i]);
     }
     return out.join("\n");
   };
-  let total = texts.reduce((n, t) => n + t.length + 1, 0);
-  const all = texts.map((_, i) => i);
+  const all = texts.map((_, i) => i).filter((i) => !lines[i].masked);
+  let total = all.reduce((n, i) => n + texts[i].length + 1, 0);
   if (total <= o.maxChars) return { text: withMarker(all), droppedEvents: 0 };
   // 从中间往两头削权重最低的（助手发言）；结尾 TAIL_EVENTS 条与最后 3 条助手行、3 条报错行不削
   const protectedIdx = new Set<number>();
   for (let i = tailStart; i < lines.length; i++) protectedIdx.add(i);
   for (const w of [1, 2]) {
     let kept = 0;
-    for (let i = lines.length - 1; i >= 0 && kept < 3; i--) if (lines[i].weight === w) { protectedIdx.add(i); kept++; }
+    for (let i = lines.length - 1; i >= 0 && kept < 3; i--) if (lines[i].weight === w && !lines[i].masked) { protectedIdx.add(i); kept++; }
   }
-  const order = lines.map((l, i) => ({ i, dist: Math.abs(i - lines.length / 2), w: l.weight })).sort((a, b) => a.w - b.w || a.dist - b.dist);
+  const order = all.map((i) => ({ i, dist: Math.abs(i - lines.length / 2), w: lines[i].weight })).sort((a, b) => a.w - b.w || a.dist - b.dist);
   const drop = new Set<number>();
   let dropped = 0;
   for (const { i } of order) {
@@ -168,7 +173,7 @@ export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOp
   }
   if (total > o.maxChars) {
     // 还超：用户行不丢，但单条截到 2,000 字（R3 Codex 自评 #4：30,000 字的用户输入会让预算形同虚设）
-    for (let i = 0; i < texts.length; i++) {
+    for (const i of all) {
       if (!drop.has(i) && lines[i].weight >= 3 && texts[i].length > 2000) texts[i] = `${texts[i].slice(0, 2000)}… [用户发言截断 ${texts[i].length - 2000} 字]`;
     }
   }
@@ -403,6 +408,8 @@ export function renderLedgerMarkdown(doc: SessionDoc, summary: SessionSummary, b
     machine: meta.machine ?? doc.machine ?? null,
     started: doc.startedAt,
     ended: doc.endedAt,
+    // 这份账本写的时候转录读到哪一刻：扫描器据此判断之后有没有新的用户发言（收工账本的保护看它，不看本机游标）
+    covered_upto: doc.endedAt,
     trigger: meta.trigger,
     pass: meta.pass,
     generated_at: meta.generatedAt ?? new Date().toISOString(),

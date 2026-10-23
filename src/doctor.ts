@@ -322,7 +322,8 @@ export function checkSessionsSweep(opts: { ledgersConfigured: boolean; heartbeat
   const ago = `${Math.round(age / 60_000)} 分钟前`;
   if (!Number.isFinite(age) || age > SWEEP_STALE_MS) return fail(name, `上次扫描 ${Number.isFinite(age) ? ago : "时间不明"}（超过 ${SWEEP_STALE_MS / 60_000} 分钟）`, fix);
   const detail = `上次扫描 ${ago}，写账本 ${hb.ledgersWritten} 份，LLM ${hb.llmCalls} 次`;
-  if (hb.llmCalls > 0 && hb.llmFailures === hb.llmCalls) return warn(name, `${detail}，全部失败（账本只有机器抽取的两节）`, "检查 sessionsSweep.llm / llm 的 key 与额度");
+  const streak = hb.llmFailStreak ?? (hb.llmCalls > 0 && hb.llmFailures >= hb.llmCalls ? 1 : 0);
+  if (streak > 0) return warn(name, `${detail}；LLM 已连续 ${streak} 轮全失败（最近 ${hb.lastLlmFailureAt ?? "时间不明"}），这期间的账本只有机器抽取的两节`, "检查 sessionsSweep.llm / llm 的 key 与额度");
   return pass(name, detail);
 }
 

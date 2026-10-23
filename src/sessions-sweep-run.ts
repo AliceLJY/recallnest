@@ -8,7 +8,7 @@
  * 每端各自的静默阈值走 `policyBySource`（Alice 10-23 拍板：CC 60 分钟 / 候选 12 小时，其余端 30 分钟 / 6 小时）。
  */
 
-import { appendFileSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 
 import type { LLMClient } from "./llm-client.js";
@@ -64,6 +64,8 @@ export interface SweepRunResult {
   llmCompletionTokens: number;
   llmFailures: number;
   wallMs: number;
+  /** 写了心跳时带回本轮心跳（CLI 据此定退出码） */
+  heartbeat?: SweepHeartbeat;
 }
 
 /** 各端默认的静默阈值（Alice 2026-10-23 拍板：CC 常停一两个小时再接着聊，60 分钟 / 候选 12 小时；其余端沿用 D2 的 30 / 360） */
@@ -86,6 +88,29 @@ export interface SweepHeartbeat {
   ledgersWritten: number;
   llmCalls: number;
   llmFailures: number;
+  /**
+   * 连续几轮「调了 LLM 且全失败」。没调 LLM 的空轮不清零也不加（10 分钟一轮，多数轮没事可做——空轮清零的话
+   * 故障永远凑不齐「连续」，P1 互审 R1 Codex #7）；有一次成功才清零。
+   */
+  llmFailStreak: number;
+  lastLlmFailureAt: string | null;
+}
+
+/** 由上一份心跳与本轮结果算出新的失败连击 */
+export function nextLlmFailState(prev: Pick<SweepHeartbeat, "llmFailStreak" | "lastLlmFailureAt"> | null, run: { llmCalls: number; llmFailures: number }, nowIso: string): { llmFailStreak: number; lastLlmFailureAt: string | null } {
+  const streak = prev?.llmFailStreak ?? 0;
+  const last = prev?.lastLlmFailureAt ?? null;
+  if (run.llmCalls === 0) return { llmFailStreak: streak, lastLlmFailureAt: last };
+  if (run.llmFailures >= run.llmCalls) return { llmFailStreak: streak + 1, lastLlmFailureAt: nowIso };
+  return { llmFailStreak: 0, lastLlmFailureAt: last };
+}
+
+export function readHeartbeat(path: string): SweepHeartbeat | null {
+  try {
+    return JSON.parse(readFileSync(path, "utf-8")) as SweepHeartbeat;
+  } catch {
+    return null;
+  }
 }
 
 export function policyFor(source: SessionSource, opts: Pick<SweepRunOptions, "policy" | "policyBySource">): SweepPolicy {
@@ -135,10 +160,13 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
       actions["skip-no-timestamp"] = (actions["skip-no-timestamp"] ?? 0) + 1;
       continue;
     }
-    // 收工时当场写过账本（P1 ⑤），之后只多了助手的收尾、没有新的用户发言：留着那份，不用机器版盖掉
-    let keepManualUpto: string | null = null;
-    if ((decision.action === "ledger" || decision.action === "ledger+candidates") && state.lastAction === "manual" && state.processedUpto && decision.doc && !hasUserTurnAfter(decision.doc, state.processedUpto)) {
-      keepManualUpto = decision.lastMessageAt ?? null;
+    // 收工时当场写过账本（P1 ⑤），之后没有新的用户发言：留着那份，不用机器版盖掉。
+    // 判据看账本文件自己的 frontmatter（generator: agent + covered_upto），不看本机游标——游标会被每轮扫描改写，
+    // 也不跟着账本跨机同步（P1 互审 R1 Codex #1 #3）
+    let keepAgentUpto: string | null = null;
+    const targetPath = decision.doc ? ledgerTargetPath(ledgerRoot, decision.doc, state.ledgerPath) : null;
+    if ((decision.action === "ledger" || decision.action === "ledger+candidates" || decision.action === "candidates") && decision.doc && targetPath && agentLedgerCovers(targetPath, decision.doc)) {
+      keepAgentUpto = decision.lastMessageAt ?? decision.doc.endedAt ?? null;
       decision = { ...decision, action: "up-to-date", reason: "收工账本之后没有新的用户发言，保留当场写的账本" };
     }
     // 候选关着时：「ledger+candidates」降成只写账本（候选记已处理，不再到期）；只剩候选到期的「candidates」不重生成
@@ -162,20 +190,30 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
         if (render.generator === "llm-failed") result.llmFailures++;
         usageNote = { generator: render.generator, tokens: render.usage ? [render.usage.promptTokens, render.usage.completionTokens] : null, wallMs: render.usage?.wallMs ?? null, failure: render.failure ? redactSecrets(render.failure).text.slice(0, 300) : undefined, candidates: includeCandidates, experience: render.body?.experience.length ?? 0, anchorsUnverified: render.body?.experience.filter((x) => !x.anchorVerified).length ?? 0 };
       }
-      ledgerPath = join(ledgerRoot, ledgerRelPath(decision.doc.sessionId, decision.lastMessageAt ?? decision.doc.endedAt ?? new Date(nowMs).toISOString()));
-      mkdirSync(dirname(ledgerPath), { recursive: true });
-      // 先写临时文件再改名：Syncthing / 对账导入不会读到写了一半的账本
-      const tmp = `${ledgerPath}.tmp-${process.pid}`;
-      writeFileSync(tmp, render.markdown);
-      renameSync(tmp, ledgerPath);
-      result.ledgersWritten.push(ledgerPath);
-      produced++;
+      const target = targetPath ?? join(ledgerRoot, ledgerRelPath(decision.doc.sessionId, decision.lastMessageAt ?? decision.doc.endedAt ?? new Date(nowMs).toISOString()));
+      // 等 LLM 的这段时间里收工命令可能已经写了当场账本：提交前再看一眼，盖住就放弃这次生成（P1 互审 R1 Codex #2）
+      if (agentLedgerCovers(target, decision.doc)) {
+        keepAgentUpto = decision.lastMessageAt ?? decision.doc.endedAt ?? null;
+        actions[decision.action] = (actions[decision.action] ?? 1) - 1;
+        actions["up-to-date"] = (actions["up-to-date"] ?? 0) + 1;
+        decision = { ...decision, action: "up-to-date", reason: "生成期间收工账本已写入，放弃本次生成" };
+      } else {
+        ledgerPath = target;
+        mkdirSync(dirname(ledgerPath), { recursive: true });
+        // 先写临时文件再改名：Syncthing / 对账导入不会读到写了一半的账本
+        const tmp = `${ledgerPath}.tmp-${process.pid}`;
+        writeFileSync(tmp, render.markdown);
+        renameSync(tmp, ledgerPath);
+        result.ledgersWritten.push(ledgerPath);
+        produced++;
+      }
     }
     if (!opts.dryRun) {
       const next = applyDecision(state, file, decision, nowMs, policy, ledgerPath);
-      if (keepManualUpto) {
-        next.processedUpto = keepManualUpto;
-        next.lastAction = "manual";
+      if (keepAgentUpto) {
+        next.processedUpto = keepAgentUpto;
+        next.candidateDone = true;
+        if (targetPath) next.ledgerPath = targetPath;
       }
       stateStore.save(next);
       if (sweepLog) appendFileSync(sweepLog, `${JSON.stringify({ ts: new Date(nowMs).toISOString(), source: file.source, sid8: file.sessionId.slice(0, 8), action: decision.action, reason: decision.reason, userTurns: decision.summary?.userTurns ?? null, rich: decision.summary?.rich ?? null, lastMessageAt: decision.lastMessageAt ?? null, ledger: ledgerPath ? show(ledgerPath) : null, ...usageNote })}\n`);
@@ -184,13 +222,66 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
   }
   result.wallMs = Math.round(performance.now() - t0);
   if (opts.heartbeatPath && !opts.dryRun) {
-    const hb: SweepHeartbeat = { at: new Date().toISOString(), wallMs: result.wallMs, discovered: result.discovered, actions: result.actions, ledgersWritten: result.ledgersWritten.length, llmCalls: result.llmCalls, llmFailures: result.llmFailures };
+    const at = new Date().toISOString();
+    const hb: SweepHeartbeat = { at, wallMs: result.wallMs, discovered: result.discovered, actions: result.actions, ledgersWritten: result.ledgersWritten.length, llmCalls: result.llmCalls, llmFailures: result.llmFailures, ...nextLlmFailState(readHeartbeat(opts.heartbeatPath), result, at) };
+    result.heartbeat = hb;
     mkdirSync(dirname(opts.heartbeatPath), { recursive: true });
     const tmp = `${opts.heartbeatPath}.tmp-${process.pid}`;
     writeFileSync(tmp, `${JSON.stringify(hb)}\n`);
     renameSync(tmp, opts.heartbeatPath);
   }
   return result;
+}
+
+/** 只读账本文件开头的 frontmatter（≤4KB），取 generator / covered_upto；不是账本或读不了返回 null */
+export function readLedgerHead(path: string): { generator?: string; coveredUpto?: string; session?: string } | null {
+  if (!existsSync(path)) return null;
+  let head = "";
+  try {
+    const fd = openSync(path, "r");
+    try {
+      const buf = Buffer.alloc(4096);
+      const n = readSync(fd, buf, 0, buf.length, 0);
+      head = buf.subarray(0, n).toString("utf-8");
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+  const m = head.match(/^---\n([\s\S]*?)\n---/);
+  if (!m) return null;
+  const out: Record<string, string> = {};
+  for (const line of m[1].split("\n")) {
+    const i = line.indexOf(":");
+    if (i <= 0) continue;
+    let v = line.slice(i + 1).trim();
+    if (v.startsWith("\"") && v.endsWith("\"")) {
+      try { v = String(JSON.parse(v)); } catch { v = v.slice(1, -1); }
+    }
+    out[line.slice(0, i).trim()] = v;
+  }
+  return { generator: out.generator, coveredUpto: out.covered_upto, session: out.session };
+}
+
+/** 当场 agent 写的账本还管着这场会话吗：generator 是 agent，且 covered_upto 之后没有新的真人用户发言 */
+export function agentLedgerCovers(path: string, doc: SessionDoc): boolean {
+  const head = readLedgerHead(path);
+  if (!head || head.generator !== "agent" || !head.coveredUpto || Number.isNaN(Date.parse(head.coveredUpto))) return false;
+  return !hasUserTurnAfter(doc, head.coveredUpto);
+}
+
+/**
+ * 账本落在哪：这场会话已经有账本（游标记着的、或按开始 / 结束月份算得到的）就写回原处，免得跨月续聊时
+ * 一场会话出两份；都没有才按结束月份新建。
+ */
+export function ledgerTargetPath(ledgerRoot: string, doc: SessionDoc, stateLedgerPath?: string): string {
+  const candidates = [
+    stateLedgerPath && stateLedgerPath.startsWith(ledgerRoot) ? stateLedgerPath : null,
+    doc.endedAt ? join(ledgerRoot, ledgerRelPath(doc.sessionId, doc.endedAt)) : null,
+    doc.startedAt ? join(ledgerRoot, ledgerRelPath(doc.sessionId, doc.startedAt)) : null,
+  ].filter((p): p is string => !!p);
+  return candidates.find((p) => existsSync(p)) ?? candidates[0] ?? join(ledgerRoot, ledgerRelPath(doc.sessionId, new Date().toISOString()));
 }
 
 function hasUserTurnAfter(doc: SessionDoc, iso: string): boolean {
@@ -215,7 +306,7 @@ export interface WriteLedgerNowOptions {
  * 没给才调 LLM；机器抽取两节照常从转录里抽。写完把游标推到当前最后一条消息、候选记已处理——
  * 扫描器之后只在有新的用户发言时才重写它。
  */
-export async function writeSessionLedgerNow(o: WriteLedgerNowOptions): Promise<{ path: string; generator: string; failure?: string }> {
+export async function writeSessionLedgerNow(o: WriteLedgerNowOptions): Promise<{ path: string; generator: string; failure?: string; written: boolean }> {
   const nowMs = o.nowMs ?? Date.now();
   const doc = parseSessionFile(o.file.path, { source: o.file.source });
   if (!doc.endedAt) throw new Error(`转录里没有带时间的事件：${o.file.path}`);
@@ -226,11 +317,13 @@ export async function writeSessionLedgerNow(o: WriteLedgerNowOptions): Promise<{
   const render = o.body
     ? renderLedgerMarkdown(doc, summarizeSession(doc), o.body, meta, null, "agent")
     : await buildLedger(doc, meta, o.llm ?? null, { ...o.render, includeCandidates: false });
-  const path = join(o.ledgerDir, ledgerRelPath(doc.sessionId, doc.endedAt));
+  const path = ledgerTargetPath(o.ledgerDir, doc, state.ledgerPath);
+  // 没给正文、LLM 又没生成出来：不盖已有账本、不推进游标，交给扫描器之后补（P1 互审 R1 Codex #4）
+  if (render.generator !== "agent" && render.generator !== "llm") return { path, generator: render.generator, failure: render.failure ?? "no llm", written: false };
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}`;
   writeFileSync(tmp, render.markdown);
   renameSync(tmp, path);
   store.save({ ...state, path: o.file.path, processedUpto: doc.endedAt, pass: meta.pass, candidateDueAt: null, candidateDone: true, lastMtimeMs: o.file.mtimeMs, lastSweepAt: new Date(nowMs).toISOString(), lastAction: "manual", notIdleSince: null, ledgerPath: path });
-  return { path, generator: render.generator, failure: render.failure };
+  return { path, generator: render.generator, failure: render.failure, written: true };
 }

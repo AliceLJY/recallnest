@@ -3082,8 +3082,12 @@ sessionsCmd
       body,
       llm,
     });
-    console.log(`✅ 账本：${r.path}（正文：${r.generator === "agent" ? "当场 agent 写的" : r.generator}${r.failure ? `，失败：${r.failure}` : ""}）`);
-    if (r.generator === "llm-failed" || r.generator === "none") process.exitCode = 3;
+    if (!r.written) {
+      console.error(`❌ 没写账本（正文生成失败：${r.failure ?? r.generator}）；已有的账本与游标都没动，扫描器之后会补。要当场写就加 --body 给正文`);
+      process.exitCode = 3;
+      return;
+    }
+    console.log(`✅ 账本：${r.path}（正文：${r.generator === "agent" ? "当场 agent 写的" : r.generator}）`);
   });
 
 sessionsCmd
@@ -3166,11 +3170,18 @@ sessionsCmd
       const outcome = await withLock("sessions-sweep", () => runSweep(runOpts), { onBusy: "skip", expireMs: 2 * 3_600_000 });
       if (!outcome.ran) {
         console.log("上一轮扫描还在跑（锁 sessions-sweep 被占），本轮跳过");
+        process.exitCode = 5; // 包装脚本：既不算失败、也不清零失败计数
         return;
       }
       result = outcome.result;
     } else {
       result = await runSweep(runOpts);
+    }
+    // 退出码给包装脚本数连续失败（P1 互审 R1 Codex #7）：4 = 本轮调了 LLM 且全失败；
+    // 6 = 本轮没调 LLM、但之前的 LLM 故障还没恢复（不清零）；0 = 正常
+    if (result.heartbeat) {
+      if (result.llmCalls > 0 && result.llmFailures >= result.llmCalls) process.exitCode = 4;
+      else if (result.llmCalls === 0 && result.heartbeat.llmFailStreak > 0) process.exitCode = 6;
     }
     if (options.json) console.log(JSON.stringify(result, null, 2));
     else console.log(`发现 ${result.discovered}（stat ${result.statCalls} 次 / ${result.discoveryWallMs} ms）；决策 ${JSON.stringify(result.actions)}；写账本 ${result.ledgersWritten.length} 份；LLM ${result.llmCalls} 次（${result.llmPromptTokens}+${result.llmCompletionTokens} tokens，失败 ${result.llmFailures}）；${result.wallMs} ms`);

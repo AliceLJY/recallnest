@@ -4,9 +4,9 @@
 # 上一轮没跑完时 CLI 自己按锁跳过（sessions-sweep）。心跳写 data/sessions-sweep-heartbeat.json，doctor 看它。
 # 安装 / 卸载：scripts/setup-sessions-sweep.sh install | uninstall
 #
-# 失败报警（写法同 incremental-ingest.sh / 2026-09-17 实施规范）：每 10 分钟一轮，单次失败（网络抖、LLM 429）不报，
-# 连续 3 轮（约 30 分钟）都失败才发一条 TG，之后每连续 18 轮（约 3 小时）再提醒一次；恢复后计数清零。
-# 脚本以真实退出码结束。
+# 失败报警（写法同 incremental-ingest.sh / 2026-09-17 实施规范）：单次失败（网络抖、LLM 429）不报，
+# 连续 3 次失败（只数真正失败的轮次，锁忙与空轮不算也不清零）才发一条 TG，之后每再失败 18 次提醒一次；成功一轮清零。
+# 失败轮以真实退出码结束；锁忙 / 空轮以 0 结束（launchd 不必看到它们）。
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$SCRIPT_DIR" || exit 1
@@ -52,10 +52,17 @@ EXIT_CODE=$?
 kill "$WATCH" 2>/dev/null
 wait "$WATCH" 2>/dev/null
 
-if [ "$EXIT_CODE" -eq 0 ]; then
-  echo 0 > "$STATE_FILE"
-  exit 0
-fi
+# 退出码（cli.ts sessions sweep）：0 正常 → 清零；5 锁忙（上一轮还在跑）、6 本轮没调 LLM 但之前的 LLM 故障未恢复 →
+# 既不算失败、也不清零（10 分钟一轮多数轮没事可做，空轮清零会让连续失败永远凑不齐）；其余（4 = LLM 全失败、崩溃、超时）计一次
+case "$EXIT_CODE" in
+  0)
+    echo 0 > "$STATE_FILE"
+    exit 0
+    ;;
+  5|6)
+    exit 0
+    ;;
+esac
 
 N=$(( $(cat "$STATE_FILE" 2>/dev/null || echo 0) + 1 ))
 echo "$N" > "$STATE_FILE"
