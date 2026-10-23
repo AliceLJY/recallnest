@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { checkSessionsSweep } from "../doctor.js";
 import type { LLMClient } from "../llm-client.js";
-import { policyFor, runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE, SWEEP_STALE_MS, writeSessionLedgerNow } from "../sessions-sweep-run.js";
+import { nextLlmFailState, policyFor, runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE, SWEEP_STALE_MS, writeSessionLedgerNow } from "../sessions-sweep-run.js";
 import { appendFileSync } from "node:fs";
 import { discoverTranscripts, SessionStateStore } from "../sessions-sweep.js";
 
@@ -162,6 +162,99 @@ describe("收工当场写账本（P1 ⑤）", () => {
     expect(readFileSync(again.ledgersWritten[0], "utf-8")).toContain("trigger: auto-sweep");
   });
 
+  it("中间夹一轮 not-idle 扫描也不丢保护（R1 Codex #1）", async () => {
+    const e = env();
+    const sid = "abab1111-0000-4000-8000-000000000011";
+    const path = writeCC(e.cc, sid, 5);
+    const file = discoverTranscripts([{ source: "cc", dir: e.cc }]).files[0];
+    const r = await writeSessionLedgerNow({ file, ledgerDir: e.ledgerDir, stateDir: e.stateDir, trigger: "manual-收工", body: agentBody, nowMs: NOW });
+    const md = readFileSync(r.path, "utf-8");
+    appendFileSync(path, line(sid, NOW + MIN, "assistant", "收工完成"));
+    utimesSync(path, new Date(NOW + MIN), new Date(NOW + MIN));
+    const { llm, calls } = fakeLLM();
+    const base = { roots: [{ source: "cc" as const, dir: e.cc }], ledgerDir: e.ledgerDir, stateDir: e.stateDir, llm, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false };
+    const mid = await runSweep({ ...base, nowMs: NOW + 10 * MIN });
+    expect(mid.actions["not-idle"]).toBe(1);
+    const late = await runSweep({ ...base, nowMs: NOW + 90 * MIN });
+    expect(late.actions["up-to-date"]).toBe(1);
+    expect(calls()).toBe(0);
+    expect(readFileSync(r.path, "utf-8")).toBe(md);
+  });
+
+  it("跨机同步来的收工账本、本机没有游标：扫描器照样保留（R1 Codex #3）", async () => {
+    const e = env();
+    const sid = "abab2222-0000-4000-8000-000000000022";
+    writeCC(e.cc, sid, 90);
+    const file = discoverTranscripts([{ source: "cc", dir: e.cc }]).files[0];
+    // 「另一台机」写的：游标在别的目录，本机 stateDir 空
+    const r = await writeSessionLedgerNow({ file, ledgerDir: e.ledgerDir, stateDir: join(e.root, "other-machine-state"), trigger: "manual-收工", body: agentBody, nowMs: NOW });
+    const md = readFileSync(r.path, "utf-8");
+    const { llm, calls } = fakeLLM();
+    const res = await runSweep({ roots: [{ source: "cc", dir: e.cc }], ledgerDir: e.ledgerDir, stateDir: e.stateDir, llm, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false, nowMs: NOW + 60 * MIN });
+    expect(res.actions["up-to-date"]).toBe(1);
+    expect(calls()).toBe(0);
+    expect(readFileSync(r.path, "utf-8")).toBe(md);
+  });
+
+  it("扫描器等 LLM 期间收工账本写进来：提交前发现，放弃这次生成（R1 Codex #2）", async () => {
+    const e = env();
+    const sid = "abab3333-0000-4000-8000-000000000033";
+    writeCC(e.cc, sid, 90);
+    const file = discoverTranscripts([{ source: "cc", dir: e.cc }]).files[0];
+    const inner = fakeLLM();
+    let manualPath = "";
+    const racingLLM = {
+      chatLongDetailed: async (...args: unknown[]) => {
+        const r = await writeSessionLedgerNow({ file, ledgerDir: e.ledgerDir, stateDir: join(e.root, "cli-state"), trigger: "manual-收工", body: agentBody, nowMs: NOW });
+        manualPath = r.path;
+        return (inner.llm.chatLongDetailed as (...a: unknown[]) => Promise<unknown>)(...args);
+      },
+    } as unknown as LLMClient;
+    const res = await runSweep({ roots: [{ source: "cc", dir: e.cc }], ledgerDir: e.ledgerDir, stateDir: e.stateDir, llm: racingLLM, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false, nowMs: NOW });
+    expect(res.ledgersWritten).toEqual([]);
+    expect(res.actions["up-to-date"]).toBe(1);
+    expect(readFileSync(manualPath, "utf-8")).toContain("generator: agent");
+  });
+
+  it("没给正文、LLM 失败：不盖已有账本、不推进游标（R1 Codex #4）", async () => {
+    const e = env();
+    const sid = "abab4444-0000-4000-8000-000000000044";
+    writeCC(e.cc, sid, 90);
+    const file = discoverTranscripts([{ source: "cc", dir: e.cc }]).files[0];
+    const { llm } = fakeLLM();
+    const first = await runSweep({ roots: [{ source: "cc", dir: e.cc }], ledgerDir: e.ledgerDir, stateDir: e.stateDir, llm, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false, nowMs: NOW });
+    const md = readFileSync(first.ledgersWritten[0], "utf-8");
+    const stBefore = readFileSync(join(e.stateDir, readdirSync(e.stateDir)[0]), "utf-8");
+    const broken = { chatLongDetailed: async () => { throw new Error("429 You have exceeded your current request limit"); } } as unknown as LLMClient;
+    const r = await writeSessionLedgerNow({ file, ledgerDir: e.ledgerDir, stateDir: e.stateDir, trigger: "manual-收工", llm: broken, render: { retries: 0 }, nowMs: NOW + MIN });
+    expect(r.written).toBe(false);
+    expect(readFileSync(first.ledgersWritten[0], "utf-8")).toBe(md);
+    expect(readFileSync(join(e.stateDir, readdirSync(e.stateDir)[0]), "utf-8")).toBe(stBefore);
+  });
+
+  it("跨月续聊：写回原来那份，不在新月份另起一份", async () => {
+    const e = env();
+    const sid = "abab5555-0000-4000-8000-000000000055";
+    const oct = Date.parse("2026-10-31T23:00:00.000Z");
+    const path = join(e.cc, "-Users-x", `${sid}.jsonl`);
+    mkdirSync(join(e.cc, "-Users-x"), { recursive: true });
+    for (let i = 0; i < 4; i++) {
+      appendFileSync(path, line(sid, oct + i * 2 * MIN, "user", `问 ${i}`));
+      appendFileSync(path, line(sid, oct + i * 2 * MIN + 1000, "assistant", `答 ${i}`));
+    }
+    utimesSync(path, new Date(oct + 8 * MIN), new Date(oct + 8 * MIN));
+    const { llm } = fakeLLM();
+    const base = { roots: [{ source: "cc" as const, dir: e.cc }], ledgerDir: e.ledgerDir, stateDir: e.stateDir, llm, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false };
+    const a = await runSweep({ ...base, nowMs: oct + 120 * MIN });
+    expect(a.ledgersWritten).toEqual([join(e.ledgerDir, "2026-10", "abab5555.md")]);
+    appendFileSync(path, line(sid, oct + 180 * MIN, "user", "11 月接着问"));
+    appendFileSync(path, line(sid, oct + 181 * MIN, "assistant", "接着答"));
+    utimesSync(path, new Date(oct + 181 * MIN), new Date(oct + 181 * MIN));
+    const b = await runSweep({ ...base, nowMs: oct + 300 * MIN });
+    expect(b.ledgersWritten).toEqual([join(e.ledgerDir, "2026-10", "abab5555.md")]);
+    expect(existsSync(join(e.ledgerDir, "2026-11"))).toBe(false);
+  });
+
   it("没给正文就调 LLM 生成，不出候选", async () => {
     const e = env();
     writeCC(e.cc, "ffff6666-0000-4000-8000-000000000006", 5);
@@ -171,6 +264,32 @@ describe("收工当场写账本（P1 ⑤）", () => {
     expect(r.generator).toBe("llm");
     expect(calls()).toBe(1);
     expect(readFileSync(r.path, "utf-8")).toContain("## 经验（待确认）\n- （无）");
+  });
+});
+
+describe("LLM 失败连击（R1 Codex #7）", () => {
+  it("全失败 +1、空轮不变、有一次成功清零", () => {
+    const t = "2026-10-23T12:00:00.000Z";
+    let st = nextLlmFailState(null, { llmCalls: 2, llmFailures: 2 }, t);
+    expect(st).toEqual({ llmFailStreak: 1, lastLlmFailureAt: t });
+    st = nextLlmFailState(st, { llmCalls: 0, llmFailures: 0 }, "2026-10-23T12:10:00.000Z");
+    expect(st).toEqual({ llmFailStreak: 1, lastLlmFailureAt: t });
+    st = nextLlmFailState(st, { llmCalls: 1, llmFailures: 1 }, "2026-10-23T12:20:00.000Z");
+    expect(st.llmFailStreak).toBe(2);
+    st = nextLlmFailState(st, { llmCalls: 3, llmFailures: 2 }, "2026-10-23T12:30:00.000Z");
+    expect(st.llmFailStreak).toBe(0);
+  });
+  it("runSweep 把连击写进心跳，空轮带过去", async () => {
+    const e = env();
+    writeCC(e.cc, "acac1111-0000-4000-8000-000000000111", 90);
+    const broken = { chatLongDetailed: async () => { throw new Error("429 limit"); } } as unknown as LLMClient;
+    const base = { roots: [{ source: "cc" as const, dir: e.cc }], ledgerDir: e.ledgerDir, stateDir: e.stateDir, heartbeatPath: e.heartbeatPath, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false, render: { retries: 0 } };
+    const a = await runSweep({ ...base, llm: broken, nowMs: NOW });
+    expect(a.heartbeat?.llmFailStreak).toBe(1);
+    const b = await runSweep({ ...base, llm: broken, nowMs: NOW + 10 * MIN });
+    expect(b.llmCalls).toBe(0);
+    expect(b.heartbeat?.llmFailStreak).toBe(1);
+    expect(checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: e.heartbeatPath })?.status).toBe("warn");
   });
 });
 
@@ -189,7 +308,10 @@ describe("doctor：会话扫描验活", () => {
     expect(checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: hbPath, nowMs: NOW })?.status).toBe("pass");
     write(NOW - SWEEP_STALE_MS - MIN);
     expect(checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: hbPath, nowMs: NOW })?.status).toBe("fail");
-    write(NOW - 2 * MIN, { llmFailures: 2 });
+    write(NOW - 2 * MIN, { llmFailures: 2, llmFailStreak: 1 });
+    expect(checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: hbPath, nowMs: NOW })?.status).toBe("warn");
+    // 本轮空轮（0 次调用）但之前的故障没恢复：仍黄
+    write(NOW - 2 * MIN, { llmCalls: 0, llmFailures: 0, llmFailStreak: 2 });
     expect(checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: hbPath, nowMs: NOW })?.status).toBe("warn");
   });
 });

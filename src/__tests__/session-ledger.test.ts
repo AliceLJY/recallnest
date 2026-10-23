@@ -92,6 +92,21 @@ describe("session-ledger 结尾保全（P1 ②）", () => {
     expect(masked.text).toContain("[A#7] 记下了");
     expect(masked.text).toContain("[U#0");
   });
+  it("maskRestatement 不改变结尾范围：遮后的每一行都在照常版里原样出现（R1 Codex #8）", () => {
+    const d = doc();
+    // seq 8：结尾之外的一条长助手发言；之后一轮里写记忆，带 9 条助手复述
+    d.events.push({ seq: 8, ts: d.events[7].ts, tsMs: d.events[7].tsMs, kind: "assistant", text: `旧的长发言：${"旧".repeat(1500)}` });
+    d.events.push({ seq: 9, ts: d.events[7].ts, tsMs: d.events[7].tsMs, kind: "user", text: "把这次的坑记一下" });
+    for (let i = 0; i < 9; i++) d.events.push({ seq: 10 + i, ts: d.events[7].ts, tsMs: d.events[7].tsMs, kind: "assistant", text: `复述 ${i}` });
+    d.events.push({ seq: 19, ts: d.events[7].ts, tsMs: d.events[7].tsMs, kind: "tool_call", text: "", toolName: "mcp__recallnest__store_case", toolCallId: "t9", toolInput: { title: "x" } });
+    const plain = renderTranscriptForLLM(d, { assistantClip: 100, maskMemoryWrites: true });
+    const masked = renderTranscriptForLLM(d, { assistantClip: 100, maskMemoryWrites: true, maskRestatement: true });
+    const plainLines = new Set(plain.text.split("\n"));
+    for (const l of masked.text.split("\n")) if (l !== TAIL_MARKER) expect(plainLines.has(l)).toBe(true);
+    expect(masked.text).not.toContain("复述 0");
+    const old = masked.text.split("\n").find((l) => l.startsWith("[A#8]"))!;
+    expect(old.length).toBeLessThan(200);
+  });
   it("prompt 让「没做完」去结尾找完成证据，并要求决定写清谁定的", () => {
     expect(LEDGER_SYSTEM_PROMPT).toContain(TAIL_MARKER);
     expect(LEDGER_SYSTEM_PROMPT).toContain("unfinished 写之前，先到");

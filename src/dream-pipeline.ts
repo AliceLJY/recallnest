@@ -287,7 +287,10 @@ async function runDreamInner(params: {
   // =========================================================================
   // Phase 2: Gather — collect active entries for consolidation
   // =========================================================================
-  const entries = await store.list([scope], undefined, config.maxEntriesPerRun, 0, scopeMatch);
+  // 家族匹配（手动 `dream --scope memory` 不带 --exact-scope）会把 neverDreamScopes 里的兄弟 scope
+  // （memory:pivot、memory:ledger）一起取出来——上面的策略闸只看参数本身，挡不住；行级再排除一次（P1 互审 R1 Codex #5）
+  const familyExcludes = scopeMatch === "family" ? config.neverDreamScopes.filter((s) => s !== scope) : [];
+  const entries = await store.list([scope], undefined, config.maxEntriesPerRun, 0, scopeMatch, familyExcludes.length ? familyExcludes : undefined);
   const active = entries.filter(e => isActiveMemory(e.metadata));
   stats.activeMemories = active.length;
 
@@ -366,8 +369,9 @@ async function runDreamInner(params: {
       clusterThreshold: config.clusterThreshold,
       maxEntriesPerRun: config.maxEntriesPerRun,
       // 3a 自己重新取数（list + 两处 vectorSearch），gather 收窄了它不会跟着窄 ——
-      // 模式必须显式传进来，漏传就只修了一半（2026-08-16 互审 K3）。
+      // 模式必须显式传进来，漏传就只修了一半（2026-08-16 互审 K3）。排除的 scope 同理。
       scopeMatch,
+      excludeScopes: familyExcludes.length ? familyExcludes : undefined,
     }, params.kgStore ?? null);
     const consolidation = await engine.run(scope);
     stats.dedupeClustersFound += consolidation.clustersFound;

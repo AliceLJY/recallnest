@@ -1378,7 +1378,7 @@ async function undoUnlocked(
   // 反过来：此刻已有合并成员指向的行（比如对账之后 dream 把别的行合并进了本轮插入或恢复的行），撤成不活跃也会造出断链
   const targetsInUse = new Set<string>();
   if (willDeactivate.size > 0) {
-    for (const row of await loadMemoryScopeRows(deps.store)) {
+    for (const row of await loadMemoryScopeRows(deps.store, opts.scope)) {
       const st = rowState(row.meta);
       if (st.status === "consolidated" && st.consolidatedInto) targetsInUse.add(st.consolidatedInto);
     }
