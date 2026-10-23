@@ -286,7 +286,8 @@ function startsAtBoundary(raw: string[], map: number[], idx: number): boolean {
   const rawIdx = map[idx];
   if (rawIdx === undefined || rawIdx === 0) return true;
   const prev = raw[rawIdx - 1];
-  if (/\p{Script=Han}/u.test(prev)) return !NEGATION_CHAR_RE.test(raw.slice(Math.max(0, rawIdx - 2), rawIdx).join(""));
+  // 「不过」「没问题」这类带否定字的肯定说法先拿掉再看（R5 Codex #4：「不错不过以后全部…」）
+  if (/\p{Script=Han}/u.test(prev)) return !NEGATION_CHAR_RE.test([...raw.slice(Math.max(0, rawIdx - 4), rawIdx).join("").replace(AFFIRM_RE, "")].slice(-2).join(""));
   return !/[\p{L}\p{N}]/u.test(prev);
 }
 
@@ -294,26 +295,76 @@ function startsAtBoundary(raw: string[], map: number[], idx: number): boolean {
 const CLAUSE_END_RE = /[，,、。！？!?；;：:\n~～…]/u;
 /** 否定字离锚点多近算管着它：同一分句里、锚点前最近这么多个字（不数空白与标点） */
 const NEGATION_WINDOW = 4;
-/** 前一个分句、锚点之后到下一个分句末尾里出现就算「用户不认」的说法：「我不同意，以后全部…」「以后全部…，这个我不同意」 */
-const DISAGREE_RE = /不同意|不赞成|不认同|不接受|反对|否决|不采纳|别这么|不要这么|不是这个意思/u;
+/** 「用户不认」的说法：出现在锚点所在分句的前半截、前一个分句、锚点之后到下一个分句末尾，都可能管着锚点 */
+const DISAGREE_SOURCE = "不同意|不赞成|不认同|不接受|反对|否决|不采纳|别这么|不要这么|不是这个意思";
+/** 带否定字、本身却是肯定或转折的说法：数窗口里的否定字之前先拿掉（「没问题以后全部…」「不错不过以后…」，R5 Codex #4） */
+const AFFIRM_RE = /没问题|没关系|没事|没错|不错|不过|不管|不论|无论|非常|不仅|不但|不少|不久/gu;
+/** 「不同意」之后只剩这些语气词，才算光秃秃地管着相邻分句；接了别的东西（「我不同意删库」）就是在说别的事 */
+const TRAILING_PARTICLE_RE = /[啊吧呀的哈了呢哦嘛噢喔]/gu;
+/** 当前分句里「不同意」之后又转折了（「我不同意删库但以后…」），就不管锚点 */
+const CONTRAST_RE = /但是|但|不过|可是|然而|而是|只是/u;
+/** 「不同意」之后接了并列连词，说的是另一件事（「我反对删库而且我决定以后…」不加标点，R6 Codex #4） */
+const CONJUNCTION_RE = /而且|并且|另外|同时|还有/u;
+/** 锚点之后的「反对」接指代词：指的就是锚点那件事（「以后全部…，我反对这个建议」，R6 Codex #1）。只看锚点之后，前一个分句仍只认光秃秃的 */
+const POINTER_RE = /^(?:这个|这样|那个|这|它|此|该)/u;
+/** 采纳说法所在分句里的犹豫：「我还没决定是否采用」「要不要采用」不算采纳（R6 Codex #1） */
+const HESITATE_RE = /是否|要不要|考虑|再想|再看/u;
+/** 锚点之后说明这还没定、或只是助手的话：不算用户拍板（R6 Codex #1） */
+const UNDECIDED_AFTER_RE = /还在考虑|再想想|再看看|还没定|待定/u;
+/** 同上，但只在这段话最早出自助手时看：用户自己说出口的话后面跟「你说的…」多半是在说别的（「…，你说的那个先不管」） */
+const ATTRIBUTED_AFTER_RE = /你的建议|你说的|你建议的/u;
+/** 方案最早出自助手时，用户要明说采纳才算她拍板（「我决定采用这个方案，以后…」，R5 Codex #4）；前一个字是否定就不算（「还没决定」「不同意」） */
+const ADOPT_RE = /(?<![不没别])(?:决定|定了|就这么定|就这么办|采用|采纳|就按|按这个|按你说的|拍板|确定|同意)/u;
 /** 开引号 → 闭引号（直引号开闭同形，按个数奇偶判） */
 const QUOTE_PAIRS: ReadonlyArray<readonly [string, string]> = [["「", "」"], ["『", "』"], ["“", "”"], ["‘", "’"], ["\"", "\""]];
 
+/** clause 里有用户自己的采纳说法：采纳词前同一分句里没有「你」（转述对方），分句里没有否定字（先拿掉「没问题」这类）与犹豫词（R6 Codex #1） */
+function adoptsIn(clause: string): boolean {
+  const m = ADOPT_RE.exec(clause);
+  if (!m) return false;
+  return !clause.slice(0, m.index).includes("你") && !NEGATION_CHAR_RE.test(clause.replace(AFFIRM_RE, "")) && !HESITATE_RE.test(clause);
+}
+
+function stripNoise(s: string): string {
+  return [...s].filter((c) => !STRIP_CHAR_RE.test(c)).join("");
+}
+
+/** segment 里最后一处「不同意」类说法；bare = 它后面只剩标点和语气词 */
+function lastDisagree(segment: string): { end: number; bare: boolean } | null {
+  const re = new RegExp(DISAGREE_SOURCE, "gu");
+  let last: RegExpExecArray | null = null;
+  for (let m = re.exec(segment); m; m = re.exec(segment)) last = m;
+  if (!last) return null;
+  const end = last.index + last[0].length;
+  return { end, bare: stripNoise(segment.slice(end)).replace(TRAILING_PARTICLE_RE, "") === "" };
+}
+
 /**
- * 用户原话核对（userOnly）的额外几关——文字出现在用户消息里，不等于用户认可这件事（P1 互审 R4 R3 Codex NEW-1、Kimi NEW-4）：
- *  - 锚点前同一分句里最近 4 个字有否定字：「我不同意以后全部使用中文回答」「不要——跑全量测试」摘否定后面那半句，不算；
- *  - 前一个分句或紧跟着的分句说了「不同意 / 反对」这类话：「我不同意，以后全部…」「以后全部…，这个我不同意」，不算；
- *  - 锚点落在引号里：「你刚才建议「以后不用跑测试」，这个建议我不同意」引的是别人的话，不算。
+ * 用户原话核对（userOnly）的额外几关——文字出现在用户消息里，不等于用户认可这件事（P1 互审 R4 R3 Codex NEW-1、Kimi NEW-4；R5 Codex #1）：
+ *  - 锚点前同一分句里最近 4 个字有否定字（先拿掉「没问题」「不错」这类）：「不要——跑全量测试」摘否定后面那半句，不算；
+ *  - 同一分句前半截有「不同意 / 反对」、之后没转折、没接「而且 / 另外」这类连词、也没有用户自己的采纳说法：
+ *    「我不同意你刚才说的以后全部…」，不算；「我反对删库而且我决定以后全部…」照算（R6 #4）；
+ *  - 前一个分句或紧跟着的分句是光秃秃的「不同意 / 反对」：「我不同意，以后全部…」「以后全部…，这个我反对」，不算；
+ *    后面接了别的事项的不管（「我不同意删库，以后全部…」「以后全部…，我反对用英文」，R5 Codex #4）；
+ *    锚点之后的「反对」接的是指代词（「…，我反对这个建议」）也算管着锚点（R6 #1）；
+ *  - 锚点之后到下一个分句末尾有「还在考虑 / 再想想 / 待定」：还没定，不算（R6 #1）；
+ *  - 锚点落在引号（只在锚点所在那一行里配对，R6 NEW-7）、Markdown 引用行、代码块或行内代码里：引的是别人的话或文件内容，不算；
+ *  - requireAdopt（这段话最早出自助手或工具）：同一分句前半截或前一个分句里要有「决定 / 采用 / 就按」这类采纳说法，
+ *    且那个分句里没有否定、犹豫（是否 / 要不要 / 考虑），采纳词前没有「你」（转述对方）；锚点之后说「只是你的建议」也不算（R6 #1）。
  * 判不准就不算、降成助手提议。不按「整句里有没有否定字」判：她说话常是逗号和「~」连起来的长句，
  * 整句判在 P1 回放账本上把 259 条核到的用户原话降了 37 条真话（「是不是」「不错」「不用管」都会撞上）。
  * raw 是原文字符数组，[start, end) 是锚点在原文里的范围。
  */
-function userOwnsSpan(raw: string[], start: number, end: number): boolean {
-  const near: string[] = [];
-  for (let i = start - 1; i >= 0 && !CLAUSE_END_RE.test(raw[i]) && near.length < NEGATION_WINDOW; i--) if (!STRIP_CHAR_RE.test(raw[i])) near.push(raw[i]);
-  if (NEGATION_CHAR_RE.test(near.join(""))) return false;
+function userOwnsSpan(raw: string[], start: number, end: number, requireAdopt = false): boolean {
   let clauseStart = start;
   while (clauseStart > 0 && !CLAUSE_END_RE.test(raw[clauseStart - 1])) clauseStart--;
+  const pre = raw.slice(clauseStart, start).join("");
+  if (NEGATION_CHAR_RE.test([...stripNoise(pre.replace(AFFIRM_RE, ""))].slice(-NEGATION_WINDOW).join(""))) return false;
+  const inPre = lastDisagree(pre);
+  if (inPre) {
+    const rest = pre.slice(inPre.end);
+    if (!CONTRAST_RE.test(rest) && !CONJUNCTION_RE.test(rest) && !adoptsIn(rest)) return false;
+  }
   let prevStart = clauseStart - 1;
   while (prevStart > 0 && !CLAUSE_END_RE.test(raw[prevStart - 1])) prevStart--;
   const prevClause = clauseStart > 0 ? raw.slice(Math.max(0, prevStart), clauseStart - 1).join("") : "";
@@ -321,36 +372,48 @@ function userOwnsSpan(raw: string[], start: number, end: number): boolean {
   while (nextEnd < raw.length && !CLAUSE_END_RE.test(raw[nextEnd])) nextEnd++;
   nextEnd++;
   while (nextEnd < raw.length && !CLAUSE_END_RE.test(raw[nextEnd])) nextEnd++;
-  if (DISAGREE_RE.test(prevClause) || DISAGREE_RE.test(raw.slice(end, nextEnd).join(""))) return false;
+  const after = raw.slice(end, nextEnd).join("");
+  const inAfter = lastDisagree(after);
+  if (lastDisagree(prevClause)?.bare || inAfter?.bare || (inAfter && POINTER_RE.test(stripNoise(after.slice(inAfter.end))))) return false;
+  if (UNDECIDED_AFTER_RE.test(after) || (requireAdopt && ATTRIBUTED_AFTER_RE.test(after))) return false;
   const before = raw.slice(0, start);
+  const lineStart = before.lastIndexOf("\n") + 1;
+  const line = before.slice(lineStart);
+  // 引号只在锚点所在那一行里配对：前文多打了一个没配对的「，不该把后面每一行都算进引号（R6 Codex NEW-7）
   for (const [open, close] of QUOTE_PAIRS) {
-    if (open === close ? before.filter((c) => c === open).length % 2 === 1 : before.lastIndexOf(open) > before.lastIndexOf(close)) return false;
+    if (open === close ? line.filter((c) => c === open).length % 2 === 1 : line.lastIndexOf(open) > line.lastIndexOf(close)) return false;
   }
+  if (/^\s*>/.test(line.join("")) || line.filter((c) => c === "`").length % 2 === 1) return false;
+  if (before.join("").split("\n").filter((l) => /^\s*```/.test(l)).length % 2 === 1) return false;
+  if (requireAdopt && !adoptsIn(prevClause) && !adoptsIn(pre)) return false;
   return true;
 }
 
 /** 核锚点：逐字（去空白与标点后）在转录事件里找得到才算 verified；找到了但序号不对就修正序号。
- *  userOnly：只在真人用户的发言里找（偏好、用户拍板的决定必须是用户亲口说的，P1 ⑥），且要过 userOwnsSpan 两关；
- *  这段话在全场最早出现在助手或工具输出里（用户贴回 / 复述了助手的原文），也不算用户原话（R4 R3 Kimi NEW-2） */
+ *  userOnly：只在真人用户的发言里找（偏好、用户拍板的决定必须是用户亲口说的，P1 ⑥），且要过 userOwnsSpan 那几关；
+ *  这段话在全场最早出现在助手或工具输出里（用户贴回 / 复述了助手的原文，R4 R3 Kimi NEW-2），要用户明说采纳才算
+ *  （最初出处与最终采纳分开判，R5 Codex #4） */
 export function verifyAnchor(doc: SessionDoc, anchor: string, seq: number | null, opts: { userOnly?: boolean } = {}): { verified: boolean; seq: number | null } {
   const needle = normalizeForMatch(anchor);
   if (needle.length < 4) return { verified: false, seq };
   const spoken = (e: SessionEvent) => (e.kind === "user" && !e.injected) || e.kind === "assistant" || e.kind === "tool_result";
   const eligible = (e: SessionEvent) => (opts.userOnly ? e.kind === "user" && !e.injected : spoken(e));
+  let requireAdopt = false;
   const check = (e: SessionEvent | undefined, own = false) => {
     if (!e) return false;
     const { norm, map } = normalizeWithMap(e.text);
     const raw = [...e.text];
     let idx = norm.indexOf(needle);
     while (idx >= 0) {
-      if (startsAtBoundary(raw, map, idx) && (!own || userOwnsSpan(raw, map[idx], map[idx + needle.length - 1] + 1))) return true;
+      if (startsAtBoundary(raw, map, idx) && (!own || userOwnsSpan(raw, map[idx], map[idx + needle.length - 1] + 1, requireAdopt))) return true;
       idx = norm.indexOf(needle, idx + 1);
     }
     return false;
   };
   if (opts.userOnly) {
     const first = doc.events.find((e) => spoken(e) && check(e));
-    if (!first || first.kind !== "user") return { verified: false, seq };
+    if (!first) return { verified: false, seq };
+    requireAdopt = first.kind !== "user";
   }
   const own = !!opts.userOnly;
   const atSeq = seq !== null ? doc.events[seq] : undefined;
