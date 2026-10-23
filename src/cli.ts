@@ -61,6 +61,7 @@ import {
   undoMemoryReconcile,
   type ReconcileOutcome,
 } from "./memory-reconcile.js";
+import { LEDGER_DOC_SOURCE } from "./ledger-docs.js";
 import {
   CaseMemoryInputSchema,
   type CaseMemoryInput,
@@ -1776,6 +1777,41 @@ program
           }
         }
       }
+
+      // 会话账本（ledgers/YYYY-MM/<sid8>.md）：记忆文件对账只认顶层 *.md，账本走自己的源与 scope memory:ledger。
+      // 只在 sources.ledgers.path 显式配置时跑（P1 ①，2026-10-23）
+      const ledgerSource = config.sources.ledgers;
+      if (ledgerSource && ledgerSource.path !== "auto") {
+        const ledgerDir = resolveSourcePath(ledgerSource.path, "ledgers");
+        const paths = checkReconcilePaths(config);
+        if (!paths.ok) {
+          console.log(`  ⚠️ Ledgers: 对账没有执行——${paths.reason}`);
+          memoryReconcileAlert = true;
+        } else if (!existsSync(ledgerDir)) {
+          console.log(`  ℹ️  Ledgers: 账本目录还不存在（${ledgerDir}），跳过`);
+        } else {
+          try {
+            const outcome = await reconcileMemoryDocuments({
+              store,
+              embedder,
+              llm: effectiveLlm,
+              auditLogger: createAuditLogger(),
+              memDir: ledgerDir,
+              dataDir: paths.dataDir,
+              explicitPath: true,
+              apply: true,
+              source: LEDGER_DOC_SOURCE,
+            });
+            results.push({ ...reconcileToIngestResult(outcome), source: "ledgers" });
+            console.log(`  ✅ Ledgers: ${formatReconcileSummary(outcome)}`);
+            if (outcome.journalPath) console.log(`     对账日志: ${outcome.journalPath}`);
+            if (outcome.alert) memoryReconcileAlert = true;
+          } catch (err) {
+            console.log(`  ❌ Ledgers: 对账出错——${err instanceof Error ? err.message : String(err)}`);
+            memoryReconcileAlert = true;
+          }
+        }
+      }
     }
 
     // Obsidian vault (--obsidian <path>)
@@ -1949,7 +1985,8 @@ program
   .description("记忆文件对账：让 memory 源的文档切片与现行记忆文件一一对应（默认只看计划，不写库）")
   .option("--apply", "执行：插入 → 恢复 → 下架")
   .option("--max-retire <n>", "本次下架上限（默认 max(300, 活跃文档切片数的 25%)，也可用 RECALLNEST_MEMORY_RECONCILE_MAX_RETIRE）")
-  .option("--undo <journal>", "按对账日志（data/reconcile-journals/*.jsonl）逐条撤销")
+  .option("--undo <journal>", "按对账日志（data/reconcile-journals/*.jsonl）逐条撤销；ledger-reconcile-*.jsonl 自动按账本源撤")
+  .option("--ledgers", "对会话账本目录（sources.ledgers.path，scope memory:ledger）而不是记忆文件目录")
   .option("--json", "以 JSON 输出计划与结果")
   .action(async (options) => {
     const config = loadConfig();
@@ -1967,7 +2004,9 @@ program
       const journalPath = resolve(String(options.undo));
       let r: Awaited<ReturnType<typeof undoMemoryReconcile>>;
       try {
-        r = await undoMemoryReconcile({ store, auditLogger: createAuditLogger() }, journalPath, { auditPath: join(paths.dataDir, "audit.jsonl") });
+        // 日志文件名带源名（memory-reconcile-* / ledger-reconcile-*）：按它选 scope 与锁，不靠人记得加 --ledgers
+        const undoSource = basename(journalPath).startsWith(`${LEDGER_DOC_SOURCE.name}-`) ? LEDGER_DOC_SOURCE : undefined;
+        r = await undoMemoryReconcile({ store, auditLogger: createAuditLogger() }, journalPath, { auditPath: join(paths.dataDir, "audit.jsonl"), source: undoSource });
       } catch (err) {
         console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
         process.exitCode = 2;
@@ -1984,14 +2023,15 @@ program
       return;
     }
 
-    const memSource = config.sources.memory;
+    const sourceKey = options.ledgers ? "ledgers" : "memory";
+    const memSource = config.sources[sourceKey];
     if (!memSource || memSource.path === "auto") {
-      console.error("❌ 需要在 config.json 里显式配置 sources.memory.path（当前为 auto 或未配置）");
+      console.error(`❌ 需要在 config.json 里显式配置 sources.${sourceKey}.path（当前为 auto 或未配置）`);
       process.exitCode = 2;
       return;
     }
-    const memDir = resolveSourcePath(memSource.path, "memory");
-    console.log(`记忆目录: ${memDir}`);
+    const memDir = resolveSourcePath(memSource.path, sourceKey);
+    console.log(`${options.ledgers ? "账本目录" : "记忆目录"}: ${memDir}`);
     const maxRetire = options.maxRetire !== undefined
       ? parseRequiredLimitOption(options.maxRetire, "--max-retire", 0, Number.MAX_SAFE_INTEGER)
       : undefined;
@@ -2006,6 +2046,7 @@ program
       explicitPath: true,
       apply: Boolean(options.apply),
       maxRetire,
+      source: options.ledgers ? LEDGER_DOC_SOURCE : undefined,
     });
 
     const plan = outcome.plan;

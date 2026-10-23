@@ -28,6 +28,7 @@ const SOURCE_SCOPE_PREFIX: Record<string, string | null> = {
   desktop: "cc",
   minis: "minis",
   memory: null, // markdown 记忆文件，不是会话记录，不走 transcript 降权
+  ledgers: null, // 会话账本文件（ledgers/YYYY-MM/<sid8>.md），按文件对账进 scope memory:ledger，不是会话原文
 };
 
 describe("ingest 源的 scope 前缀登记", () => {
