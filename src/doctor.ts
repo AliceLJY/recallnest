@@ -28,6 +28,8 @@ import {
 import { collectScopeInventory, type ScopeInventoryReport } from "./scope-inventory.js";
 import { MemoryStore, type MemoryEntry, validateStoragePath } from "./store.js";
 import { readHeartbeats, formatAge } from "./source-heartbeat.js";
+import { dataDir as envDataDir } from "./env-config.js";
+import { SWEEP_HEARTBEAT_FILE, SWEEP_STALE_MS, type SweepHeartbeat } from "./sessions-sweep-run.js";
 
 interface CheckResult {
   name: string;
@@ -301,6 +303,29 @@ export function assessContinuityBaseline(
   };
 }
 
+/**
+ * 会话扫描（P1 ④）验活：只在 sources.ledgers.path 显式配置时检查。launchd 每 10 分钟一轮，
+ * 心跳超过 SWEEP_STALE_MS（20 分钟）或从没写过 → 红；最近一轮 LLM 全失败 → 黄。
+ */
+export function checkSessionsSweep(opts: { ledgersConfigured: boolean; heartbeatPath: string; nowMs?: number }): CheckResult | null {
+  if (!opts.ledgersConfigured) return null;
+  const name = "Sessions sweep";
+  const fix = "launchctl print gui/$(id -u)/com.recallnest.sessions-sweep；手动跑一轮：bun run src/cli.ts sessions sweep";
+  if (!existsSync(opts.heartbeatPath)) return fail(name, "还没有扫描心跳（sources.ledgers 已配置，但 sessions sweep 从没跑完过一轮）", fix);
+  let hb: SweepHeartbeat;
+  try {
+    hb = JSON.parse(readFileSync(opts.heartbeatPath, "utf-8")) as SweepHeartbeat;
+  } catch {
+    return fail(name, `心跳文件读不了：${opts.heartbeatPath}`, fix);
+  }
+  const age = (opts.nowMs ?? Date.now()) - Date.parse(hb.at);
+  const ago = `${Math.round(age / 60_000)} 分钟前`;
+  if (!Number.isFinite(age) || age > SWEEP_STALE_MS) return fail(name, `上次扫描 ${Number.isFinite(age) ? ago : "时间不明"}（超过 ${SWEEP_STALE_MS / 60_000} 分钟）`, fix);
+  const detail = `上次扫描 ${ago}，写账本 ${hb.ledgersWritten} 份，LLM ${hb.llmCalls} 次`;
+  if (hb.llmCalls > 0 && hb.llmFailures === hb.llmCalls) return warn(name, `${detail}，全部失败（账本只有机器抽取的两节）`, "检查 sessionsSweep.llm / llm 的 key 与额度");
+  return pass(name, detail);
+}
+
 export async function runDoctor(options: { ci?: boolean } = {}): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
 
@@ -544,6 +569,14 @@ export async function runDoctor(options: { ci?: boolean } = {}): Promise<CheckRe
     }
   } catch {
     results.push(warn("Source heartbeats", "unable to read heartbeat file"));
+  }
+
+  try {
+    const ledgers = loadConfig().sources.ledgers;
+    const sweep = checkSessionsSweep({ ledgersConfigured: !!ledgers && ledgers.path !== "auto", heartbeatPath: join(resolve(envDataDir()), SWEEP_HEARTBEAT_FILE) });
+    if (sweep) results.push(sweep);
+  } catch {
+    results.push(warn("Sessions sweep", "unable to read config / heartbeat"));
   }
 
   return results;

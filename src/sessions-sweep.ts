@@ -155,7 +155,9 @@ export type SweepAction =
   | "ledger"
   | "ledger+candidates"
   | "candidates"
-  | "up-to-date";
+  | "up-to-date"
+  /** 收工时当场写的账本（sessions ledger 命令，P1 ⑤）；不是扫描器的决策，只记在游标上 */
+  | "manual";
 
 export interface SweepPolicy {
   idleMinutes: number;

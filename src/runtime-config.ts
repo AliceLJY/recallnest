@@ -40,6 +40,19 @@ export interface LocalMemoryConfig {
     baseURL: string;
   };
   sources: Record<string, { path: string; glob: string; description: string }>;
+  /**
+   * 会话扫描（`recallnest sessions sweep` 正式模式，P1 ④）。账本落点走 `sources.ledgers.path`。
+   * - llm：给扫描单独配一个 LLM（不配就用上面的 llm）。账本生成一场一两万 token，和导入抢同一把 key 会互相拖累；
+   * - idleMinutes / candidateAfterMinutes：按端覆盖（cc / codex / kimi / antigravity），不配走 CLI 默认
+   *   （CC 60 / 720，其余 30 / 360，Alice 2026-10-23 拍板）；
+   * - candidates：出不出经验候选节（D2 第二步），默认 false，P1 ⑥ 打开。
+   */
+  sessionsSweep?: {
+    llm?: { apiKey: string; model: string; baseURL: string };
+    idleMinutes?: Record<string, number>;
+    candidateAfterMinutes?: Record<string, number>;
+    candidates?: boolean;
+  };
   retrieval?: Partial<RetrievalConfig>;
   /**
    * Opt-in cross-scope sidecar map for search_memory.
