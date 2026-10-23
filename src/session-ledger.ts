@@ -311,18 +311,48 @@ const POINTER_RE = /^(?:这个|这样|那个|这|它|此|该)/u;
 const HESITATE_RE = /是否|要不要|考虑|再想|再看/u;
 /** 锚点之后说明这还没定、或只是助手的话：不算用户拍板（R6 Codex #1） */
 const UNDECIDED_AFTER_RE = /还在考虑|再想想|再看看|还没定|待定/u;
-/** 同上，但只在这段话最早出自助手时看：用户自己说出口的话后面跟「你说的…」多半是在说别的（「…，你说的那个先不管」） */
-const ATTRIBUTED_AFTER_RE = /你的建议|你说的|你建议的/u;
+/**
+ * 同上，但只在这段话最早出自助手时看：用户自己说出口的话后面跟「你说的…」多半是在说别的（「…，你说的那个先不管」）。
+ * 只认「只是 / 不过是 / 而已」这类把它说成「仅仅是对方的话」的说法：「你的建议我完全赞同」是采纳，不拦（R7 Codex #4）
+ */
+const ATTRIBUTED_AFTER_RE = /(?:只是|不过是|仅仅?是)(?:你的建议|你说的|你建议的)|(?:你的建议|你说的|你建议的)(?:而已|罢了)/u;
 /** 方案最早出自助手时，用户要明说采纳才算她拍板（「我决定采用这个方案，以后…」，R5 Codex #4）；前一个字是否定就不算（「还没决定」「不同意」） */
 const ADOPT_RE = /(?<![不没别])(?:决定|定了|就这么定|就这么办|采用|采纳|就按|按这个|按你说的|拍板|确定|同意)/u;
 /** 开引号 → 闭引号（直引号开闭同形，按个数奇偶判） */
 const QUOTE_PAIRS: ReadonlyArray<readonly [string, string]> = [["「", "」"], ["『", "』"], ["“", "”"], ["‘", "’"], ["\"", "\""]];
 
-/** clause 里有用户自己的采纳说法：采纳词前同一分句里没有「你」（转述对方），分句里没有否定字（先拿掉「没问题」这类）与犹豫词（R6 Codex #1） */
-function adoptsIn(clause: string): boolean {
+/**
+ * clause 里有用户自己的采纳说法：分句里没有否定字（先拿掉「没问题」这类）与犹豫词（R6 Codex #1）；
+ * 采纳词前有「你」、且「你」之后没再出现「我」，是转述对方（「你刚才说你决定了」），不算——
+ * 「你这个建议我决定采纳」是用户在采纳，算（R7 Codex #4）。
+ * needSubject：采纳词前要有「我」——给「反对」之后放行用：「我反对删库我决定…」放行，「我反对直接决定…」里的决定是被反对的对象（R7 Codex #1）
+ */
+function adoptsIn(clause: string, needSubject = false): boolean {
   const m = ADOPT_RE.exec(clause);
   if (!m) return false;
-  return !clause.slice(0, m.index).includes("你") && !NEGATION_CHAR_RE.test(clause.replace(AFFIRM_RE, "")) && !HESITATE_RE.test(clause);
+  const head = clause.slice(0, m.index);
+  const you = head.lastIndexOf("你");
+  if (you >= 0 && !head.slice(you).includes("我")) return false;
+  if (needSubject && !head.includes("我")) return false;
+  return !NEGATION_CHAR_RE.test(clause.replace(AFFIRM_RE, "")) && !HESITATE_RE.test(clause);
+}
+
+/**
+ * 锚点在不在引号里：前面有没闭合的开引号，且后面先碰到的是它的闭引号（直引号：前面个数为奇数、后面还有一个）。
+ * 只看前面会让前文多打的一个「把后面全算进引号（R6 Codex NEW-7，同一行也一样）；只看本行又放过跨行的引用（R7 Codex 新问题）
+ */
+function insideQuotes(before: string[], after: string[]): boolean {
+  for (const [open, close] of QUOTE_PAIRS) {
+    if (open === close) {
+      if (before.filter((c) => c === open).length % 2 === 1 && after.includes(close)) return true;
+      continue;
+    }
+    if (before.lastIndexOf(open) <= before.lastIndexOf(close)) continue;
+    const c = after.indexOf(close);
+    const o = after.indexOf(open);
+    if (c >= 0 && (o < 0 || c < o)) return true;
+  }
+  return false;
 }
 
 function stripNoise(s: string): string {
@@ -348,9 +378,9 @@ function lastDisagree(segment: string): { end: number; bare: boolean } | null {
  *    后面接了别的事项的不管（「我不同意删库，以后全部…」「以后全部…，我反对用英文」，R5 Codex #4）；
  *    锚点之后的「反对」接的是指代词（「…，我反对这个建议」）也算管着锚点（R6 #1）；
  *  - 锚点之后到下一个分句末尾有「还在考虑 / 再想想 / 待定」：还没定，不算（R6 #1）；
- *  - 锚点落在引号（只在锚点所在那一行里配对，R6 NEW-7）、Markdown 引用行、代码块或行内代码里：引的是别人的话或文件内容，不算；
+ *  - 锚点落在引号（前有没闭合的开引号、后有它的闭引号，R6 NEW-7 / R7）、Markdown 引用行、代码块或行内代码里：引的是别人的话或文件内容，不算；
  *  - requireAdopt（这段话最早出自助手或工具）：同一分句前半截或前一个分句里要有「决定 / 采用 / 就按」这类采纳说法，
- *    且那个分句里没有否定、犹豫（是否 / 要不要 / 考虑），采纳词前没有「你」（转述对方）；锚点之后说「只是你的建议」也不算（R6 #1）。
+ *    且那个分句里没有否定、犹豫（是否 / 要不要 / 考虑），采纳词前的「你」之后要再有「我」（否则是转述对方）；锚点之后说「只是你的建议」也不算（R6 #1 / R7）。
  * 判不准就不算、降成助手提议。不按「整句里有没有否定字」判：她说话常是逗号和「~」连起来的长句，
  * 整句判在 P1 回放账本上把 259 条核到的用户原话降了 37 条真话（「是不是」「不错」「不用管」都会撞上）。
  * raw 是原文字符数组，[start, end) 是锚点在原文里的范围。
@@ -363,7 +393,7 @@ function userOwnsSpan(raw: string[], start: number, end: number, requireAdopt = 
   const inPre = lastDisagree(pre);
   if (inPre) {
     const rest = pre.slice(inPre.end);
-    if (!CONTRAST_RE.test(rest) && !CONJUNCTION_RE.test(rest) && !adoptsIn(rest)) return false;
+    if (!CONTRAST_RE.test(rest) && !CONJUNCTION_RE.test(rest) && !adoptsIn(rest, true)) return false;
   }
   let prevStart = clauseStart - 1;
   while (prevStart > 0 && !CLAUSE_END_RE.test(raw[prevStart - 1])) prevStart--;
@@ -379,10 +409,7 @@ function userOwnsSpan(raw: string[], start: number, end: number, requireAdopt = 
   const before = raw.slice(0, start);
   const lineStart = before.lastIndexOf("\n") + 1;
   const line = before.slice(lineStart);
-  // 引号只在锚点所在那一行里配对：前文多打了一个没配对的「，不该把后面每一行都算进引号（R6 Codex NEW-7）
-  for (const [open, close] of QUOTE_PAIRS) {
-    if (open === close ? line.filter((c) => c === open).length % 2 === 1 : line.lastIndexOf(open) > line.lastIndexOf(close)) return false;
-  }
+  if (insideQuotes(before, raw.slice(end))) return false;
   if (/^\s*>/.test(line.join("")) || line.filter((c) => c === "`").length % 2 === 1) return false;
   if (before.join("").split("\n").filter((l) => /^\s*```/.test(l)).length % 2 === 1) return false;
   if (requireAdopt && !adoptsIn(prevClause) && !adoptsIn(pre)) return false;

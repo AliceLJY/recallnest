@@ -553,3 +553,43 @@ describe("R6 修复（Codex R5 复核 #1 / #4 / NEW-7）：指代词接拒绝、
     expect(afterSuggestion(`我决定采用这个方案，${A}`)).toBe(true);
   });
 });
+
+describe("R7 修复（Codex 复核 6e62f81）：被反对的「决定」不算采纳、「你…我决定」与「你的建议我赞同」不误降、引号看前后是否闭合", () => {
+  const A = "以后全部使用中文回答";
+  const userSays = (text: string) => {
+    const d = doc();
+    d.events[6].text = text;
+    return verifyAnchor(d, A, null, { userOnly: true }).verified;
+  };
+  const afterSuggestion = (text: string) => {
+    const d = doc();
+    d.events[1].text = `建议${A}`;
+    d.events[6].text = text;
+    return verifyAnchor(d, A, null, { userOnly: true }).verified;
+  };
+  it("「反对」后面紧跟的「决定」是被反对的对象，不放行（#1）", () => {
+    expect(userSays(`我反对直接决定${A}`)).toBe(false);
+    // 放行要有新的主语「我」或连词
+    expect(userSays(`我反对删库我决定${A}`)).toBe(true);
+  });
+  it("「你」之后又出现「我」才采纳：是用户在采纳对方的建议（#4）", () => {
+    expect(afterSuggestion(`你这个建议我决定采纳，${A}`)).toBe(true);
+    // 「你」之后没有「我」仍是转述
+    expect(afterSuggestion(`你刚才说你决定了${A}`)).toBe(false);
+    expect(userSays(`我不同意你决定的${A}`)).toBe(false);
+  });
+  it("锚点之后说「你的建议」只有在「只是 / 不过是 / 而已」这类贬低说法里才拦（#4）", () => {
+    expect(afterSuggestion(`我明确决定${A}，你的建议我完全赞同`)).toBe(true);
+    expect(afterSuggestion(`我决定采用这个方案，${A}只是你的建议`)).toBe(false);
+    expect(afterSuggestion(`我决定采用这个方案，${A}不过是你说的而已`)).toBe(false);
+  });
+  it("引号：锚点前有没闭合的开引号、且锚点后有它的闭引号，才算在引号里（NEW-7 / 新问题）", () => {
+    expect(userSays(`文档里多打了一个「。另外，我明确决定${A}`)).toBe(true);
+    expect(userSays(`文档里多打了一个「。\n另外，我明确决定${A}`)).toBe(true);
+    expect(userSays(`同事的建议是「\n${A}\n」`)).toBe(false);
+    expect(userSays(`他原话是「${A}」`)).toBe(false);
+    expect(userSays(`他原话是"${A}"`)).toBe(false);
+    // 直引号同理：前文多打的一个 " 后面没有闭合，不算
+    expect(userSays(`文档里多打了一个"。另外，我明确决定${A}`)).toBe(true);
+  });
+});
