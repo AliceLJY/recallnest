@@ -1,5 +1,6 @@
 /**
- * 写入工具的回执（2026-10-17）：store_memory、batch_store、HTTP /v1/store 三处共用。
+ * 写入工具的回执（2026-10-17）：store_memory、batch_store、HTTP /v1/store 三处共用；
+ * HTTP /v1/capture、/v1/pattern、/v1/case、/v1/promote 同一天跟上，用同一条规则。
  *
  * agent 读回执决定要不要重试、要不要补 trigger。以前三处都按「没撞 conflict 就算存了」写：
  * batch_store 把 rejected / conflict 计成 new，HTTP 对 rejected 回 `stored: true` 与 201，
@@ -8,7 +9,12 @@
  */
 
 import type { PersistedMemoryRecord } from "./capture-engine.js";
-import type { WriteDisposition } from "./memory-schema.js";
+import type {
+  StoredCaseMemoryRecord,
+  StoredPromotedMemoryRecord,
+  StoredWorkflowPatternRecord,
+  WriteDisposition,
+} from "./memory-schema.js";
 
 /** 这次写入在主表里落下了新内容：新行、原位修订、提升。deduped / conflict / rejected 都没有。 */
 export function dispositionWroteMemory(disposition: WriteDisposition): boolean {
@@ -89,8 +95,13 @@ export function formatBatchStoreReceipt(records: readonly PersistedMemoryRecord[
   return [headline, ...notWritten].join("\n");
 }
 
+export interface HttpWriteResponse {
+  status: 200 | 201;
+  body: Record<string, unknown>;
+}
+
 /** HTTP /v1/store 的状态码与响应体。只有真写进主表才回 201 与 `stored: true`。 */
-export function buildStoreHttpResponse(stored: PersistedMemoryRecord): { status: 200 | 201; body: Record<string, unknown> } {
+export function buildStoreHttpResponse(stored: PersistedMemoryRecord): HttpWriteResponse {
   const wrote = dispositionWroteMemory(stored.disposition);
   return {
     status: wrote ? 201 : 200,
@@ -104,6 +115,74 @@ export function buildStoreHttpResponse(stored: PersistedMemoryRecord): { status:
       canonicalKey: stored.canonicalKey,
       conflictId: stored.conflictId,
       ...(stored.rejectionReason ? { rejectionReason: stored.rejectionReason } : {}),
+    },
+  };
+}
+
+/** HTTP /v1/pattern 与 /v1/case 的状态码与响应体，规则同 /v1/store。 */
+export function buildStructuredWriteHttpResponse(
+  stored: StoredWorkflowPatternRecord | StoredCaseMemoryRecord,
+): HttpWriteResponse {
+  const wrote = dispositionWroteMemory(stored.disposition);
+  return {
+    status: wrote ? 201 : 200,
+    body: {
+      id: stored.id,
+      stored: wrote,
+      disposition: stored.disposition,
+      category: stored.category,
+      title: stored.title,
+      scope: stored.resolvedScope,
+      tags: stored.tags,
+      storedAt: stored.storedAt,
+      canonicalKey: stored.canonicalKey,
+      conflictId: stored.conflictId,
+    },
+  };
+}
+
+/** HTTP /v1/promote 的状态码与响应体，规则同 /v1/store。 */
+export function buildPromoteHttpResponse(stored: StoredPromotedMemoryRecord): HttpWriteResponse {
+  const wrote = dispositionWroteMemory(stored.disposition);
+  return {
+    status: wrote ? 201 : 200,
+    body: {
+      id: stored.id,
+      stored: wrote,
+      disposition: stored.disposition,
+      category: stored.category,
+      scope: stored.resolvedScope,
+      sourceMemoryId: stored.sourceMemoryId,
+      sourceCategory: stored.sourceCategory,
+      storedAt: stored.storedAt,
+      canonicalKey: stored.canonicalKey,
+      conflictId: stored.conflictId,
+    },
+  };
+}
+
+/**
+ * HTTP /v1/capture 的状态码与响应体。`stored` 是真写进主表的条数（不是收到的条数），
+ * 至少写进一条才回 201；每条照旧带 disposition，被拒的另带 rejectionReason。
+ */
+export function buildCaptureHttpResponse(records: readonly PersistedMemoryRecord[]): HttpWriteResponse {
+  const written = records.filter((r) => dispositionWroteMemory(r.disposition)).length;
+  return {
+    status: written > 0 ? 201 : 200,
+    body: {
+      stored: written,
+      memories: records.map((memory) => ({
+        id: memory.id,
+        text: memory.text,
+        category: memory.category,
+        scope: memory.resolvedScope,
+        source: memory.source,
+        storedAt: memory.storedAt,
+        disposition: memory.disposition,
+        canonicalKey: memory.canonicalKey,
+        conflictId: memory.conflictId,
+        ...(memory.rejectionReason ? { rejectionReason: memory.rejectionReason } : {}),
+      })),
     },
   };
 }
