@@ -275,6 +275,23 @@ describe("账本对账 真实 LanceDB", () => {
     expect(audit).toContain(`"scope":"${LEDGER_DOC_SCOPE}"`);
   });
 
+  it("撤销账本插入时按 memory:ledger 查合并依赖：别的账本行合并进了它，就保留它（R1 Codex #6）", async () => {
+    writeFileSync(join(ledgerDir, "2026-10", "abcd1234.md"), ledgerMd());
+    const r = await run("ledger");
+    const rows = await activeRows(LEDGER_DOC_SCOPE);
+    const target = rows.find((x) => x.text.includes("## 解决了什么"))!;
+    const member = rows.find((x) => x.text.includes("## 没做完"))!;
+    // 对账之后有人把另一片账本合并进了 target
+    await store.patchMetadataBatch([{ id: member.id, patchFn: (meta) => {
+      const evo = (meta.evolution && typeof meta.evolution === "object" ? meta.evolution : {}) as Record<string, unknown>;
+      meta.evolution = { ...evo, status: "consolidated", consolidatedInto: target.id };
+      return meta;
+    } }]);
+    const undo = await undoMemoryReconcile({ store, auditLogger: createAuditLogger(auditPath) }, r.journalPath!, { auditPath, source: LEDGER_DOC_SOURCE });
+    expect(undo.skippedDependency).toContain(target.id);
+    expect(rowState((await loadMemoryScopeRows(store, LEDGER_DOC_SCOPE)).find((x) => x.id === target.id)!.meta).status).toBe("active");
+  });
+
   it("锁按源分开：记忆文件对账正在跑时账本照跑，账本对账自己的锁被占才跳过", async () => {
     writeFileSync(join(ledgerDir, "2026-10", "abcd1234.md"), ledgerMd());
     let inner: Awaited<ReturnType<typeof run>> | null = null;
