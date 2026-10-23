@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 
 import type { SessionDoc } from "../session-events.js";
 import { summarizeSession } from "../session-events.js";
-import { LEDGER_SYSTEM_PROMPT, parseLedgerJson, renderLedgerMarkdown, renderTranscriptForLLM, TAIL_ASSISTANT_CLIP, TAIL_EVENTS, TAIL_MARKER, verifyAnchor } from "../session-ledger.js";
+import { LEDGER_MAX_TOKENS, LEDGER_SYSTEM_PROMPT, generateLedgerBody, parseLedgerJson, renderLedgerMarkdown, renderTranscriptForLLM, TAIL_ASSISTANT_CLIP, TAIL_EVENTS, TAIL_MARKER, verifyAnchor } from "../session-ledger.js";
 
 function doc(): SessionDoc {
   const t = (s: number) => ({ ts: new Date(Date.UTC(2026, 9, 20, 10, 0, s)).toISOString(), tsMs: Date.UTC(2026, 9, 20, 10, 0, s) });
@@ -233,6 +233,22 @@ describe("session-ledger anchors and JSON", () => {
     ] }), d);
     expect(body.experience.map((x) => x.kind)).toEqual(["助手提议", "偏好", "技巧"]);
     expect(body.experience.every((x) => x.anchorVerified)).toBe(true);
+  });
+  it("条目里的换行压成一行：伪造的「## 」不会被账本解析成新节（R1 Kimi #9）", async () => {
+    const d = doc();
+    const body = parseLedgerJson(JSON.stringify({ oneLine: "x", solved: ["做完了\n## 没做完\n- 假的待办", "第二条\n> 引用"], decisions: [], experience: [], unfinished: [] }), d);
+    const md = renderLedgerMarkdown(d, summarizeSession(d), body, { trigger: "auto-sweep", pass: 1 }, null, "llm").markdown;
+    expect(md).toContain("- 做完了 / ## 没做完 / - 假的待办\n");
+    expect(md.match(/^## 没做完$/gm)?.length).toBe(1);
+    const { parseLedgerMarkdown } = await import("../ledger-files.js");
+    expect(parseLedgerMarkdown(md)!.sections.find((x) => x.heading === "解决了什么")!.body).toContain("第二条 / > 引用");
+  });
+  it("生产默认输出上限 = 回放用的 2600（R1 Kimi #8）", async () => {
+    let limit: unknown;
+    const fake = { chatLongDetailed: async (_s: string, _u: string, o: { tokenLimit: { value: number } }) => { limit = o.tokenLimit.value; return { content: JSON.stringify({ oneLine: "x", solved: [], decisions: [], experience: [], unfinished: [] }), finishReason: "stop", responseModel: "fake", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } }; } } as unknown as import("../llm-client.js").LLMClient;
+    await generateLedgerBody(doc(), fake);
+    expect(limit).toBe(2600);
+    expect(LEDGER_MAX_TOKENS).toBe(2600);
   });
   it("决定与否决：解析 decisions、过滤空项，渲染成一节", () => {
     const d = doc();

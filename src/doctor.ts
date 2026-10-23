@@ -318,10 +318,18 @@ export function checkSessionsSweep(opts: { ledgersConfigured: boolean; heartbeat
   } catch {
     return fail(name, `心跳文件读不了：${opts.heartbeatPath}`, fix);
   }
-  const age = (opts.nowMs ?? Date.now()) - Date.parse(hb.at);
+  // 上一轮还在跑（本轮因锁跳过）也算活着：取心跳与 busyAt 里较新的那个
+  const last = Math.max(Date.parse(hb.at), hb.busyAt ? Date.parse(hb.busyAt) : Number.NEGATIVE_INFINITY);
+  const age = (opts.nowMs ?? Date.now()) - last;
   const ago = `${Math.round(age / 60_000)} 分钟前`;
   if (!Number.isFinite(age) || age > SWEEP_STALE_MS) return fail(name, `上次扫描 ${Number.isFinite(age) ? ago : "时间不明"}（超过 ${SWEEP_STALE_MS / 60_000} 分钟）`, fix);
-  const detail = `上次扫描 ${ago}，写账本 ${hb.ledgersWritten} 份，LLM ${hb.llmCalls} 次`;
+  // 一直因锁跳过、最近完成的一轮却在 2 小时之前：上一轮多半卡住了（包装脚本 45 分钟就该杀掉它）
+  const sinceDone = (opts.nowMs ?? Date.now()) - Date.parse(hb.at);
+  if (hb.busyAt && Date.parse(hb.busyAt) > Date.parse(hb.at) && sinceDone > 2 * 3_600_000) return fail(name, `最近完成的一轮在 ${Math.round(sinceDone / 60_000)} 分钟前，之后一直因锁跳过——上一轮可能卡住了`, fix);
+  const detail = hb.busyAt && Date.parse(hb.busyAt) > Date.parse(hb.at)
+    ? `上一轮还在跑（${ago}因锁跳过），最近完成的一轮写账本 ${hb.ledgersWritten} 份`
+    : `上次扫描 ${ago}，写账本 ${hb.ledgersWritten} 份，LLM ${hb.llmCalls} 次`;
+  if (hb.llmConfigured === false) return warn(name, `${detail}；没配 LLM（sessionsSweep.llm / llm），账本只有机器抽取的两节`, "在 config.json 配 sessionsSweep.llm 或 llm");
   const streak = hb.llmFailStreak ?? (hb.llmCalls > 0 && hb.llmFailures >= hb.llmCalls ? 1 : 0);
   if (streak > 0) return warn(name, `${detail}；LLM 已连续 ${streak} 轮全失败（最近 ${hb.lastLlmFailureAt ?? "时间不明"}），这期间的账本只有机器抽取的两节`, "检查 sessionsSweep.llm / llm 的 key 与额度");
   return pass(name, detail);
