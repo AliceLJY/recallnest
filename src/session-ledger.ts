@@ -47,7 +47,8 @@ export interface LedgerRender {
   frontmatter: Record<string, unknown>;
   body: LedgerBody | null;
   usage: LedgerUsage | null;
-  generator: "llm" | "none" | "llm-failed";
+  /** agent = 收工时当场的 agent 自己写的正文（P1 ⑤），llm = 扫描器兜底生成 */
+  generator: "llm" | "none" | "llm-failed" | "agent";
   failure?: string;
   markdown: string;
 }
@@ -379,10 +380,13 @@ export function renderLedgerMarkdown(doc: SessionDoc, summary: SessionSummary, b
   sections.push(`# ${red(body?.oneLine || `${doc.source} 会话 ${sid8}`)}`);
   sections.push(`## 解决了什么\n${body?.solved.length ? body.solved.map((s) => `- ${red(s)}`).join("\n") : "- （未生成）"}`);
   sections.push(`## 决定与否决\n${body?.decisions.length ? body.decisions.map((s) => `- ${red(s)}`).join("\n") : body ? "- （无）" : "- （未生成）"}`);
-  const exp = body?.experience.length
+  // 当场 agent 写的经验已经分流进 pivot / case（收工第五步），这里只列它和指针，不套候选的原话锚点格式
+  const exp = generator === "agent"
+    ? (body?.experience.length ? body.experience.map((x) => `- ${red(x.text)}${x.kind ? `（${x.kind}）` : ""}`).join("\n") : "- （无）")
+    : body?.experience.length
     ? body.experience.map((x) => `- ${red(x.text)}${x.kind ? `（${x.kind}）` : ""} ｜原文：「${red(x.anchor) || "—"}」 ｜src:${sid8}#${x.anchorSeq ?? "?"}${x.anchorVerified ? "" : " ｜anchor:未核"}`).join("\n")
     : "- （无）";
-  sections.push(`## 经验（待确认）\n${exp}`);
+  sections.push(`## ${generator === "agent" ? "经验（已分流）" : "经验（待确认）"}\n${exp}`);
   sections.push(`## 没做完\n${body?.unfinished.length ? body.unfinished.map((s) => `- ${red(s)}`).join("\n") : "- （无）"}`);
   // 机器抽取两节
   const errLines = summary.errors.slice(0, 20).map((e) => {

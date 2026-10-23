@@ -2988,12 +2988,12 @@ program
   });
 
 // ---------------------------------------------------------------------------
-// sessions —— 会话扫描与账本（P0 影子期：只写 --shadow 目录下的文件，不写库、不碰 cc-memory/ledgers/）
+// sessions —— 会话扫描与账本（--shadow 影子模式只写影子目录；正式模式写 sources.ledgers.path，P1 ④）
 // 设计：sync-bridge AI产出/2026-10-22-RecallNest自动总结经验/plan.md（v3 节 + v2.1 D2 / D5）
 // ---------------------------------------------------------------------------
 const sessionsCmd = program
   .command("sessions")
-  .description("会话转录扫描与账本（P0 影子期）");
+  .description("会话转录扫描与账本（影子模式 / 正式模式）");
 
 function parseRootsOption(value: string | undefined): import("./sessions-sweep.js").RootSpec[] {
   const { defaultLocalRoots, truthRoots } = require("./sessions-sweep.js") as typeof import("./sessions-sweep.js");
@@ -3026,17 +3026,80 @@ sessionsCmd
   });
 
 sessionsCmd
+  .command("ledger")
+  .description("当场为一场会话写账本（收工第五步：和扫描器同一格式、同一落点；正文优先用 --body 给的）")
+  .requiredOption("--session <id>", "session id 或它的前 8 位")
+  .option("--body <file>", "当场 agent 写好的正文 JSON（- 从 stdin 读）：{oneLine, solved[], decisions[], experience[], unfinished[]}，experience 可以直接是字符串；不给就调 LLM 生成")
+  .option("--trigger <name>", "frontmatter 的 trigger：manual-收工 | precompact", "manual-收工")
+  .option("--roots <spec>", "到哪找转录：local（默认，找不到再找 truth）| truth | source=dir,...")
+  .action(async (options) => {
+    const { writeSessionLedgerNow } = await import("./sessions-sweep-run.js");
+    const { discoverTranscripts, truthRoots } = await import("./sessions-sweep.js");
+    const config = loadConfig();
+    const ledgerSource = config.sources.ledgers;
+    if (!ledgerSource || ledgerSource.path === "auto") {
+      console.error("❌ 需要在 config.json 里显式配置 sources.ledgers.path（账本落点）");
+      process.exitCode = 2;
+      return;
+    }
+    const want = String(options.session).trim();
+    const sinceMs = Date.now() - 45 * 86_400_000;
+    const find = (roots: import("./sessions-sweep.js").RootSpec[]) => discoverTranscripts(roots, { sinceMs }).files.filter((f) => f.sessionId === want || f.sessionId.startsWith(want));
+    let hits = find(parseRootsOption(options.roots ?? "local"));
+    if (hits.length === 0 && !options.roots) hits = find(truthRoots());
+    if (hits.length !== 1) {
+      console.error(hits.length === 0 ? `❌ 近 45 天的转录里找不到 session ${want}` : `❌ session ${want} 对上 ${hits.length} 个转录，给完整 id：${hits.slice(0, 5).map((h) => h.sessionId).join(" ")}`);
+      process.exitCode = 2;
+      return;
+    }
+    let body: import("./session-ledger.js").LedgerBody | null = null;
+    if (options.body) {
+      const raw = options.body === "-" ? readFileSync(0, "utf-8") : readFileSync(resolve(String(options.body)), "utf-8");
+      const j = JSON.parse(raw) as Record<string, unknown>;
+      const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((x) => x.trim()) : []);
+      const experience = (Array.isArray(j.experience) ? j.experience : []).flatMap((x) => {
+        if (typeof x === "string" && x.trim()) return [{ text: x.trim(), anchor: "", anchorSeq: null, anchorVerified: true, kind: "" }];
+        if (x && typeof x === "object" && typeof (x as { text?: unknown }).text === "string") {
+          const o = x as { text: string; kind?: unknown };
+          return [{ text: o.text.trim(), anchor: "", anchorSeq: null, anchorVerified: true, kind: typeof o.kind === "string" ? o.kind : "" }];
+        }
+        return [];
+      });
+      body = { oneLine: typeof j.oneLine === "string" ? j.oneLine.trim() : "", solved: strs(j.solved), decisions: strs(j.decisions), experience, unfinished: strs(j.unfinished) };
+    }
+    let llm: import("./llm-client.js").LLMClient | null = null;
+    if (!body) {
+      const { createLLMClient } = await import("./llm-client.js");
+      const { resolveEnv } = await import("./runtime-config.js");
+      const llmCfg = config.sessionsSweep?.llm ?? config.llm;
+      llm = llmCfg ? createLLMClient({ ...llmCfg, apiKey: resolveEnv(llmCfg.apiKey), timeoutMs: 90_000 }) : null;
+    }
+    const r = await writeSessionLedgerNow({
+      file: hits[0],
+      ledgerDir: resolveSourcePath(ledgerSource.path, "ledgers"),
+      stateDir: join(resolve(envDataDir()), "session-state"),
+      trigger: options.trigger === "precompact" ? "precompact" : "manual-收工",
+      body,
+      llm,
+    });
+    console.log(`✅ 账本：${r.path}（正文：${r.generator === "agent" ? "当场 agent 写的" : r.generator}${r.failure ? `，失败：${r.failure}` : ""}）`);
+    if (r.generator === "llm-failed" || r.generator === "none") process.exitCode = 3;
+  });
+
+sessionsCmd
   .command("sweep")
-  .description("扫一轮：静默会话 → 账本（P0 只支持 --shadow 影子模式）")
-  .requiredOption("--shadow <dir>", "影子输出目录（ledgers/ session-state/ sweep-log.jsonl 都写在这里）")
-  .option("--roots <spec>", "同 scan", "local")
+  .description("扫一轮：静默会话 → 账本。给 --shadow 是影子模式；不给是正式模式（写 sources.ledgers.path，游标与心跳在数据目录）")
+  .option("--shadow <dir>", "影子输出目录（ledgers/ session-state/ sweep-log.jsonl 都写在这里）")
+  .option("--roots <spec>", "同 scan；影子模式默认 local，正式模式默认 truth（conversation-truth，两台机都在）")
   .option("--since-days <n>", "只看最近 N 天的转录", "30")
-  .option("--idle-minutes <n>", "静默多少分钟算结束", String(30))
-  .option("--candidate-after-minutes <n>", "经验候选在最后一条消息多少分钟后才出", String(360))
+  .option("--idle-minutes <n>", "静默多少分钟算结束（给了就对所有端生效；不给按端默认：CC 60，其余 30）")
+  .option("--candidate-after-minutes <n>", "经验候选在最后一条消息多少分钟后才出（给了对所有端生效；不给按端默认：CC 720，其余 360）")
   .option("--min-user-turns <n>", "少于这么多轮用户发言的会话跳过", String(3))
   .option("--sources <list>", "只扫这些端：cc,codex,kimi,antigravity")
   .option("--limit <n>", "本轮最多生成多少份账本（0 = 不限）", "0")
   .option("--no-llm", "不调 LLM，只出机器抽取版账本（影子期先量覆盖与游标）")
+  .option("--candidates", "出经验候选节（正式模式默认看 config sessionsSweep.candidates，影子模式默认出）")
+  .option("--no-candidates", "不出经验候选节")
   .option("--mask-memory-writes", "回放用：隐藏当场写过的记忆，免得账本召回被灌水")
   .option("--now <iso>", "把「现在」定在某个时刻（回放用）")
   .option("--only <sids>", "只处理这些 session id（逗号分隔，可用前 8 位）")
@@ -3045,19 +3108,45 @@ sessionsCmd
   .option("--dry-run", "只决策不写任何文件")
   .option("--json", "结尾输出 JSON 汇总")
   .action(async (options) => {
-    const { runSweep } = await import("./sessions-sweep-run.js");
+    const { runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE, SWEEP_HEARTBEAT_FILE } = await import("./sessions-sweep-run.js");
+    const config = loadConfig();
+    const sweepCfg = config.sessionsSweep ?? {};
+    const formal = !options.shadow;
+    let ledgerDir: string | undefined;
+    if (formal) {
+      const ledgerSource = config.sources.ledgers;
+      if (!ledgerSource || ledgerSource.path === "auto") {
+        console.error("❌ 正式模式需要在 config.json 里显式配置 sources.ledgers.path（账本落点）；只想试跑就加 --shadow <dir>");
+        process.exitCode = 2;
+        return;
+      }
+      ledgerDir = resolveSourcePath(ledgerSource.path, "ledgers");
+    }
     let llm: import("./llm-client.js").LLMClient | null = null;
     if (options.llm !== false) {
       const { createLLMClient } = await import("./llm-client.js");
-      const config = loadConfig();
       const { resolveEnv } = await import("./runtime-config.js");
-      llm = config.llm ? createLLMClient({ ...config.llm, apiKey: resolveEnv(config.llm.apiKey) }) : null;
+      const llmCfg = sweepCfg.llm ?? config.llm;
+      llm = llmCfg ? createLLMClient({ ...llmCfg, apiKey: resolveEnv(llmCfg.apiKey), timeoutMs: 90_000 }) : null;
       if (!llm) console.error("⚠️ config.llm 缺失或无法初始化，退回 --no-llm 行为");
     }
-    const result = await runSweep({
-      roots: parseRootsOption(options.roots),
-      shadowDir: options.shadow.replace(/^~\//, `${require("node:os").homedir()}/`),
-      policy: { idleMinutes: Number(options.idleMinutes), candidateAfterMinutes: Number(options.candidateAfterMinutes), minUserTurns: Number(options.minUserTurns) },
+    const policyBySource: Record<string, { idleMinutes?: number; candidateAfterMinutes?: number }> = {};
+    for (const [src, p] of Object.entries(SWEEP_DEFAULT_POLICY_BY_SOURCE)) {
+      policyBySource[src] = {
+        idleMinutes: options.idleMinutes !== undefined ? Number(options.idleMinutes) : (sweepCfg.idleMinutes?.[src] ?? p.idleMinutes),
+        candidateAfterMinutes: options.candidateAfterMinutes !== undefined ? Number(options.candidateAfterMinutes) : (sweepCfg.candidateAfterMinutes?.[src] ?? p.candidateAfterMinutes),
+      };
+    }
+    const candidates = options.candidates !== undefined ? Boolean(options.candidates) : formal ? Boolean(sweepCfg.candidates) : true;
+    const dataDir = resolve(envDataDir());
+    const runOpts: Parameters<typeof runSweep>[0] = {
+      roots: parseRootsOption(options.roots ?? (formal ? "truth" : "local")),
+      ...(formal
+        ? { ledgerDir, stateDir: join(dataDir, "session-state"), logPath: join(dataDir, "logs", "sessions-sweep.jsonl"), heartbeatPath: join(dataDir, SWEEP_HEARTBEAT_FILE) }
+        : { shadowDir: options.shadow.replace(/^~\//, `${require("node:os").homedir()}/`) }),
+      policy: { minUserTurns: Number(options.minUserTurns) },
+      policyBySource,
+      candidates,
       sinceDays: Number(options.sinceDays),
       nowMs: options.now ? Date.parse(options.now) : undefined,
       sources: options.sources ? String(options.sources).split(",") as import("./session-events.js").SessionSource[] : undefined,
@@ -3069,7 +3158,20 @@ sessionsCmd
       trigger: options.trigger === "replay" ? "replay" : "auto-sweep",
       llmDelayMs: Number(options.llmDelayMs) || 0,
       log: (line) => console.log(line),
-    });
+    };
+    // 正式模式：launchd 每 10 分钟拉一次，上一轮（LLM 慢）没跑完就跳过本轮，不叠跑
+    let result: Awaited<ReturnType<typeof runSweep>>;
+    if (formal && !options.dryRun) {
+      const { withLock } = await import("./distill-lock.js");
+      const outcome = await withLock("sessions-sweep", () => runSweep(runOpts), { onBusy: "skip", expireMs: 2 * 3_600_000 });
+      if (!outcome.ran) {
+        console.log("上一轮扫描还在跑（锁 sessions-sweep 被占），本轮跳过");
+        return;
+      }
+      result = outcome.result;
+    } else {
+      result = await runSweep(runOpts);
+    }
     if (options.json) console.log(JSON.stringify(result, null, 2));
     else console.log(`发现 ${result.discovered}（stat ${result.statCalls} 次 / ${result.discoveryWallMs} ms）；决策 ${JSON.stringify(result.actions)}；写账本 ${result.ledgersWritten.length} 份；LLM ${result.llmCalls} 次（${result.llmPromptTokens}+${result.llmCompletionTokens} tokens，失败 ${result.llmFailures}）；${result.wallMs} ms`);
   });
