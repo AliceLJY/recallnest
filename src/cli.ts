@@ -3062,6 +3062,13 @@ sessionsCmd
       process.exitCode = 2;
       return;
     }
+    const { checkLedgerWriter } = await import("./sessions-sweep-run.js");
+    const writer = checkLedgerWriter(resolveSourcePath(ledgerSource.path, "ledgers"), { claim: true });
+    if (!writer.ok) {
+      console.error(`❌ 账本目录只由 ${writer.owner || "（标记文件是空的）"} 写（${writer.path}），本机是 ${writer.host}：到那台机器上、仓库根目录下跑这条命令。确实要换写入端，改那个文件`);
+      process.exitCode = 2;
+      return;
+    }
     const want = String(options.session).trim();
     const sinceMs = Date.now() - 45 * 86_400_000;
     const find = (roots: import("./sessions-sweep.js").RootSpec[]) => discoverTranscripts(roots, { sinceMs }).files.filter((f) => f.sessionId === want || f.sessionId.startsWith(want));
@@ -3165,6 +3172,14 @@ sessionsCmd
         return;
       }
       ledgerDir = resolveSourcePath(ledgerSource.path, "ledgers");
+      // 账本目录只许一台机器写（本机提交锁管不到 Syncthing 同步进来的写入）；dry-run 只查不认领
+      const { checkLedgerWriter } = await import("./sessions-sweep-run.js");
+      const writer = checkLedgerWriter(ledgerDir, { claim: !options.dryRun });
+      if (!writer.ok) {
+        console.error(`❌ 账本目录只由 ${writer.owner || "（标记文件是空的）"} 写（${writer.path}），本机是 ${writer.host}：正式扫描只在那台机器上跑。确实要换写入端，改那个文件`);
+        process.exitCode = 2;
+        return;
+      }
     }
     let llm: import("./llm-client.js").LLMClient | null = null;
     if (options.llm !== false) {

@@ -405,3 +405,56 @@ describe("R4 修复：旧格式决定、中文句中摘录、结尾标记的预�
     expect([...seqsOf(masked.text)].some((s) => maskedSeqs.has(s))).toBe(false);
   });
 });
+
+describe("R4 R3 修复：用户原话核对看否定、引用与贴回；emoji 不让下标错位", () => {
+  const userSays = (text: string, anchor: string) => {
+    const d = doc();
+    d.events[6].text = text;
+    return verifyAnchor(d, anchor, null, { userOnly: true }).verified;
+  };
+  it("否定就在锚点前面（中间隔着标点也算）：核不到（R3 Codex NEW-1、Kimi NEW-4 的反例）", () => {
+    expect(userSays("我不同意以后全部使用中文回答", "以后全部使用中文回答")).toBe(false);
+    expect(userSays("不要——跑全量测试", "跑全量测试")).toBe(false);
+    expect(userSays("我坚决不同意以后全部使用中文回答", "以后全部使用中文回答")).toBe(false);
+    const d = doc();
+    d.events[6].text = "我不同意以后全部使用中文回答";
+    const body = parseLedgerJson(JSON.stringify({ oneLine: "x", solved: [], decisions: [{ text: "定：以后全部使用中文回答", by: "用户", anchor: "以后全部使用中文回答" }], experience: [], unfinished: [] }), d);
+    expect(body.decisions).toEqual(["定：以后全部使用中文回答（用户原话没核到，按助手提议看）"]);
+  });
+  it("前一个分句或紧跟着的分句说「不同意 / 反对」：核不到", () => {
+    expect(userSays("我不同意，以后全部使用中文回答", "以后全部使用中文回答")).toBe(false);
+    expect(userSays("以后全部使用中文回答，这个我反对", "以后全部使用中文回答")).toBe(false);
+  });
+  it("锚点在引号里（引的是别人的话）：核不到（R3 Codex NEW-1 第二个反例）", () => {
+    expect(userSays("你刚才建议「以后不用跑测试」，这个建议我不同意。", "以后不用跑测试")).toBe(false);
+    expect(userSays("你说的“以后不用跑测试”我再想想", "以后不用跑测试")).toBe(false);
+  });
+  it("否定离得远、或是「不错 / 是不是」这类分句外的字：照样核到（回放账本上整句判会误伤的形状）", () => {
+    expect(userSays("我明确决定以后全部使用中文回答", "以后全部使用中文回答")).toBe(true);
+    expect(userSays("不错，以后全部使用中文回答", "以后全部使用中文回答")).toBe(true);
+    expect(userSays("你哪里不准的时候是不是先问我以后全部使用中文回答", "以后全部使用中文回答")).toBe(true);
+    expect(userSays("以后全部使用中文回答，不用再问了~这个不是重点", "以后全部使用中文回答")).toBe(true);
+    // 引号已经关上之后的话照常算
+    expect(userSays("默认结论是「不用管」：以后全部使用中文回答", "以后全部使用中文回答")).toBe(true);
+  });
+  it("这段话最早出现在助手或工具输出里、用户后来贴回 / 复述：不算用户原话（R3 Kimi NEW-2）；用户先说、助手后复述照样算", () => {
+    const d = doc();
+    d.events[1].text = "建议以后日志一律放 ops-logs 目录";
+    d.events[6].text = "建议以后日志一律放 ops-logs 目录 —— 你上面这句我再看看";
+    expect(verifyAnchor(d, "以后日志一律放 ops-logs 目录", null, { userOnly: true }).verified).toBe(false);
+    // 不限 userOnly 的核对不受影响：原文确实在转录里
+    expect(verifyAnchor(d, "以后日志一律放 ops-logs 目录", null).verified).toBe(true);
+    const e = doc();
+    e.events[0].text = "以后日志一律放 ops-logs 目录";
+    e.events[7].text = "好，以后日志一律放 ops-logs 目录";
+    expect(verifyAnchor(e, "以后日志一律放 ops-logs 目录", 7, { userOnly: true })).toEqual({ verified: true, seq: 0 });
+  });
+  it("消息里有 emoji：归一化下标不错位，截掉否定的摘录照样核不到", () => {
+    const d = doc();
+    d.events[7].text = "👍👍 这不是生产环境";
+    expect(verifyAnchor(d, "是生产环境", 7).verified).toBe(false);
+    expect(verifyAnchor(d, "这不是生产环境", 7).verified).toBe(true);
+    d.events[6].text = "😂😂 我不同意以后全部使用中文回答";
+    expect(verifyAnchor(d, "以后全部使用中文回答", null, { userOnly: true }).verified).toBe(false);
+  });
+});

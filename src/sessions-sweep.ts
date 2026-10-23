@@ -149,6 +149,11 @@ export interface SessionState {
    */
   llmRetryAt?: string | null;
   llmFailCount?: number;
+  /**
+   * 上次判这场的 recall-log 时，主日志有多大（字节）。主日志比它大 = 判完之后又追加了记录：转录没变（mtime 快路、
+   * 不解析）也要解析一次再判（P1 互审 R4 R3 Codex #2 前半）。没有 = 从没判过
+   */
+  recallLogBytes?: number;
 }
 
 export type SweepAction =

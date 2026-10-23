@@ -10,6 +10,7 @@
  * 只用 node:fs + 轻依赖：报错召回的 hook 每次工具报错都要跑一次（scripts/error-recall.ts）。
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync, renameSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
@@ -55,6 +56,13 @@ export function recurrenceSignatures(errorText: string): Map<string, string> {
   return out;
 }
 
+/**
+ * 报错头以 CC 钩子拦截的前缀开头（「PreToolUse:Bash hook error: …」）。只给读旧账本用：474f50b 之前写的账本对拦截报错
+ * 照样写签名，而抽取会把这个前缀抽掉（P1 互审 R4 R3 Codex #6 / Kimi NEW-5）。只认开头：新账本只给第一行不像拦截的报错写签名，
+ * 第一行不含拦截字样，以它起头的报错头也就不会以拦截前缀开头——新账本上这一关一条都不会挡（读写两侧仍同形）
+ */
+const HOOK_PREFIX_RE = /^(?:Pre|Post)ToolUse\w*:\S*\s+hook error\b/i;
+
 /** 账本 markdown 的报错节里记下的签名（「｜签名：a ‖ b」），按同一规则过滤 */
 export function ledgerFileSignatures(md: string): Map<string, string> {
   const out = new Map<string, string>();
@@ -62,6 +70,9 @@ export function ledgerFileSignatures(md: string): Map<string, string> {
   for (const line of sec.split("\n")) {
     const i = line.indexOf("｜签名：");
     if (i < 0) continue;
+    // 行形：「- <工具名> #<序号>: <报错头> ｜签名：…」
+    const head = line.slice(0, i).replace(/^-\s+\S+\s+#\d+:\s*/, "");
+    if (HOOK_PREFIX_RE.test(head)) continue;
     for (const raw of line.slice(i + "｜签名：".length).split("‖")) {
       const s = raw.trim();
       if (!s || isHookInterception(s) || classifySignatureSpecificity(s) !== "specific") continue;
@@ -88,20 +99,52 @@ export interface SignatureIndex {
   /** 账本根目录（报错召回要回读命中那份账本的「解决了什么」） */
   ledgerDir: string;
   files: number;
+  /**
+   * 建索引时账本目录的样子（每份账本的相对路径、mtime、大小的摘要，见 ledgerDirDigest）。扫描器拿它和当前目录比，
+   * 不一样就重建——只比「最新 mtime 与 builtAt」会漏掉 mtime 比 builtAt 旧的文件（恢复、带原 mtime 拷进来的，
+   * P1 互审 R4 R3 Codex #2 后半）。旧索引没有这一项，按不一样处理
+   */
+  sourceDigest?: string;
   /** 签名键 → 出现过的会话（每场一次） */
   sigs: Record<string, { display: string; refs: SigRef[] }>;
 }
 
-export function buildSignatureIndex(ledgerDir: string, nowIso = new Date().toISOString()): SignatureIndex {
-  const index: SignatureIndex = { builtAt: nowIso, ledgerDir, files: 0, sigs: {} };
-  let files: string[] = [];
+/** 参与索引的账本（不含 Syncthing 冲突副本）及其 mtime / 大小；目录读不了返回 null */
+function ledgerFileStats(ledgerDir: string): Array<{ file: string; mtimeMs: number; size: number }> | null {
+  let files: string[];
   try {
     files = listLedgerFiles(ledgerDir);
   } catch {
-    return index;
+    return null;
   }
+  const out: Array<{ file: string; mtimeMs: number; size: number }> = [];
   for (const file of files) {
     if (/sync-conflict/i.test(file)) continue;
+    try {
+      const st = statSync(join(ledgerDir, file));
+      out.push({ file, mtimeMs: st.mtimeMs, size: st.size });
+    } catch {
+      /* 刚被挪走 */
+    }
+  }
+  return out.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+}
+
+function digestOf(stats: Array<{ file: string; mtimeMs: number; size: number }> | null): string {
+  const h = createHash("sha256");
+  for (const s of stats ?? []) h.update(`${s.file}\t${s.mtimeMs}\t${s.size}\n`);
+  return h.digest("hex").slice(0, 32);
+}
+
+/** 账本目录此刻的摘要（同 SignatureIndex.sourceDigest 的算法）：多一份、少一份、哪份的 mtime 或大小变了都会变 */
+export function ledgerDirDigest(ledgerDir: string): string {
+  return digestOf(ledgerFileStats(ledgerDir));
+}
+
+export function buildSignatureIndex(ledgerDir: string, nowIso = new Date().toISOString()): SignatureIndex {
+  const stats = ledgerFileStats(ledgerDir);
+  const index: SignatureIndex = { builtAt: nowIso, ledgerDir, files: 0, sourceDigest: digestOf(stats), sigs: {} };
+  for (const { file } of stats ?? []) {
     let md: string;
     try {
       md = readFileSync(join(ledgerDir, file), "utf-8");
@@ -118,8 +161,9 @@ export function buildSignatureIndex(ledgerDir: string, nowIso = new Date().toISO
 
 export function addToIndex(index: SignatureIndex, ref: { session: string; ended: string; file: string; title: string }, sigs: Map<string, string>): void {
   const sid8 = ref.session.replace(/[^A-Za-z0-9]/g, "").slice(0, 8);
-  // 标题压成一行：报错召回把它拼进注入文本（P1 互审 R4 Kimi #3）
-  const full: SigRef = { session: ref.session, sid8, date: ref.ended.slice(0, 10), ended: ref.ended, file: ref.file, title: ref.title.replace(/\s+/g, " ").trim().slice(0, 60) };
+  // 标题压成一行：报错召回把它拼进注入文本（P1 互审 R4 Kimi #3）；先脱敏——索引文件本身落盘，
+  // 不能只靠账本 markdown 与钩子输出那两处的脱敏（R4 R3 Codex NEW-3）
+  const full: SigRef = { session: ref.session, sid8, date: ref.ended.slice(0, 10), ended: ref.ended, file: ref.file, title: redactSecrets(ref.title).text.replace(/\s+/g, " ").trim().slice(0, 60) };
   for (const [k, display] of sigs) {
     const slot = (index.sigs[k] ??= { display, refs: [] });
     const at = slot.refs.findIndex((r) => r.session === ref.session);
@@ -156,25 +200,6 @@ export function writeSignatureIndex(path: string, index: SignatureIndex): void {
   const tmp = `${path}.tmp-${process.pid}`;
   writeFileSync(tmp, JSON.stringify(index));
   renameSync(tmp, path);
-}
-
-/** 账本目录里最新那份账本的修改时间（毫秒）；没有账本或读不了返回 0 */
-export function newestLedgerMtimeMs(ledgerDir: string): number {
-  let files: string[];
-  try {
-    files = listLedgerFiles(ledgerDir);
-  } catch {
-    return 0;
-  }
-  let newest = 0;
-  for (const f of files) {
-    try {
-      newest = Math.max(newest, statSync(join(ledgerDir, f)).mtimeMs);
-    } catch {
-      /* 刚被挪走 */
-    }
-  }
-  return newest;
 }
 
 export function readSignatureIndex(path: string): SignatureIndex | null {

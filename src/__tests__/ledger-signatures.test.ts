@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -8,6 +8,7 @@ import {
   addToIndex,
   buildSignatureIndex,
   isHookInterception,
+  ledgerDirDigest,
   ledgerFileSignatures,
   lookupSignatures,
   readSignatureIndex,
@@ -91,7 +92,7 @@ describe("扫描器：疑似又踩节 + 签名索引", () => {
     const first = readFileSync(join(ledgerDir, "2026-10", "aaaa0001.md"), "utf-8");
     expect(first).not.toContain("疑似又踩");
     const idx = readSignatureIndex(indexPath)!;
-    expect(idx.files).toBe(0); // 首次构建时目录还空，之后全靠就地更新
+    expect(idx.files).toBe(2); // 本轮写了账本：收尾时从磁盘整份重建（R4 R3 Codex #2 后半），不是首次构建时那份空目录的就地更新
     expect(Object.values(idx.sigs)[0].refs.map((x) => x.sid8).sort()).toEqual(["aaaa0001", "bbbb0002"]);
     // 从文件重建也得到同样的索引
     const rebuilt = buildSignatureIndex(ledgerDir);
@@ -270,5 +271,81 @@ describe("R4 修复：钩子拦截按原始报错第一行判、读写一致；�
     const b = await runSweep({ ...base, nowMs: NOW + 10 * MIN });
     expect(b.ledgersWritten).toEqual([]);
     expect(Object.values(readSignatureIndex(indexPath)!.sigs).flatMap((v) => v.refs.map((x) => x.sid8))).toEqual(["eeee0005"]);
+  });
+});
+
+describe("R4 R3 修复：判完之后追加的 recall-log、旧 mtime 账本进索引、旧账本的拦截签名、索引标题脱敏", () => {
+  it("判完之后又追加一行（转录没变、走 mtime 快路）：下一轮照判；主日志没长就不解析（R3 Codex #2 前半）", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rn-sig-latelog-"));
+    const cc = join(root, "projects");
+    const dataDir = join(root, "data");
+    const sid = "ffff0006-0000-4000-8000-000000000006";
+    ccWithError(cc, sid, 90, STORE_CASE_ERR);
+    const query = [...recurrenceSignatures(STORE_CASE_ERR).values()][0];
+    const end = NOW - 90 * MIN;
+    appendRecallLog(dataDir, buildRecallLogEntry({ sessionId: sid, operation: "error-signature", query, results: [], now: end - 9 * MIN }));
+    const base = { roots: [{ source: "cc" as const, dir: cc }], ledgerDir: join(root, "ledgers"), stateDir: join(dataDir, "state"), recallLogRoot: dataDir, llm: fakeLLM, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false };
+    const r1 = await runSweep({ ...base, nowMs: NOW });
+    const r2 = await runSweep({ ...base, nowMs: NOW + 24 * 60 * MIN }); // 候选到期那一轮（解析过、判过）
+    expect(Object.values(r1.recallOutcomes ?? {}).reduce((a, b) => a + b, 0)).toBe(1);
+    expect(r2.recallOutcomes ?? {}).toEqual({});
+    // 转录不动，钩子补写一条会话结束之前的记录
+    appendRecallLog(dataDir, buildRecallLogEntry({ sessionId: sid, operation: "error-signature", query, results: [], now: end - 8 * MIN }));
+    const r3 = await runSweep({ ...base, nowMs: NOW + 48 * 60 * MIN });
+    expect(r3.actions).toEqual({ "up-to-date": 1 } as typeof r3.actions);
+    expect(Object.values(r3.recallOutcomes ?? {}).reduce((a, b) => a + b, 0)).toBe(1);
+    const side = join(dataDir, RECALL_LOG_DIRNAME, recallOutcomeFileName(sid));
+    expect(readFileSync(side, "utf-8").trim().split("\n").length).toBe(2);
+    // 游标记着判的时候主日志多大；没再长就不解析、不判
+    const state = JSON.parse(readFileSync(join(dataDir, "state", `cc__${sid}.json`), "utf-8")) as { recallLogBytes?: number };
+    expect(state.recallLogBytes).toBe(statSync(join(dataDir, RECALL_LOG_DIRNAME, recallLogFileName(sid))).size);
+    const r4 = await runSweep({ ...base, nowMs: NOW + 49 * 60 * MIN });
+    expect(r4.recallOutcomes).toBeUndefined();
+  });
+  it("索引建好之后来了一份 mtime 比索引还旧的账本（恢复 / 带原 mtime 拷进来）：下一轮重建进索引；什么都没变就不重写（R3 Codex #2 后半）", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rn-sig-oldmtime-"));
+    const cc = join(root, "projects");
+    const ledgerDir = join(root, "ledgers");
+    const indexPath = join(root, "data", SIGNATURE_INDEX_FILE);
+    const sidA = "abab0007-0000-4000-8000-000000000007";
+    const sidB = "abab0008-0000-4000-8000-000000000008";
+    ccWithError(cc, sidA, 90, STORE_CASE_ERR);
+    const base = { roots: [{ source: "cc" as const, dir: cc }], ledgerDir, stateDir: join(root, "state"), signatureIndexPath: indexPath, llm: fakeLLM, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false };
+    const a = await runSweep({ ...base, nowMs: NOW });
+    const built = readFileSync(indexPath, "utf-8");
+    await runSweep({ ...base, nowMs: NOW + 5 * MIN });
+    expect(readFileSync(indexPath, "utf-8")).toBe(built);
+    const pB = join(ledgerDir, "2026-10", "abab0008.md");
+    writeFileSync(pB, readFileSync(a.ledgersWritten[0], "utf-8").replaceAll(sidA, sidB));
+    const old = new Date(Date.parse(readSignatureIndex(indexPath)!.builtAt) - 10 * MIN);
+    utimesSync(pB, old, old);
+    await runSweep({ ...base, nowMs: NOW + 10 * MIN });
+    expect(Object.values(readSignatureIndex(indexPath)!.sigs).flatMap((v) => v.refs.map((x) => x.sid8)).sort()).toEqual(["abab0007", "abab0008"]);
+    expect(readSignatureIndex(indexPath)!.sourceDigest).toBe(ledgerDirDigest(ledgerDir));
+    // 同名、同字节数的账本原地换了内容（标题改一个字），mtime 也拨回索引之前：摘要里有 mtime，照样重建
+    const pA = a.ledgersWritten[0];
+    const mdA = readFileSync(pA, "utf-8");
+    expect(mdA).toContain("# 存 case 撞参数校验");
+    writeFileSync(pA, mdA.replace("# 存 case 撞参数校验", "# 存 cbse 撞参数校验"));
+    const older = new Date(Date.parse(readSignatureIndex(indexPath)!.builtAt) - 20 * MIN);
+    utimesSync(pA, older, older);
+    await runSweep({ ...base, nowMs: NOW + 15 * MIN });
+    const titles = Object.values(readSignatureIndex(indexPath)!.sigs).flatMap((v) => v.refs.filter((x) => x.sid8 === "abab0007").map((x) => x.title));
+    expect(titles).toEqual(["存 cbse 撞参数校验"]);
+  });
+  it("旧账本里被抽掉拦截前缀的签名：读的时候按报错头开头的拦截前缀排除；第一行是真报错的新账本签名照收（R3 Codex #6 / Kimi NEW-5）", () => {
+    const legacy = "---\nsession: s\n---\n# t\n## 报错（机器抽取，1 条）\n- Bash #0: PreToolUse:Bash hook error: Error: Operation not permitted on /tmp/review-target ｜签名：error: Error: Operation not permitted on /tmp/review-target\n";
+    expect([...ledgerFileSignatures(legacy).keys()]).toEqual([]);
+    const realErr = `${STORE_CASE_ERR}\nhook events: ['PostToolUse', 'PreToolUse']`;
+    const sig = [...recurrenceSignatures(realErr).values()][0];
+    const fresh = `---\nsession: s\n---\n# t\n## 报错（机器抽取，1 条）\n- mcp__recallnest__store_case #2: ${realErr.replace(/\s+/g, " ").slice(0, 160)} ｜签名：${sig}\n`;
+    expect([...ledgerFileSignatures(fresh).keys()]).toEqual([...recurrenceSignatures(realErr).keys()]);
+  });
+  it("索引里的标题先脱敏再落盘（R3 Codex NEW-3）", () => {
+    const fake = ["sk", "-", "proj", "-", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"].join("");
+    const idx = { builtAt: "", ledgerDir: "/x", files: 0, sigs: {} };
+    addToIndex(idx, { session: "s1-x", ended: "2026-10-23T00:00:00.000Z", file: "a.md", title: `修好了 ${fake} 那个配置` }, recurrenceSignatures(STORE_CASE_ERR));
+    expect(JSON.stringify(idx)).not.toContain(fake);
+    expect(Object.values(idx.sigs)[0].refs[0].title).toContain("修好了");
   });
 });
