@@ -1,10 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import {
+  addToIndex,
   buildSignatureIndex,
   isHookInterception,
   ledgerFileSignatures,
@@ -15,10 +16,12 @@ import {
   SIGNATURE_INDEX_FILE,
   sigKey,
 } from "../ledger-signatures.js";
-import { judgeEntry, judgeRecallLog } from "../recall-outcome.js";
+import { judgeEntry, judgeRecallLog, recallOutcomeFileName, type RecallOutcomeRecord } from "../recall-outcome.js";
 import { buildRecallLogEntry, RECALL_LOG_DIRNAME, recallLogFileName } from "../recall-log.js";
 import type { SessionDoc } from "../session-events.js";
-import { runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE } from "../sessions-sweep-run.js";
+import { runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE, writeSessionLedgerNow } from "../sessions-sweep-run.js";
+import { discoverTranscripts } from "../sessions-sweep.js";
+import { appendRecallLog } from "../recall-log.js";
 
 /**
  * P1 ⑥：账本签名索引 → 「疑似又踩」节、报错召回（hook 脚本）、recall-log 四态。
@@ -166,19 +169,106 @@ describe("recall-log 四态", () => {
     expect(judgeEntry(entry(), doc([])).outcome).toBe("undeterminable");
     expect(judgeEntry(entry("api:/v1/auto-recall"), doc([{ kind: "tool_result", at: NOW + MIN, text: "ok" }])).outcome).toBe("undeterminable");
   });
-  it("judgeRecallLog 只判没判过的、写回文件；会话结束之后的记录留给下一轮", () => {
+  it("judgeRecallLog 只判没判过的，结果追加到 sidecar、主日志一个字节不动；会话结束之后的记录留给下一轮（R4 Codex #1 / Kimi #1）", () => {
     const root = mkdtempSync(join(tmpdir(), "rn-outcome-"));
     mkdirSync(join(root, RECALL_LOG_DIRNAME));
     const p = join(root, RECALL_LOG_DIRNAME, recallLogFileName("s1"));
-    const judged = { ...entry(), outcome: "missed", outcomeReason: "earlier" };
+    const side = join(root, RECALL_LOG_DIRNAME, recallOutcomeFileName("s1"));
+    const inline = { ...entry(), outcome: "missed", outcomeReason: "旧版就地判过的" };
     const later = { ...entry(), ts: new Date(NOW + 120 * MIN).toISOString() };
-    writeFileSync(p, [JSON.stringify(entry()), JSON.stringify(judged), JSON.stringify(later), "garbage"].join("\n"));
-    const counts = judgeRecallLog(root, doc([{ kind: "tool_result", at: NOW + MIN, text: "ok" }]), "2026-10-23T13:00:00.000Z");
-    expect(counts).toEqual({ used: 1 });
-    const lines = readFileSync(p, "utf-8").split("\n");
-    expect(JSON.parse(lines[0]).outcome).toBe("used");
-    expect(JSON.parse(lines[1]).outcomeReason).toBe("earlier");
-    expect(JSON.parse(lines[2]).outcome).toBeNull();
-    expect(lines[3]).toBe("garbage");
+    // 最后一行没有换行：别的进程正写到一半，这一轮不判
+    const original = `${[JSON.stringify(entry()), JSON.stringify(inline), JSON.stringify(later), "garbage"].join("\n")}\n${JSON.stringify(entry())}`;
+    writeFileSync(p, original);
+    const d = doc([{ kind: "tool_result", at: NOW + MIN, text: "ok" }]);
+    expect(judgeRecallLog(root, d, "2026-10-23T13:00:00.000Z")).toEqual({ used: 1 });
+    expect(readFileSync(p, "utf-8")).toBe(original);
+    const recs = readFileSync(side, "utf-8").trim().split("\n").map((l) => JSON.parse(l) as RecallOutcomeRecord);
+    expect(recs.map((r) => [r.key.split(":")[0], r.outcome])).toEqual([["0", "used"]]);
+    // 再判一次：不重判
+    expect(judgeRecallLog(root, d, "2026-10-23T13:10:00.000Z")).toEqual({});
+    // 那一行写完了、钩子又追加了一条：两条都在主日志里、都被判
+    appendFileSync(p, `\n${JSON.stringify(entry())}\n`);
+    expect(judgeRecallLog(root, d, "2026-10-23T13:20:00.000Z")).toEqual({ used: 2 });
+    expect(readFileSync(p, "utf-8").startsWith(original)).toBe(true);
+    expect(readFileSync(side, "utf-8").trim().split("\n").length).toBe(3);
+  });
+  it("判定读快照之后别的进程追加的行：不会被盖掉，下一轮照判", () => {
+    const root = mkdtempSync(join(tmpdir(), "rn-outcome-race-"));
+    mkdirSync(join(root, RECALL_LOG_DIRNAME));
+    const p = join(root, RECALL_LOG_DIRNAME, recallLogFileName("s1"));
+    writeFileSync(p, `${JSON.stringify(entry())}\n`);
+    // 在判定读主日志之后、写结果之前插进一条追加（模拟钩子 / MCP 进程）
+    const d = doc([{ kind: "tool_result", at: NOW + MIN, text: "ok" }]);
+    const realEndedAt = d.endedAt;
+    let injected = false;
+    Object.defineProperty(d, "endedAt", { get() { if (!injected) { injected = true; appendFileSync(p, `${JSON.stringify(entry())}\n`); } return realEndedAt; } });
+    expect(judgeRecallLog(root, d)).toEqual({ used: 1 });
+    expect(injected).toBe(true);
+    expect(readFileSync(p, "utf-8").trim().split("\n").length).toBe(2);
+    expect(judgeRecallLog(root, doc([{ kind: "tool_result", at: NOW + MIN, text: "ok" }]))).toEqual({ used: 1 });
+  });
+});
+
+describe("R4 修复：钩子拦截按原始报错第一行判、读写一致；索引标题压平；收工账本之后的判定与索引刷新", () => {
+  const HOOK_PREFIXED = "PreToolUse:Bash hook error: Error: Operation not permitted on /tmp/review-target";
+  it("拦截前缀在报错第一行：抽签名时不会因为前缀被抽掉而漏判（R4 Codex #6 的反例）", () => {
+    expect([...recurrenceSignatures(HOOK_PREFIXED).keys()]).toEqual([]);
+    // 第一行是真报错、第二行才出现拦截字样：真报错照样算
+    expect([...recurrenceSignatures(`${STORE_CASE_ERR}\n${HOOK_ERR}`).keys()].length).toBe(1);
+  });
+  it("写账本时拦截报错标「钩子拦截」、不写签名；从账本建索引读不到它（读写两侧同一个判断）", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rn-sig-hook-"));
+    const cc = join(root, "projects");
+    const ledgerDir = join(root, "ledgers");
+    ccWithError(cc, "cccc0003-0000-4000-8000-000000000003", 90, HOOK_PREFIXED);
+    const r = await runSweep({ roots: [{ source: "cc", dir: cc }], ledgerDir, stateDir: join(root, "state"), nowMs: NOW, llm: fakeLLM, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false });
+    const md = readFileSync(r.ledgersWritten[0], "utf-8");
+    expect(md).toContain("｜钩子拦截");
+    expect(md).not.toContain("｜签名：");
+    expect([...ledgerFileSignatures(md).keys()]).toEqual([]);
+    expect(Object.keys(buildSignatureIndex(ledgerDir).sigs)).toEqual([]);
+  });
+  it("索引里的标题压成一行（报错召回把它拼进注入文本，R4 Kimi #3）", () => {
+    const idx = { builtAt: "", ledgerDir: "/x", files: 0, sigs: {} };
+    addToIndex(idx, { session: "s1-x", ended: "2026-10-23T00:00:00.000Z", file: "2026-10/s1.md", title: "第一行\n## 没做完\n- 第三行" }, recurrenceSignatures(STORE_CASE_ERR));
+    expect(Object.values(idx.sigs)[0].refs[0].title).toBe("第一行 ## 没做完 - 第三行");
+  });
+  it("收工账本写完之后会话再没有新事件：扫描器静默后照样判它的 recall-log，并把它的签名刷进索引（R4 Codex #2）", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rn-sig-manual-"));
+    const cc = join(root, "projects");
+    const ledgerDir = join(root, "ledgers");
+    const dataDir = join(root, "data");
+    const indexPath = join(dataDir, SIGNATURE_INDEX_FILE);
+    const sid = "dddd0004-0000-4000-8000-000000000004";
+    ccWithError(cc, sid, 90, STORE_CASE_ERR);
+    // 先有一份旧索引（另一场会话的），builtAt 在收工账本之前
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(indexPath, JSON.stringify({ builtAt: new Date(Date.now() - 3_600_000).toISOString(), ledgerDir, files: 0, sigs: {} }));
+    // 钩子在这场里注入过一次
+    appendRecallLog(dataDir, buildRecallLogEntry({ sessionId: sid, operation: "error-signature", query: [...recurrenceSignatures(STORE_CASE_ERR).values()][0], results: [], now: NOW - 97 * MIN }));
+    const file = discoverTranscripts([{ source: "cc", dir: cc }]).files[0];
+    await writeSessionLedgerNow({ file, ledgerDir, stateDir: join(dataDir, "session-state"), trigger: "manual-收工", body: { oneLine: "存 case", solved: ["存好了"], decisions: [], experience: [], unfinished: [] }, nowMs: NOW });
+    const r = await runSweep({ roots: [{ source: "cc", dir: cc }], ledgerDir, stateDir: join(dataDir, "session-state"), signatureIndexPath: indexPath, recallLogRoot: dataDir, nowMs: NOW + 10 * MIN, llm: fakeLLM, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false });
+    expect(r.ledgersWritten).toEqual([]);
+    // 注入之后这场再没有工具调用：判成 undeterminable——要紧的是「判了」，不是判成哪态
+    expect(r.recallOutcomes).toEqual({ undeterminable: 1 });
+    expect(existsSync(join(dataDir, RECALL_LOG_DIRNAME, recallOutcomeFileName(sid)))).toBe(true);
+    const idx = readSignatureIndex(indexPath)!;
+    expect(Object.values(idx.sigs).flatMap((v) => v.refs.map((x) => x.sid8))).toEqual(["dddd0004"]);
+  });
+  it("上一轮写完账本、在写索引之前被杀：下一轮没写账本也会按账本比索引新把索引重建（R4 Kimi #2）", async () => {
+    const root = mkdtempSync(join(tmpdir(), "rn-sig-killed-"));
+    const cc = join(root, "projects");
+    const ledgerDir = join(root, "ledgers");
+    const indexPath = join(root, "data", SIGNATURE_INDEX_FILE);
+    ccWithError(cc, "eeee0005-0000-4000-8000-000000000005", 90, STORE_CASE_ERR);
+    const base = { roots: [{ source: "cc" as const, dir: cc }], ledgerDir, stateDir: join(root, "state"), signatureIndexPath: indexPath, llm: fakeLLM, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false };
+    const a = await runSweep({ ...base, nowMs: NOW });
+    expect(a.ledgersWritten.length).toBe(1);
+    // 模拟「写完账本、写索引之前被杀」：索引退回到这份账本之前的样子
+    writeFileSync(indexPath, JSON.stringify({ builtAt: new Date(Date.now() - 3_600_000).toISOString(), ledgerDir, files: 0, sigs: {} }));
+    const b = await runSweep({ ...base, nowMs: NOW + 10 * MIN });
+    expect(b.ledgersWritten).toEqual([]);
+    expect(Object.values(readSignatureIndex(indexPath)!.sigs).flatMap((v) => v.refs.map((x) => x.sid8))).toEqual(["eeee0005"]);
   });
 });

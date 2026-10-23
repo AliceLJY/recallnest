@@ -10,7 +10,7 @@
  * 只用 node:fs + 轻依赖：报错召回的 hook 每次工具报错都要跑一次（scripts/error-recall.ts）。
  */
 
-import { readFileSync, renameSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, renameSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { extractErrorSignatures } from "./error-signature.js";
@@ -28,6 +28,16 @@ export function isHookInterception(sig: string): boolean {
   return HOOK_INTERCEPT_RE.test(sig);
 }
 
+/**
+ * 一条原始报错是不是钩子拦截：看它的第一行（前 300 字）。不能只看抽出来的签名——抽取会把「PreToolUse:Bash hook error:」
+ * 这类前缀丢掉（P1 互审 R4 Codex #6）；也不看全文——第二行起偶然出现的拦截字样不该把第一行的真报错一起排除。
+ * 写账本（session-ledger.ts 报错节标「钩子拦截」、不写签名）与查召回（recurrenceSignatures）用的是这同一个判断。
+ */
+export function isHookInterceptionText(errorText: string): boolean {
+  const first = errorText.split("\n").find((l) => l.trim()) ?? "";
+  return HOOK_INTERCEPT_RE.test(first.slice(0, 300));
+}
+
 /** 签名比较用的键：先脱敏、截到账本里存的长度，再小写、压空白（账本存的是脱敏截断后的原形） */
 export function sigKey(sig: string): string {
   return redactSecrets(sig).text.slice(0, SIG_MAX).toLowerCase().replace(/\s+/g, " ").trim();
@@ -36,6 +46,7 @@ export function sigKey(sig: string): string {
 /** 从一段原始报错里抽「能算又踩」的签名（具体性档、非 hook 拦截），返回键 → 展示用原形 */
 export function recurrenceSignatures(errorText: string): Map<string, string> {
   const out = new Map<string, string>();
+  if (isHookInterceptionText(errorText)) return out;
   for (const s of extractErrorSignatures({ problem: errorText.slice(0, 4000) })) {
     if (classifySignatureSpecificity(s) !== "specific" || isHookInterception(s)) continue;
     const k = sigKey(s);
@@ -107,7 +118,8 @@ export function buildSignatureIndex(ledgerDir: string, nowIso = new Date().toISO
 
 export function addToIndex(index: SignatureIndex, ref: { session: string; ended: string; file: string; title: string }, sigs: Map<string, string>): void {
   const sid8 = ref.session.replace(/[^A-Za-z0-9]/g, "").slice(0, 8);
-  const full: SigRef = { session: ref.session, sid8, date: ref.ended.slice(0, 10), ended: ref.ended, file: ref.file, title: ref.title.slice(0, 60) };
+  // 标题压成一行：报错召回把它拼进注入文本（P1 互审 R4 Kimi #3）
+  const full: SigRef = { session: ref.session, sid8, date: ref.ended.slice(0, 10), ended: ref.ended, file: ref.file, title: ref.title.replace(/\s+/g, " ").trim().slice(0, 60) };
   for (const [k, display] of sigs) {
     const slot = (index.sigs[k] ??= { display, refs: [] });
     const at = slot.refs.findIndex((r) => r.session === ref.session);
@@ -144,6 +156,25 @@ export function writeSignatureIndex(path: string, index: SignatureIndex): void {
   const tmp = `${path}.tmp-${process.pid}`;
   writeFileSync(tmp, JSON.stringify(index));
   renameSync(tmp, path);
+}
+
+/** 账本目录里最新那份账本的修改时间（毫秒）；没有账本或读不了返回 0 */
+export function newestLedgerMtimeMs(ledgerDir: string): number {
+  let files: string[];
+  try {
+    files = listLedgerFiles(ledgerDir);
+  } catch {
+    return 0;
+  }
+  let newest = 0;
+  for (const f of files) {
+    try {
+      newest = Math.max(newest, statSync(join(ledgerDir, f)).mtimeMs);
+    } catch {
+      /* 刚被挪走 */
+    }
+  }
+  return newest;
 }
 
 export function readSignatureIndex(path: string): SignatureIndex | null {

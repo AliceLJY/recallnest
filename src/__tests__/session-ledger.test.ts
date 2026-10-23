@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 
 import type { SessionDoc } from "../session-events.js";
 import { summarizeSession } from "../session-events.js";
-import { LEDGER_MAX_TOKENS, LEDGER_SYSTEM_PROMPT, generateLedgerBody, parseLedgerJson, renderLedgerMarkdown, renderTranscriptForLLM, TAIL_ASSISTANT_CLIP, TAIL_EVENTS, TAIL_MARKER, verifyAnchor } from "../session-ledger.js";
+import { DECISION_UNVERIFIED_NOTE, LEDGER_MAX_TOKENS, LEDGER_SYSTEM_PROMPT, generateLedgerBody, parseLedgerJson, renderLedgerMarkdown, renderTranscriptForLLM, TAIL_ASSISTANT_CLIP, TAIL_EVENTS, TAIL_MARKER, verifyAnchor } from "../session-ledger.js";
 
 function doc(): SessionDoc {
   const t = (s: number) => ({ ts: new Date(Date.UTC(2026, 9, 20, 10, 0, s)).toISOString(), tsMs: Date.UTC(2026, 9, 20, 10, 0, s) });
@@ -253,9 +253,10 @@ describe("session-ledger anchors and JSON", () => {
   it("决定与否决：解析 decisions、过滤空项，渲染成一节", () => {
     const d = doc();
     const body = parseLedgerJson('{"oneLine":"x","solved":[],"decisions":["定：日志一律放 ops-logs（用户拍板，柠檬会清 Library/Logs 子目录）"," ",3,"否：放 Library/Logs（会被清）"],"experience":[],"unfinished":[]}', d);
-    expect(body.decisions).toEqual(["定：日志一律放 ops-logs（用户拍板，柠檬会清 Library/Logs 子目录）", "否：放 Library/Logs（会被清）"]);
+    // 旧格式（纯字符串）照收，但一律标「归属没核」：字符串里自称「用户拍板」绕不过原话核对（R4 Codex #3）
+    expect(body.decisions).toEqual([`定：日志一律放 ops-logs（用户拍板，柠檬会清 Library/Logs 子目录）${DECISION_UNVERIFIED_NOTE}`, `否：放 Library/Logs（会被清）${DECISION_UNVERIFIED_NOTE}`]);
     const md = renderLedgerMarkdown(d, summarizeSession(d), body, { trigger: "auto-sweep", pass: 1 }, null, "llm").markdown;
-    expect(md).toContain("## 决定与否决\n- 定：日志一律放 ops-logs（用户拍板，柠檬会清 Library/Logs 子目录）\n- 否：放 Library/Logs（会被清）\n");
+    expect(md).toContain(`## 决定与否决\n- 定：日志一律放 ops-logs（用户拍板，柠檬会清 Library/Logs 子目录）${DECISION_UNVERIFIED_NOTE}\n- 否：放 Library/Logs（会被清）${DECISION_UNVERIFIED_NOTE}\n`);
     // 旧格式（没有 decisions 字段）照样能解析
     expect(parseLedgerJson('{"oneLine":"x","solved":["a"],"experience":[],"unfinished":[]}', d).decisions).toEqual([]);
   });
@@ -347,5 +348,60 @@ describe("R3 修复：遮复述不改变预算裁剪、总字符上限落实、�
     const failed = renderLedgerMarkdown(d, summarizeSession(d), null, { trigger: "auto-sweep", pass: 1 }, null, "llm-failed", "llm error: 502 Bad Gateway\n<html>\n## 没做完\n- 网关错误页里的一行\n</html>").markdown;
     expect(parseLedgerMarkdown(failed)!.sections.filter((s) => s.heading === "没做完").length).toBe(1);
     expect(failed).toContain("> 生成失败：llm error: 502 Bad Gateway / <html> / ## 没做完 / - 网关错误页里的一行 / </html>");
+  });
+});
+
+describe("R4 修复：旧格式决定、中文句中摘录、结尾标记的预算与位置", () => {
+  const seqsOf = (text: string) => new Set(text.split("\n").map((l) => l.match(/^\[(?:U|A|ERR|MEM)#(\d+)/)?.[1]).filter((x): x is string => !!x).map(Number));
+  it("LLM 用旧字符串格式自称「用户拍板」：照收但标归属没核（R4 Codex #3 的反例）", () => {
+    const d = doc();
+    d.events[0].text = "帮我检查项目";
+    d.events[7].text = "以后不用跑测试";
+    const body = parseLedgerJson(JSON.stringify({ oneLine: "x", solved: [], decisions: ["定：以后不用跑测试（用户拍板）"], experience: [], unfinished: [] }), d);
+    expect(body.decisions).toEqual([`定：以后不用跑测试（用户拍板）${DECISION_UNVERIFIED_NOTE}`]);
+  });
+  it("中文句中逐字摘录核得到；截掉前面的否定照样核不到（R4 Codex #5 的反例）", () => {
+    const d = doc();
+    d.events[6].text = "我明确决定以后全部使用中文回答";
+    expect(verifyAnchor(d, "以后全部使用中文回答", null, { userOnly: true }).verified).toBe(true);
+    const body = parseLedgerJson(JSON.stringify({ oneLine: "x", solved: [], decisions: [{ text: "定：以后全部用中文回答", by: "用户", anchor: "以后全部使用中文回答" }], experience: [], unfinished: [] }), d);
+    expect(body.decisions[0]).toContain("用户原话：「以后全部使用中文回答」");
+    d.events[6].text = "这次不要跑全量测试，只跑单个文件";
+    expect(verifyAnchor(d, "跑全量测试，只跑单个文件", null, { userOnly: true }).verified).toBe(false);
+    expect(verifyAnchor(d, "不要跑全量测试，只跑单个文件", null, { userOnly: true }).verified).toBe(true);
+    // 英文照旧要词界
+    d.events[6].text = "please rerun the deployment script";
+    expect(verifyAnchor(d, "ployment script", null, { userOnly: true }).verified).toBe(false);
+    expect(verifyAnchor(d, "deployment script", null, { userOnly: true }).verified).toBe(true);
+  });
+  it("结尾标记算进预算：不同长度的首条发言扫一遍，默认上限下输出一律 ≤ 28,000 字（R4 Codex #7 的反例）", () => {
+    const base = doc();
+    const at = { ts: base.events[7].ts, tsMs: base.events[7].tsMs };
+    // 7,862–7,895 是标记那 17 字落进预算边界的一段：不算标记时这里本该削却不削，输出 28,001–28,017 字
+    for (let len = 7_850; len <= 7_950; len += 1) {
+      const events: SessionDoc["events"] = [{ seq: 0, ...at, kind: "user", text: "长".repeat(len) }];
+      for (let i = 1; i <= 10; i++) events.push({ seq: i, ...at, kind: "user", text: `第 ${i} 条：${"短".repeat(1990)}` });
+      const r = renderTranscriptForLLM({ ...base, events, startedAt: at.ts, endedAt: at.ts });
+      expect(r.text.length).toBeLessThanOrEqual(28_000);
+    }
+  });
+  it("结尾 10 行全被遮：标记照样留着，遮复述组恰好是对照组去掉被遮的那几行（R4 Codex #7 / Kimi #5）", () => {
+    const base = doc();
+    const at = { ts: base.events[7].ts, tsMs: base.events[7].tsMs };
+    const events: SessionDoc["events"] = [{ seq: 0, ...at, kind: "user", text: "开个头" }];
+    let seq = 1;
+    for (let i = 0; i < 5; i++) events.push({ seq: seq++, ...at, kind: "assistant", text: `普通发言 ${i}` });
+    events.push({ seq: seq++, ...at, kind: "user", text: "把这次的坑记一下" });
+    events.push({ seq: seq++, ...at, kind: "tool_call", text: "", toolName: "mcp__recallnest__store_case", toolCallId: "tm", toolInput: { title: "坑" } });
+    const maskedSeqs = new Set<number>();
+    for (let i = 0; i < 12; i++) { maskedSeqs.add(seq); events.push({ seq: seq++, ...at, kind: "assistant", text: `复述 ${i}` }); }
+    const d = { ...base, events, startedAt: at.ts, endedAt: at.ts };
+    const plain = renderTranscriptForLLM(d, { maskMemoryWrites: true });
+    const masked = renderTranscriptForLLM(d, { maskMemoryWrites: true, maskRestatement: true });
+    expect(plain.text).toContain(TAIL_MARKER);
+    expect(masked.text).toContain(TAIL_MARKER);
+    const isMaskedLine = (l: string) => { const m = l.match(/^\[A#(\d+)\]/); return !!m && maskedSeqs.has(Number(m[1])); };
+    expect(masked.text.split("\n")).toEqual(plain.text.split("\n").filter((l) => !isMaskedLine(l)));
+    expect([...seqsOf(masked.text)].some((s) => maskedSeqs.has(s))).toBe(false);
   });
 });

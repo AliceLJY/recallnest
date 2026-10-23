@@ -16,6 +16,7 @@ import type { LLMClient } from "./llm-client.js";
 import { redactSecrets } from "./pii-detector.js";
 import { extractErrorSignatures } from "./error-signature.js";
 import { classifySignatureSpecificity } from "./error-signature-specificity.js";
+import { isHookInterceptionText } from "./ledger-signatures.js";
 import { summarizeSession, type SessionDoc, type SessionEvent, type SessionSummary } from "./session-events.js";
 
 export interface LedgerExperience {
@@ -150,7 +151,9 @@ export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOp
   // 这样遮复述组看到的恰好是对照组看到的减去被遮的那些，不会因为遮掉的行腾出预算而多留对照组削掉的旧发言
   // （P1 互审 R3 Codex C8：默认 28000 下遮复述组多留了 10 条普通助手发言）
   const texts = lines.map((l, i) => l.render(i >= tailStart));
-  const withMarker = (kept: number[]): string => {
+  // 结尾标记的位置按对照组的保留集合定，被遮的行在这之后才拿走：结尾 10 行全被遮时标记照样留着，
+  // 遮复述组恰好是对照组减去被遮的行（P1 互审 R4 Codex #7）
+  const render = (kept: number[]): string => {
     const out: string[] = [];
     let marked = false;
     for (const i of kept) {
@@ -158,14 +161,14 @@ export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOp
         out.push(TAIL_MARKER);
         marked = true;
       }
-      out.push(texts[i]);
+      if (!lines[i].masked) out.push(texts[i]);
     }
     return out.join("\n");
   };
   const all = texts.map((_, i) => i);
-  const visible = (kept: number[]) => kept.filter((i) => !lines[i].masked);
-  let total = all.reduce((n, i) => n + texts[i].length + 1, 0);
-  if (total <= o.maxChars) return { text: withMarker(visible(all)), droppedEvents: 0, droppedUserTurns: 0 };
+  // 预算按最终输出算：各行加换行、减掉最后一个换行，再加结尾标记那一行（有结尾段时它一定在：结尾那几行不削）
+  let total = all.reduce((n, i) => n + texts[i].length + 1, 0) - 1 + (tailStart > 0 ? TAIL_MARKER.length + 1 : 0);
+  if (total <= o.maxChars) return { text: render(all), droppedEvents: 0, droppedUserTurns: 0 };
   // 从中间往两头削权重最低的（助手发言）；结尾 TAIL_EVENTS 条与最后 3 条助手行、3 条报错行不削
   const protectedIdx = new Set<number>();
   for (let i = tailStart; i < lines.length; i++) protectedIdx.add(i);
@@ -207,7 +210,7 @@ export function renderTranscriptForLLM(doc: SessionDoc, opts: RenderTranscriptOp
       droppedUser++;
     }
   }
-  return { text: withMarker(visible(all.filter((i) => !drop.has(i)))), droppedEvents: dropped, droppedUserTurns: droppedUser };
+  return { text: render(all.filter((i) => !drop.has(i))), droppedEvents: dropped, droppedUserTurns: droppedUser };
 }
 
 /** 超预算时用户发言单条截到这么多字 */
@@ -268,13 +271,20 @@ export function normalizeForMatch(s: string): string {
   return normalizeWithMap(s).norm;
 }
 
-/** 边界：锚点起点在**原文**里的前一个字符不能是汉字 / 字母 / 数字——「这不是生产环境」截成「是生产环境」过不了，
- *  而「注意：这不是…」里从「这」起的摘录（前面是冒号）照常通过（R3 Codex 自评 #5 反例） */
+const NEGATION_CHAR_RE = /[不没沒未非别別勿无無莫甭]/u;
+
+/** 边界：锚点不能从**原文**里一个词的中间开始，也不能把前面的否定截掉。
+ *  拉丁字母 / 数字：前一个字符不能是字母或数字（不从词中间截）。
+ *  汉字没有词界，句中摘录是常态（「我明确决定以后全部使用中文回答」里摘「以后全部使用中文回答」，P1 互审 R4 Codex #5）：
+ *  前一个字是汉字时，只看前两个字里有没有否定字——「这不是生产环境」截成「是生产环境」、「不要跑全量测试」截成「跑全量测试」过不了
+ *  （R3 Codex 自评 #5 反例）。「注意：这不是…」里从「这」起的摘录（前面是冒号）照常通过 */
 function startsAtBoundary(raw: string[], map: number[], idx: number): boolean {
   if (idx <= 0) return true;
   const rawIdx = map[idx];
   if (rawIdx === undefined || rawIdx === 0) return true;
-  return !/[\p{L}\p{N}]/u.test(raw[rawIdx - 1]);
+  const prev = raw[rawIdx - 1];
+  if (/\p{Script=Han}/u.test(prev)) return !NEGATION_CHAR_RE.test(raw.slice(Math.max(0, rawIdx - 2), rawIdx).join(""));
+  return !/[\p{L}\p{N}]/u.test(prev);
 }
 
 /** 核锚点：逐字（去空白与标点后）在转录事件里找得到才算 verified；找到了但序号不对就修正序号。
@@ -303,16 +313,20 @@ export function verifyAnchor(doc: SessionDoc, anchor: string, seq: number | null
 /** 偏好 / 决定的原话找不到用户亲口说过时的标签 */
 export const USER_UNSAID_KIND = "助手提议";
 
+/** LLM 用旧格式（纯字符串）给决定时的标签：没给原话，谁定的没法核 */
+export const DECISION_UNVERIFIED_NOTE = "（归属没核，按助手提议看）";
+
 /**
  * 决定与否决：LLM 给 {text, by, anchor}。by=用户 时原话必须在用户自己的发言里核得到，核不到就按助手提议写（P1 ③ 无声场
- * 30 场里 5 场至少一位读者判「把助手建议写成用户拍板」）。旧格式（纯字符串）照收，不加标签。
+ * 30 场里 5 场至少一位读者判「把助手建议写成用户拍板」）。旧格式（纯字符串）照收，但一律标「归属没核」——
+ * 否则 LLM 只要退回旧格式、在字符串里自己写「（用户拍板）」，就绕过了原话核对（P1 互审 R4 Codex #3）。
  */
 export function parseDecisions(v: unknown, doc: SessionDoc): string[] {
   if (!Array.isArray(v)) return [];
   const out: string[] = [];
   for (const item of v) {
     if (typeof item === "string") {
-      if (item.trim()) out.push(item.trim());
+      if (item.trim()) out.push(`${item.trim()}${DECISION_UNVERIFIED_NOTE}`);
       continue;
     }
     if (!item || typeof item !== "object") continue;
@@ -483,6 +497,8 @@ export function renderLedgerMarkdown(doc: SessionDoc, summary: SessionSummary, b
     const sigs = extractErrorSignatures({ problem: e.text.slice(0, 4000) });
     const specific = sigs.filter((s) => classifySignatureSpecificity(s) === "specific");
     const head = red(e.text.replace(/\s+/g, " ")).slice(0, 160);
+    // 钩子拦截不写签名：它们是规矩在起作用、不算又踩；签名索引只读「｜签名：」，读写两侧按同一条原始报错判（P1 互审 R4 Codex #6）
+    if (isHookInterceptionText(e.text)) return `- ${e.toolName ?? "tool"} #${e.seq}: ${head} ｜钩子拦截`;
     return `- ${e.toolName ?? "tool"} #${e.seq}: ${head}${specific.length ? ` ｜签名：${specific.map((s) => red(s).slice(0, 100)).join(" ‖ ")}` : ""}`;
   });
   sections.push(`## 报错（机器抽取，${summary.toolErrors} 条${summary.errors.length > 20 ? "，只列前 20" : ""}）\n${errLines.length ? errLines.join("\n") : "- （无）"}`);
