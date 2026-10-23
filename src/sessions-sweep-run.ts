@@ -8,18 +8,20 @@
  * 每端各自的静默阈值走 `policyBySource`（Alice 10-23 拍板：CC 60 分钟 / 候选 12 小时，其余端 30 分钟 / 6 小时）。
  */
 
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { dirname, join, relative } from "node:path";
 
-import { withLock } from "./distill-lock.js";
+import { LockTimeoutError, withLock } from "./distill-lock.js";
 import type { LLMClient } from "./llm-client.js";
 import { redactSecrets } from "./pii-detector.js";
 import { buildLedger, renderLedgerMarkdown, type GenerateLedgerOptions, type LedgerBody, type LedgerMeta } from "./session-ledger.js";
 import { parseSessionFile, summarizeSession, type SessionDoc, type SessionSource } from "./session-events.js";
 import { applyDecision, decide, DEFAULT_POLICY, discoverTranscripts, ledgerRelPath, SessionStateStore, sid8, type RootSpec, type SweepAction, type SweepPolicy, type TranscriptFile } from "./sessions-sweep.js";
-import { addToIndex, buildSignatureIndex, ledgerFileSignatures, lookupSignatures, newestLedgerMtimeMs, readSignatureIndex, recurrenceLines, recurrenceSignatures, writeSignatureIndex, type SignatureIndex } from "./ledger-signatures.js";
+import { addToIndex, buildSignatureIndex, ledgerDirDigest, ledgerFileSignatures, lookupSignatures, readSignatureIndex, recurrenceLines, recurrenceSignatures, writeSignatureIndex, type SignatureIndex } from "./ledger-signatures.js";
 import type { SessionSummary } from "./session-events.js";
 import { judgeRecallLog } from "./recall-outcome.js";
+import { RECALL_LOG_DIRNAME, recallLogFileName } from "./recall-log.js";
 
 export interface SweepRunOptions {
   roots: RootSpec[];
@@ -139,13 +141,36 @@ export function markHeartbeatRunning(path: string, opts: { nowIso?: string; pid?
   renameSync(tmp, path);
 }
 
-/** 锁被占、本轮跳过：在心跳上记一笔 busyAt（不改其余字段） */
+/** 锁忙跳过的那一笔记在心跳旁的这个小文件里 */
+export function busyPathFor(heartbeatPath: string): string {
+  return `${heartbeatPath}.busy`;
+}
+
+/**
+ * 锁被占、本轮跳过：另写一个小文件记 busyAt，不碰主心跳。这个进程没拿扫描锁，若在锁外读改写主心跳，
+ * 读到的可能是正在跑那一轮的「在跑」快照、写回时盖掉它刚写的完成时间与失败连击（P1 互审 R4 R3 Codex NEW-4 / Kimi NEW-3）
+ */
 export function touchHeartbeatBusy(path: string, nowIso = new Date().toISOString()): void {
-  const prev = readHeartbeat(path);
-  if (!prev) return;
-  const tmp = `${path}.tmp-${process.pid}`;
-  writeFileSync(tmp, `${JSON.stringify({ ...prev, busyAt: nowIso })}\n`);
-  renameSync(tmp, path);
+  const busy = busyPathFor(path);
+  mkdirSync(dirname(busy), { recursive: true });
+  const tmp = `${busy}.tmp-${process.pid}`;
+  writeFileSync(tmp, `${JSON.stringify({ busyAt: nowIso, pid: process.pid })}\n`);
+  renameSync(tmp, busy);
+}
+
+/** 最近一次「锁忙跳过」的时刻：.busy 文件与旧版写在主心跳里的 busyAt 取较新的；都没有返回 null */
+export function readBusyAt(heartbeatPath: string, hb?: Pick<SweepHeartbeat, "busyAt"> | null): string | null {
+  let side: string | null = null;
+  try {
+    const v = (JSON.parse(readFileSync(busyPathFor(heartbeatPath), "utf-8")) as { busyAt?: unknown }).busyAt;
+    if (typeof v === "string" && Number.isFinite(Date.parse(v))) side = v;
+  } catch {
+    /* 没有或写坏了 */
+  }
+  const inline = hb?.busyAt && Number.isFinite(Date.parse(hb.busyAt)) ? hb.busyAt : null;
+  if (!side) return inline;
+  if (!inline) return side;
+  return Date.parse(side) >= Date.parse(inline) ? side : inline;
 }
 
 /** 由上一份心跳与本轮结果算出新的失败连击 */
@@ -279,11 +304,27 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
         decision = { ...decision, action: "deferred", reason: `${decision.reason}（账本提交锁没等到，下一轮再写）` };
       }
     }
-    // 会话已经静默够久（解析过、过了静默判据）：判它 recall-log 里还没判的记录。不只看「这轮出了账本」——
-    // 收工账本写完之后再没有新事件、候选关着时候选到期，都不会再出账本，记录就永远没人判（P1 互审 R4 Codex #2、Kimi #7）
-    if (opts.recallLogRoot && !opts.dryRun && decision.doc && JUDGEABLE_ACTIONS.has(decision.action)) {
-      const counts = judgeRecallLog(opts.recallLogRoot, decision.doc, new Date(nowMs).toISOString());
-      if (counts) for (const [k, v] of Object.entries(counts)) (result.recallOutcomes ??= {})[k] = ((result.recallOutcomes ?? {})[k] ?? 0) + (v ?? 0);
+    // 会话已经静默够久（过了静默判据）：判它 recall-log 里还没判的记录。不只看「这轮出了账本」——
+    // 收工账本写完之后再没有新事件、候选关着时候选到期，都不会再出账本，记录就永远没人判（P1 互审 R4 Codex #2、Kimi #7）。
+    // 转录没变时 decide 走 mtime 快路、不解析（没有 doc），可 recall-log 是别的进程追加的、判完之后还会长：
+    // 游标另记「上次判的时候主日志多大」，主日志比那时大就解析一次再判（R4 R3 Codex #2 前半）
+    let judgedLogBytes: number | null = null;
+    if (opts.recallLogRoot && !opts.dryRun && JUDGEABLE_ACTIONS.has(decision.action)) {
+      // 大小在判之前取：判的时候又追加进来的行这轮也判了，下一轮看到变大再解析一次，已判的不重判
+      const logBytes = fileSize(join(opts.recallLogRoot, RECALL_LOG_DIRNAME, recallLogFileName(file.sessionId)));
+      let judgeDoc = decision.doc;
+      if (!judgeDoc && logBytes > (state.recallLogBytes ?? 0)) {
+        try {
+          judgeDoc = parseSessionFile(file.path, { source: file.source });
+        } catch (error) {
+          log(`! ${file.source} ${file.sessionId.slice(0, 8)} recall-log 待判、解析转录失败：${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      if (judgeDoc) {
+        const counts = judgeRecallLog(opts.recallLogRoot, judgeDoc, new Date(nowMs).toISOString());
+        if (counts) for (const [k, v] of Object.entries(counts)) (result.recallOutcomes ??= {})[k] = ((result.recallOutcomes ?? {})[k] ?? 0) + (v ?? 0);
+        judgedLogBytes = logBytes;
+      }
     }
     if (!opts.dryRun) {
       // LLM 失败 / 提交锁没等到：游标不推进（processedUpto / pass / 候选状态都留在原处）。
@@ -304,17 +345,18 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
         const kept = agentPath ?? targetPath;
         if (kept) next.ledgerPath = kept;
       }
+      if (judgedLogBytes !== null) next.recallLogBytes = judgedLogBytes;
       stateStore.save(next);
       if (sweepLog) appendFileSync(sweepLog, `${JSON.stringify({ ts: new Date(nowMs).toISOString(), source: file.source, sid8: file.sessionId.slice(0, 8), action: decision.action, reason: decision.reason, userTurns: decision.summary?.userTurns ?? null, rich: decision.summary?.rich ?? null, lastMessageAt: decision.lastMessageAt ?? null, ledger: ledgerPath ? show(ledgerPath) : null, ...usageNote })}\n`);
     }
     if (needsLedger) log(`${decision.action.padEnd(18)} ${file.source.padEnd(11)} ${file.sessionId.slice(0, 8)} ${decision.reason}${ledgerPath ? ` → ${show(ledgerPath)}` : ""}`);
   }
-  // 签名索引：本轮写了账本、或账本目录里有比索引 builtAt 更新的账本（收工命令当场写的、上一轮写完账本却在写索引前被杀）就重写——
-  // 只看「本轮写没写」的话，这些账本的签名要等到哪一轮恰好又写账本才进索引（P1 互审 R4 Codex #2、Kimi #2）
+  // 签名索引：本轮写了账本、或账本目录和索引建的时候不一样（收工命令当场写的、上一轮写完账本却在写索引前被杀的、
+  // 恢复或带原 mtime 拷进来的）就从磁盘整份重建。只看「本轮写没写」，这些账本的签名要等到哪一轮恰好又写账本才进索引
+  // （P1 互审 R4 Codex #2、Kimi #2）；只比「最新 mtime 与 builtAt」，mtime 比 builtAt 旧的进不来（R4 R3 Codex #2 后半）
   if (opts.signatureIndexPath && !opts.dryRun) {
     const onDisk = readSignatureIndex(opts.signatureIndexPath);
-    const stale = !onDisk || newestLedgerMtimeMs(ledgerRoot) > Date.parse(onDisk.builtAt);
-    if (result.ledgersWritten.length > 0 || stale) writeSignatureIndex(opts.signatureIndexPath, getIndex());
+    if (result.ledgersWritten.length > 0 || !onDisk || onDisk.sourceDigest !== ledgerDirDigest(ledgerRoot)) writeSignatureIndex(opts.signatureIndexPath, buildSignatureIndex(ledgerRoot));
   }
   result.wallMs = Math.round(performance.now() - t0);
   if (opts.heartbeatPath && !opts.dryRun) {
@@ -422,6 +464,8 @@ export type LedgerCommitResult = { written: true; path: string } | { written: fa
  * 把一份账本提交到落点。会话锁只包「重新定位 → 重读 frontmatter → 判断 → 写临时文件改名」，不包 LLM 调用——
  * 扫描器一轮可能持锁几分钟，锁住生成会挡住收工命令（R1 否决共用会话锁的理由）；只锁提交，复查与改名之间就没有窗口了
  * （P1 互审 R3 Codex C2 / K4，收工命令自己的 LLM 分支 NEW-1）。
+ * 这把锁是本机的 flock，只管得住本机的扫描器与收工命令；另一台机器写、经 Syncthing 同步进来的账本不经过它，
+ * 照样可能落在复查与改名之间。跨机靠的是账本目录只许一台机器写（checkLedgerWriter，R4 R3 Codex NEW-2），不是这把锁。
  */
 export async function commitLedger(o: { ledgerRoot: string; doc: SessionDoc; stateLedgerPath?: string; markdown: string; mode: LedgerCommitMode; lockDir?: string; waitMs?: number }): Promise<LedgerCommitResult> {
   const key = `${LEDGER_COMMIT_LOCK_PREFIX}${o.doc.sessionId}`;
@@ -441,9 +485,55 @@ export async function commitLedger(o: { ledgerRoot: string; doc: SessionDoc; sta
     }, { onBusy: "wait", waitTimeoutMs: o.waitMs ?? LEDGER_COMMIT_WAIT_MS, maxHoldMs: 60_000, lockDir: o.lockDir });
     if (outcome.ran) return outcome.result;
   } catch (error) {
-    if (!(error instanceof Error && error.message.startsWith(`lock '${key}' timed out`))) throw error;
+    // 认错误类型，不认文字前缀：锁模块改了措辞，这里不能把「等不到」当成真错误抛出去（R4 R3 Kimi NEW-1）
+    if (!(error instanceof LockTimeoutError && error.key === key)) throw error;
   }
   return { written: false, path: ledgerTargetPath(o.ledgerRoot, o.doc, o.stateLedgerPath), reason: "busy" };
+}
+
+/** 账本目录里记「哪台机器写这个目录」的文件（随目录同步到别的机器，别的机器读得到） */
+export const LEDGER_WRITER_FILE = ".writer-host";
+
+export type LedgerWriterCheck = { ok: true; host: string; claimed: boolean } | { ok: false; host: string; owner: string; path: string };
+
+/**
+ * 账本目录只许一台机器写（P1 互审 R4 R3 Codex NEW-2）。提交锁是本机 flock，另一台机器写、经 Syncthing 同步进来的
+ * 收工账本若落在本机「复查 → 改名」之间，会被扫描结果盖掉——跨机没有锁可拿，只能不让第二台机器写。
+ * 第一次正式写的机器（正式扫描或收工命令）在账本目录里留下自己的主机名；之后别的机器上这两条命令一律拒绝，
+ * 收工要到写入端去跑。claim=false（dry-run）只查不建。要换写入端：改那个文件。
+ */
+export function checkLedgerWriter(ledgerDir: string, opts: { claim: boolean; host?: string }): LedgerWriterCheck {
+  const host = opts.host ?? hostname();
+  const path = join(ledgerDir, LEDGER_WRITER_FILE);
+  const owner = (): string | null => {
+    try {
+      return readFileSync(path, "utf-8").trim();
+    } catch {
+      return null;
+    }
+  };
+  let who = owner();
+  if (who === null) {
+    if (!opts.claim) return { ok: true, host, claimed: false };
+    mkdirSync(ledgerDir, { recursive: true });
+    try {
+      writeFileSync(path, `${host}\n`, { flag: "wx" });
+      return { ok: true, host, claimed: true };
+    } catch (error) {
+      // 同时有人建了：按它写进去的判；不是这个原因（建不了文件）就照原样报
+      who = owner();
+      if (who === null) throw error;
+    }
+  }
+  return who === host ? { ok: true, host, claimed: false } : { ok: false, host, owner: who, path };
+}
+
+function fileSize(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
 }
 
 function hasUserTurnAfter(doc: SessionDoc, iso: string): boolean {

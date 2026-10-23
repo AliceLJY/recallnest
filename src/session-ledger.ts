@@ -260,8 +260,11 @@ function normalizeWithMap(s: string): { norm: string; map: number[] } {
       continue;
     }
     if (STRIP_CHAR_RE.test(ch)) continue;
-    norm += ch.toLowerCase();
-    map.push(i);
+    // map 按 norm 的 UTF-16 单元记：emoji 这类占两个单元的字（还有小写后变长的字）每个单元都指回同一个原文字符，
+    // 否则 norm.indexOf 给的下标在它们之后整体错位（R4 R3 修复时发现）
+    const low = ch.toLowerCase();
+    norm += low;
+    for (let k = 0; k < low.length; k++) map.push(i);
   }
   return { norm, map };
 }
@@ -287,26 +290,72 @@ function startsAtBoundary(raw: string[], map: number[], idx: number): boolean {
   return !/[\p{L}\p{N}]/u.test(prev);
 }
 
+/** 分句的边界：逗号、顿号、冒号、波浪号也断。破折号不断——「不要——跑全量测试」的否定管着后面 */
+const CLAUSE_END_RE = /[，,、。！？!?；;：:\n~～…]/u;
+/** 否定字离锚点多近算管着它：同一分句里、锚点前最近这么多个字（不数空白与标点） */
+const NEGATION_WINDOW = 4;
+/** 前一个分句、锚点之后到下一个分句末尾里出现就算「用户不认」的说法：「我不同意，以后全部…」「以后全部…，这个我不同意」 */
+const DISAGREE_RE = /不同意|不赞成|不认同|不接受|反对|否决|不采纳|别这么|不要这么|不是这个意思/u;
+/** 开引号 → 闭引号（直引号开闭同形，按个数奇偶判） */
+const QUOTE_PAIRS: ReadonlyArray<readonly [string, string]> = [["「", "」"], ["『", "』"], ["“", "”"], ["‘", "’"], ["\"", "\""]];
+
+/**
+ * 用户原话核对（userOnly）的额外几关——文字出现在用户消息里，不等于用户认可这件事（P1 互审 R4 R3 Codex NEW-1、Kimi NEW-4）：
+ *  - 锚点前同一分句里最近 4 个字有否定字：「我不同意以后全部使用中文回答」「不要——跑全量测试」摘否定后面那半句，不算；
+ *  - 前一个分句或紧跟着的分句说了「不同意 / 反对」这类话：「我不同意，以后全部…」「以后全部…，这个我不同意」，不算；
+ *  - 锚点落在引号里：「你刚才建议「以后不用跑测试」，这个建议我不同意」引的是别人的话，不算。
+ * 判不准就不算、降成助手提议。不按「整句里有没有否定字」判：她说话常是逗号和「~」连起来的长句，
+ * 整句判在 P1 回放账本上把 259 条核到的用户原话降了 37 条真话（「是不是」「不错」「不用管」都会撞上）。
+ * raw 是原文字符数组，[start, end) 是锚点在原文里的范围。
+ */
+function userOwnsSpan(raw: string[], start: number, end: number): boolean {
+  const near: string[] = [];
+  for (let i = start - 1; i >= 0 && !CLAUSE_END_RE.test(raw[i]) && near.length < NEGATION_WINDOW; i--) if (!STRIP_CHAR_RE.test(raw[i])) near.push(raw[i]);
+  if (NEGATION_CHAR_RE.test(near.join(""))) return false;
+  let clauseStart = start;
+  while (clauseStart > 0 && !CLAUSE_END_RE.test(raw[clauseStart - 1])) clauseStart--;
+  let prevStart = clauseStart - 1;
+  while (prevStart > 0 && !CLAUSE_END_RE.test(raw[prevStart - 1])) prevStart--;
+  const prevClause = clauseStart > 0 ? raw.slice(Math.max(0, prevStart), clauseStart - 1).join("") : "";
+  let nextEnd = end;
+  while (nextEnd < raw.length && !CLAUSE_END_RE.test(raw[nextEnd])) nextEnd++;
+  nextEnd++;
+  while (nextEnd < raw.length && !CLAUSE_END_RE.test(raw[nextEnd])) nextEnd++;
+  if (DISAGREE_RE.test(prevClause) || DISAGREE_RE.test(raw.slice(end, nextEnd).join(""))) return false;
+  const before = raw.slice(0, start);
+  for (const [open, close] of QUOTE_PAIRS) {
+    if (open === close ? before.filter((c) => c === open).length % 2 === 1 : before.lastIndexOf(open) > before.lastIndexOf(close)) return false;
+  }
+  return true;
+}
+
 /** 核锚点：逐字（去空白与标点后）在转录事件里找得到才算 verified；找到了但序号不对就修正序号。
- *  userOnly：只在真人用户的发言里找（偏好、用户拍板的决定必须是用户亲口说的，P1 ⑥） */
+ *  userOnly：只在真人用户的发言里找（偏好、用户拍板的决定必须是用户亲口说的，P1 ⑥），且要过 userOwnsSpan 两关；
+ *  这段话在全场最早出现在助手或工具输出里（用户贴回 / 复述了助手的原文），也不算用户原话（R4 R3 Kimi NEW-2） */
 export function verifyAnchor(doc: SessionDoc, anchor: string, seq: number | null, opts: { userOnly?: boolean } = {}): { verified: boolean; seq: number | null } {
   const needle = normalizeForMatch(anchor);
   if (needle.length < 4) return { verified: false, seq };
-  const eligible = (e: SessionEvent) => (opts.userOnly ? e.kind === "user" && !e.injected : e.kind === "user" || e.kind === "assistant" || e.kind === "tool_result");
-  const check = (e: SessionEvent | undefined) => {
+  const spoken = (e: SessionEvent) => (e.kind === "user" && !e.injected) || e.kind === "assistant" || e.kind === "tool_result";
+  const eligible = (e: SessionEvent) => (opts.userOnly ? e.kind === "user" && !e.injected : spoken(e));
+  const check = (e: SessionEvent | undefined, own = false) => {
     if (!e) return false;
     const { norm, map } = normalizeWithMap(e.text);
     const raw = [...e.text];
     let idx = norm.indexOf(needle);
     while (idx >= 0) {
-      if (startsAtBoundary(raw, map, idx)) return true;
+      if (startsAtBoundary(raw, map, idx) && (!own || userOwnsSpan(raw, map[idx], map[idx + needle.length - 1] + 1))) return true;
       idx = norm.indexOf(needle, idx + 1);
     }
     return false;
   };
+  if (opts.userOnly) {
+    const first = doc.events.find((e) => spoken(e) && check(e));
+    if (!first || first.kind !== "user") return { verified: false, seq };
+  }
+  const own = !!opts.userOnly;
   const atSeq = seq !== null ? doc.events[seq] : undefined;
-  if (atSeq && eligible(atSeq) && check(atSeq)) return { verified: true, seq };
-  const hit = doc.events.find((e) => eligible(e) && check(e));
+  if (atSeq && eligible(atSeq) && check(atSeq, own)) return { verified: true, seq };
+  const hit = doc.events.find((e) => eligible(e) && check(e, own));
   return hit ? { verified: true, seq: hit.seq } : { verified: false, seq };
 }
 

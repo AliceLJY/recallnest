@@ -3,14 +3,15 @@ import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, utimesSy
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { checkSessionsSweep } from "../doctor.js";
+import { checkSessionsSweep, sweepHeartbeatPath } from "../doctor.js";
 import type { LLMClient } from "../llm-client.js";
-import { commitLedger, LEDGER_COMMIT_LOCK_PREFIX, ledgerTargetPath, markHeartbeatRunning, nextLlmFailState, policyFor, readHeartbeat, runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE, SWEEP_STALE_MS, SWEEP_STUCK_MS, touchHeartbeatBusy, writeSessionLedgerNow } from "../sessions-sweep-run.js";
-import { acquireLock, lockPathForKey, releaseLock } from "../distill-lock.js";
+import { checkLedgerWriter, commitLedger, LEDGER_COMMIT_LOCK_PREFIX, LEDGER_WRITER_FILE, ledgerTargetPath, markHeartbeatRunning, nextLlmFailState, policyFor, readBusyAt, readHeartbeat, runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE, SWEEP_STALE_MS, SWEEP_STUCK_MS, touchHeartbeatBusy, writeSessionLedgerNow } from "../sessions-sweep-run.js";
+import { acquireLock, LockTimeoutError, lockPathForKey, releaseLock, withLock } from "../distill-lock.js";
 import type { SessionDoc } from "../session-events.js";
 import { appendFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { discoverTranscripts, SessionStateStore } from "../sessions-sweep.js";
+import { listLedgerFiles } from "../ledger-files.js";
 
 /**
  * 会话扫描正式模式（P1 ④，2026-10-23）：账本写 ledgerDir、游标写 stateDir、心跳给 doctor；
@@ -349,10 +350,12 @@ describe("LLM 失败连击（R1 Codex #7）", () => {
     expect(b.heartbeat?.llmFailStreak).toBe(1);
     expect(checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: e.heartbeatPath })?.status).toBe("warn");
     expect(b.heartbeat?.llmConfigured).toBe(true);
-    // 锁忙跳过：只记 busyAt，其余字段不动
+    // 锁忙跳过：busyAt 记在旁边的 .busy 文件里，主心跳一个字节不动（R4 R3 Codex NEW-4）
+    const before = readFileSync(e.heartbeatPath, "utf-8");
     touchHeartbeatBusy(e.heartbeatPath, "2026-10-23T12:30:00.000Z");
+    expect(readFileSync(e.heartbeatPath, "utf-8")).toBe(before);
+    expect(readBusyAt(e.heartbeatPath, readHeartbeat(e.heartbeatPath))).toBe("2026-10-23T12:30:00.000Z");
     const hb = readHeartbeat(e.heartbeatPath)!;
-    expect(hb.busyAt).toBe("2026-10-23T12:30:00.000Z");
     expect(hb.llmFailStreak).toBe(1);
     expect(hb.at).toBe(b.heartbeat!.at);
   });
@@ -671,5 +674,110 @@ describe("一轮开始就写「在跑」心跳，doctor 不在长跑时假红（
       expect(checkFirst(true)?.status).toBe("pass");
       expect(checkFirst(false)?.status).toBe("fail");
     });
+  });
+});
+
+describe("R4 R3 修复：锁忙不改写主心跳、doctor 按配置找心跳、账本目录单一写入端、锁超时认类型", () => {
+  it("手动跑撞上正在跑的那一轮：锁忙只写 .busy，那一轮刚写的完成时间与失败连击不会被盖回去（R3 Codex NEW-4 的受控交错）", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rn-busy-"));
+    const hb = join(dir, "sessions-sweep-heartbeat.json");
+    markHeartbeatRunning(hb, { nowIso: "2026-10-23T10:00:00.000Z", pid: 1, llmConfigured: true });
+    // 正在跑的那一轮跑完、写完成心跳（LLM 全失败一次）
+    const done = { at: "2026-10-23T11:00:00.000Z", wallMs: 1, discovered: 1, actions: {}, ledgersWritten: 0, llmCalls: 1, llmFailures: 1, llmFailStreak: 1, lastLlmFailureAt: "2026-10-23T11:00:00.000Z", llmConfigured: true, busyAt: null, runningSince: null, runningPid: null, startsSinceDone: 0 };
+    writeFileSync(hb, `${JSON.stringify(done)}\n`);
+    touchHeartbeatBusy(hb, "2026-10-23T11:00:01.000Z");
+    expect(readHeartbeat(hb)).toEqual(done);
+    expect(readBusyAt(hb, readHeartbeat(hb))).toBe("2026-10-23T11:00:01.000Z");
+    // doctor 仍按 busyAt 判「上一轮还在跑 / 刚跑完」，失败连击照报黄
+    expect(checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: hb, nowMs: Date.parse("2026-10-23T11:05:00.000Z"), isSweepRunning: () => false })?.status).toBe("warn");
+  });
+  it("busyAt 只在 .busy 里：完成心跳 40 分钟前、5 分钟前因锁跳过 → doctor 认它还活着（绿），不报超时红", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rn-busy-doctor-"));
+    const hb = join(dir, "sessions-sweep-heartbeat.json");
+    const at = (min: number) => new Date(NOW - min * MIN).toISOString();
+    writeFileSync(hb, `${JSON.stringify({ at: at(40), wallMs: 1, discovered: 1, actions: {}, ledgersWritten: 0, llmCalls: 0, llmFailures: 0, llmFailStreak: 0, lastLlmFailureAt: null, llmConfigured: true, busyAt: null, runningSince: null, runningPid: null, startsSinceDone: 0 })}\n`);
+    expect(checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: hb, nowMs: NOW, isSweepRunning: () => false })?.status).toBe("fail");
+    touchHeartbeatBusy(hb, at(5));
+    const r = checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: hb, nowMs: NOW, isSweepRunning: () => false });
+    expect(r?.status).toBe("pass");
+    expect(r?.message).toContain("因锁跳过");
+  });
+  it("旧版写在主心跳里的 busyAt 也认，和 .busy 取较新的", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rn-busy-old-"));
+    const hb = join(dir, "hb.json");
+    expect(readBusyAt(hb, { busyAt: "2026-10-23T11:00:00.000Z" })).toBe("2026-10-23T11:00:00.000Z");
+    touchHeartbeatBusy(hb, "2026-10-23T10:00:00.000Z");
+    expect(readBusyAt(hb, { busyAt: "2026-10-23T11:00:00.000Z" })).toBe("2026-10-23T11:00:00.000Z");
+    touchHeartbeatBusy(hb, "2026-10-23T12:00:00.000Z");
+    expect(readBusyAt(hb, { busyAt: "2026-10-23T11:00:00.000Z" })).toBe("2026-10-23T12:00:00.000Z");
+  });
+  it("doctor 的心跳路径跟着配置里的库走，不跟当前目录走（R3 Codex NEW-5）", () => {
+    const root = mkdtempSync(join(tmpdir(), "rn-doctor-path-"));
+    const elsewhere = join(root, "elsewhere");
+    mkdirSync(elsewhere);
+    const prev = process.cwd();
+    process.chdir(elsewhere);
+    try {
+      expect(sweepHeartbeatPath({ dbPath: join(root, "repo", "data", "lancedb") } as Parameters<typeof sweepHeartbeatPath>[0])).toBe(join(root, "repo", "data", "sessions-sweep-heartbeat.json"));
+    } finally {
+      process.chdir(prev);
+    }
+  });
+  it("checkLedgerWriter：第一个正式写的认领；同一台照常；别的机器拒绝；dry-run 只查不建（R3 Codex NEW-2）", () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "rn-writer-")), "ledgers");
+    expect(checkLedgerWriter(dir, { claim: false, host: "mini" })).toEqual({ ok: true, host: "mini", claimed: false });
+    expect(existsSync(join(dir, LEDGER_WRITER_FILE))).toBe(false);
+    expect(checkLedgerWriter(dir, { claim: true, host: "mini" })).toEqual({ ok: true, host: "mini", claimed: true });
+    expect(readFileSync(join(dir, LEDGER_WRITER_FILE), "utf-8")).toBe("mini\n");
+    expect(checkLedgerWriter(dir, { claim: true, host: "mini" })).toEqual({ ok: true, host: "mini", claimed: false });
+    expect(checkLedgerWriter(dir, { claim: true, host: "macbook" })).toEqual({ ok: false, host: "macbook", owner: "mini", path: join(dir, LEDGER_WRITER_FILE) });
+    expect(checkLedgerWriter(dir, { claim: false, host: "macbook" }).ok).toBe(false);
+    // 标记文件不是账本：不进账本列表（对账导入与签名索引都按它）
+    expect(listLedgerFiles(dir)).toEqual([]);
+  });
+  it("命令层：账本目录归别的机器写时，收工命令与正式扫描都退出 2；没有标记时收工命令认领本机、dry-run 扫描不建标记", () => {
+    const cli = join(import.meta.dir, "..", "cli.ts");
+    const root = mkdtempSync(join(tmpdir(), "rn-writer-cli-"));
+    const dbDir = join(root, "repo-data", "lancedb");
+    const ledgers = join(root, "ledgers");
+    const cfg = join(root, "config.json");
+    writeFileSync(cfg, JSON.stringify({ dbPath: dbDir, sources: { ledgers: { path: ledgers, glob: "**/*.md" } } }));
+    const emptyCC = join(root, "cc");
+    mkdirSync(emptyCC);
+    const env = { ...process.env, LOCAL_MEMORY_CONFIG: cfg, RECALLNEST_DATA_DIR: join(root, "repo-data") };
+    const run = (args: string[]) => spawnSync("bun", ["run", cli, ...args], { cwd: root, encoding: "utf-8", env });
+    // 没有标记：dry-run 扫描不认领
+    const dry = run(["sessions", "sweep", "--dry-run", "--no-llm", "--roots", `cc=${emptyCC}`]);
+    expect(dry.status).toBe(0);
+    expect(existsSync(join(ledgers, LEDGER_WRITER_FILE))).toBe(false);
+    // 收工命令认领本机（之后才去找转录，找不到退出 2）
+    const first = run(["sessions", "ledger", "--session", "nope0000", "--roots", `cc=${emptyCC}`]);
+    expect(first.stderr).toContain("找不到");
+    expect(readFileSync(join(ledgers, LEDGER_WRITER_FILE), "utf-8").trim()).toBe(require("node:os").hostname());
+    // 换成别的机器的标记：两条命令都拒绝
+    writeFileSync(join(ledgers, LEDGER_WRITER_FILE), "some-other-host\n");
+    for (const args of [["sessions", "ledger", "--session", "nope0000", "--roots", `cc=${emptyCC}`], ["sessions", "sweep", "--no-llm", "--roots", `cc=${emptyCC}`]]) {
+      const r = run(args);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain("只由 some-other-host 写");
+    }
+  });
+  it("提交锁等不到时抛的是 LockTimeoutError（带锁名），报错文字不变", async () => {
+    const lockDir = mkdtempSync(join(tmpdir(), "rn-locktimeout-"));
+    const cfgLock = { lockPath: lockPathForKey("k-timeout", lockDir), expireMs: 60_000 };
+    expect(acquireLock(cfgLock)).toBe(true);
+    try {
+      let caught: unknown;
+      try {
+        await withLock("k-timeout", async () => 1, { onBusy: "wait", waitTimeoutMs: 120, pollMs: 20, lockDir });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(LockTimeoutError);
+      expect((caught as LockTimeoutError).key).toBe("k-timeout");
+      expect((caught as Error).message.startsWith("lock 'k-timeout' timed out after 120ms")).toBe(true);
+    } finally {
+      releaseLock(cfgLock);
+    }
   });
 });
