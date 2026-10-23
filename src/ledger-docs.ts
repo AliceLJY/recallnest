@@ -19,6 +19,12 @@ import { isSyncConflictFile, type CurrentChunk, type DocReconcileSource } from "
 import { redactSecrets } from "./pii-detector.js";
 import { normalizeDedupText } from "./text-fingerprint.js";
 
+/**
+ * 账本切片的 scope。它在 `memory` 家族里（不带冒号的 `memory` 查询会带出它），按 durable 全权重参与召回——这是有意的：
+ * 账本本来就是要被召回的。量约每月 700 片、没有上限，会不会挤掉别的记忆没有数字（P1 互审 R3 Kimi N2）。
+ * 2026-10-23 定：先接受，部署满一个月量「search_memory scope=memory 前 10 名里账本的占比」，过半再在「移出家族」与
+ * 「单独降权」里二选一。跟进在 sync-bridge cc-memory/open-loops.md「RecallNest 会话账本（memory:ledger）按 durable 全权重…」条
+ */
 export const LEDGER_DOC_SCOPE = "memory:ledger";
 export { listLedgerFiles, parseLedgerMarkdown, type ParsedLedger } from "./ledger-files.js";
 

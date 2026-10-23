@@ -162,6 +162,8 @@ export type SweepAction =
   | "ledger+candidates"
   | "candidates"
   | "up-to-date"
+  /** 账本写好了、提交锁等不到（另一个进程卡在提交里）：这一轮不写、游标不动，下一轮再来（扫描器自己记，不是 decide 的结果） */
+  | "deferred"
   /** 收工时当场写的账本（sessions ledger 命令，P1 ⑤）；不是扫描器的决策，只记在游标上 */
   | "manual";
 

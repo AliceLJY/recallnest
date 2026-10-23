@@ -11,7 +11,8 @@
  */
 
 import { existsSync, accessSync, constants, readFileSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { dirname, resolve, join } from "node:path";
+import { acquireLock, lockPathForKey, releaseLock } from "./distill-lock.js";
 import { homedir } from "node:os";
 import { metaDir } from "./compat.js";
 import { loadConfig, expandHome, resolveEnv, findConfigPath, loadDotEnv, resolveDbPath } from "./runtime-config.js";
@@ -303,14 +304,16 @@ export function assessContinuityBaseline(
   };
 }
 
-function defaultPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // EPERM：进程在，只是不归本用户
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
+/**
+ * 扫描器此刻在不在跑：试拿一下它跑时持有的那把锁（sessions-sweep，flock）。拿得到 = 没人在跑（立刻放掉）。
+ * 不看 pid 活没活：pid 会被复用，一个无关进程就能让早已退出的那一轮显得还在跑（P1 互审 R4 Codex #4）；
+ * flock 由内核在持有进程退出时释放，不会被复用骗过。锁目录与心跳同在数据目录下。
+ */
+function defaultSweepRunning(heartbeatPath: string): boolean {
+  const cfg = { lockPath: lockPathForKey("sessions-sweep", join(dirname(heartbeatPath), "locks")), expireMs: 1000 };
+  if (!acquireLock(cfg)) return true;
+  releaseLock(cfg);
+  return false;
 }
 
 /**
@@ -318,7 +321,7 @@ function defaultPidAlive(pid: number): boolean {
  * 心跳超过 SWEEP_STALE_MS（20 分钟）或从没写过 → 红；正在跑的一轮超过 SWEEP_STUCK_MS 或接连几轮没跑完 → 红；
  * 最近一轮 LLM 全失败 → 黄。
  */
-export function checkSessionsSweep(opts: { ledgersConfigured: boolean; heartbeatPath: string; nowMs?: number; isPidAlive?: (pid: number) => boolean }): CheckResult | null {
+export function checkSessionsSweep(opts: { ledgersConfigured: boolean; heartbeatPath: string; nowMs?: number; isSweepRunning?: () => boolean }): CheckResult | null {
   if (!opts.ledgersConfigured) return null;
   const name = "Sessions sweep";
   const fix = "launchctl print gui/$(id -u)/com.recallnest.sessions-sweep；手动跑一轮：bun run src/cli.ts sessions sweep";
@@ -334,10 +337,9 @@ export function checkSessionsSweep(opts: { ledgersConfigured: boolean; heartbeat
   const doneMs = Date.parse(hb.at); // NaN：一轮都没跑完过（第一轮开始时建的心跳 at 为空）
   const doneNote = Number.isFinite(doneMs) ? `最近完成的一轮在 ${mins(now - doneMs)}前、写账本 ${hb.ledgersWritten} 份` : "还没有跑完过一轮";
   // 一轮开始时写 runningSince（跑完清掉）：launchd 在上一轮没完时不起下一轮，长跑期间没有别的心跳（P1 互审 R3 Codex K6）。
-  // 写它的进程已经不在 = 那一轮被杀或崩了，不算在跑
+  // 写了 runningSince、扫描锁却没人拿着 = 那一轮被杀或崩了，不算在跑
   const runningMs = hb.runningSince ? Date.parse(hb.runningSince) : Number.NaN;
-  const pidAlive = opts.isPidAlive ?? defaultPidAlive;
-  const running = Number.isFinite(runningMs) && (hb.runningPid === null || hb.runningPid === undefined || pidAlive(hb.runningPid));
+  const running = Number.isFinite(runningMs) && (opts.isSweepRunning ?? (() => defaultSweepRunning(opts.heartbeatPath)))();
   const starts = hb.startsSinceDone ?? 0;
   let detail: string;
   if (running) {
@@ -352,7 +354,7 @@ export function checkSessionsSweep(opts: { ledgersConfigured: boolean; heartbeat
     const last = Math.max(doneMs, hb.busyAt ? Date.parse(hb.busyAt) : Number.NEGATIVE_INFINITY);
     const age = now - last;
     const ago = `${mins(age)}前`;
-    const diedNote = Number.isFinite(runningMs) ? `；${hb.runningSince} 开始的那一轮没跑完就退出了（pid ${hb.runningPid ?? "?"} 已不在）` : "";
+    const diedNote = Number.isFinite(runningMs) ? `；${hb.runningSince} 开始的那一轮没跑完就退出了（pid ${hb.runningPid ?? "?"}，扫描锁已没人拿着）` : "";
     if (!Number.isFinite(age) || age > SWEEP_STALE_MS) return fail(name, `上次扫描 ${Number.isFinite(age) ? ago : "时间不明"}（超过 ${SWEEP_STALE_MS / 60_000} 分钟）${diedNote}`, fix);
     // 一直因锁跳过、最近完成的一轮却在 2 小时之前：上一轮多半卡住了（包装脚本 45 分钟就该杀掉它）
     const sinceDone = now - doneMs;

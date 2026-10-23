@@ -17,7 +17,7 @@ import { redactSecrets } from "./pii-detector.js";
 import { buildLedger, renderLedgerMarkdown, type GenerateLedgerOptions, type LedgerBody, type LedgerMeta } from "./session-ledger.js";
 import { parseSessionFile, summarizeSession, type SessionDoc, type SessionSource } from "./session-events.js";
 import { applyDecision, decide, DEFAULT_POLICY, discoverTranscripts, ledgerRelPath, SessionStateStore, sid8, type RootSpec, type SweepAction, type SweepPolicy, type TranscriptFile } from "./sessions-sweep.js";
-import { addToIndex, buildSignatureIndex, ledgerFileSignatures, lookupSignatures, recurrenceLines, recurrenceSignatures, writeSignatureIndex, type SignatureIndex } from "./ledger-signatures.js";
+import { addToIndex, buildSignatureIndex, ledgerFileSignatures, lookupSignatures, newestLedgerMtimeMs, readSignatureIndex, recurrenceLines, recurrenceSignatures, writeSignatureIndex, type SignatureIndex } from "./ledger-signatures.js";
 import type { SessionSummary } from "./session-events.js";
 import { judgeRecallLog } from "./recall-outcome.js";
 
@@ -81,6 +81,9 @@ export interface SweepRunResult {
   /** 写了心跳时带回本轮心跳（CLI 据此定退出码） */
   heartbeat?: SweepHeartbeat;
 }
+
+/** 解析过且过了静默判据的决策：可以判 recall-log（not-idle 没静默；skip-* 在静默判据之前就返回了） */
+const JUDGEABLE_ACTIONS: ReadonlySet<SweepAction> = new Set<SweepAction>(["ledger", "ledger+candidates", "candidates", "up-to-date", "deferred"]);
 
 /** 各端默认的静默阈值（Alice 2026-10-23 拍板：CC 常停一两个小时再接着聊，60 分钟 / 候选 12 小时；其余端沿用 D2 的 30 / 360） */
 export const SWEEP_DEFAULT_POLICY_BY_SOURCE: Record<SessionSource, { idleMinutes: number; candidateAfterMinutes: number }> = {
@@ -271,11 +274,14 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
         decision = { ...decision, action: "up-to-date", reason: "生成期间收工账本已写入，放弃本次生成" };
       } else if (commit.reason === "busy") {
         deferredThisPass = true;
-        decision = { ...decision, reason: `${decision.reason}（账本提交锁没等到，下一轮再写）` };
+        actions[decision.action] = (actions[decision.action] ?? 1) - 1;
+        actions.deferred = (actions.deferred ?? 0) + 1;
+        decision = { ...decision, action: "deferred", reason: `${decision.reason}（账本提交锁没等到，下一轮再写）` };
       }
     }
-    // 会话已经静默够久（走到了出账本 / 保留收工账本这一步）：判它 recall-log 里还没判的记录
-    if (opts.recallLogRoot && !opts.dryRun && decision.doc && (needsLedger || keepAgentUpto)) {
+    // 会话已经静默够久（解析过、过了静默判据）：判它 recall-log 里还没判的记录。不只看「这轮出了账本」——
+    // 收工账本写完之后再没有新事件、候选关着时候选到期，都不会再出账本，记录就永远没人判（P1 互审 R4 Codex #2、Kimi #7）
+    if (opts.recallLogRoot && !opts.dryRun && decision.doc && JUDGEABLE_ACTIONS.has(decision.action)) {
       const counts = judgeRecallLog(opts.recallLogRoot, decision.doc, new Date(nowMs).toISOString());
       if (counts) for (const [k, v] of Object.entries(counts)) (result.recallOutcomes ??= {})[k] = ((result.recallOutcomes ?? {})[k] ?? 0) + (v ?? 0);
     }
@@ -303,8 +309,12 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
     }
     if (needsLedger) log(`${decision.action.padEnd(18)} ${file.source.padEnd(11)} ${file.sessionId.slice(0, 8)} ${decision.reason}${ledgerPath ? ` → ${show(ledgerPath)}` : ""}`);
   }
-  if (opts.signatureIndexPath && !opts.dryRun && (result.ledgersWritten.length > 0 || !existsSync(opts.signatureIndexPath))) {
-    writeSignatureIndex(opts.signatureIndexPath, getIndex());
+  // 签名索引：本轮写了账本、或账本目录里有比索引 builtAt 更新的账本（收工命令当场写的、上一轮写完账本却在写索引前被杀）就重写——
+  // 只看「本轮写没写」的话，这些账本的签名要等到哪一轮恰好又写账本才进索引（P1 互审 R4 Codex #2、Kimi #2）
+  if (opts.signatureIndexPath && !opts.dryRun) {
+    const onDisk = readSignatureIndex(opts.signatureIndexPath);
+    const stale = !onDisk || newestLedgerMtimeMs(ledgerRoot) > Date.parse(onDisk.builtAt);
+    if (result.ledgersWritten.length > 0 || stale) writeSignatureIndex(opts.signatureIndexPath, getIndex());
   }
   result.wallMs = Math.round(performance.now() - t0);
   if (opts.heartbeatPath && !opts.dryRun) {
@@ -492,6 +502,7 @@ export async function writeSessionLedgerNow(o: WriteLedgerNowOptions): Promise<W
     if (commit.reason === "busy") throw new Error(`账本提交锁（${LEDGER_COMMIT_LOCK_PREFIX}${doc.sessionId}）等了 ${LEDGER_COMMIT_WAIT_MS / 1000} 秒没拿到：另一个进程卡在提交里，账本与游标都没动`);
     return { path: commit.path, generator: render.generator, written: false, skipped: "agent-ledger" };
   }
-  store.save({ ...state, path: o.file.path, processedUpto: doc.endedAt, pass: meta.pass, candidateDueAt: null, candidateDone: true, lastMtimeMs: o.file.mtimeMs, lastSweepAt: new Date(nowMs).toISOString(), lastAction: "manual", notIdleSince: null, ledgerPath: commit.path });
+  // lastMtimeMs 不记：扫描器下一轮静默后要真解析一次（判这场的 recall-log），不能被 mtime 粗筛直接判 up-to-date（P1 互审 R4 Codex #2）
+  store.save({ ...state, path: o.file.path, processedUpto: doc.endedAt, pass: meta.pass, candidateDueAt: null, candidateDone: true, lastMtimeMs: null, lastSweepAt: new Date(nowMs).toISOString(), lastAction: "manual", notIdleSince: null, ledgerPath: commit.path });
   return { path: commit.path, generator: render.generator, failure: render.failure, written: true };
 }

@@ -382,6 +382,21 @@ describe("sessions ledger / 正式 sweep 不在仓库数据目录下跑就拒绝
       expect(r.stderr).toContain("不一致");
     }
   });
+  it("写账本时抛错（这里用一份没有时间戳的转录）：收工命令接住、退出 3、只打一行原因，不吐调用栈（R4 Kimi #4）", () => {
+    const cfg2 = join(root, "config-ledgers.json");
+    writeFileSync(cfg2, JSON.stringify({ dbPath: dbDir, sources: { ledgers: { path: join(root, "ledgers"), glob: "**/*.md" } } }));
+    const ccDir = join(root, "cc", "-Users-x");
+    mkdirSync(ccDir, { recursive: true });
+    const sid = "abcd9999-0000-4000-8000-000000000999";
+    writeFileSync(join(ccDir, `${sid}.jsonl`), `${JSON.stringify({ type: "user", sessionId: sid, message: { role: "user", content: "没有时间戳" } })}\n`);
+    const r = spawnSync("bun", ["run", cli, "sessions", "ledger", "--session", sid, "--roots", `cc=${join(root, "cc")}`, "--body", "-"], {
+      cwd: elsewhere, encoding: "utf-8", input: JSON.stringify({ oneLine: "x", solved: [], decisions: [], experience: [], unfinished: [] }),
+      env: { ...process.env, LOCAL_MEMORY_CONFIG: cfg2, RECALLNEST_DATA_DIR: join(root, "repo-data") },
+    });
+    expect(r.status).toBe(3);
+    expect(r.stderr).toContain("转录里没有带时间的事件");
+    expect(r.stderr).not.toContain("    at ");
+  });
   it("设了 RECALLNEST_DATA_DIR 指向库所在的数据目录：过了这道核对（往下撞到没配账本目录）", () => {
     for (const args of [["sessions", "ledger", "--session", "x"], ["sessions", "sweep"]]) {
       const r = run(args, join(root, "repo-data"));
@@ -520,6 +535,9 @@ describe("账本提交锁：扫描器与收工命令都在同一把会话锁里�
     const a = await runSweep({ ...base, nowMs: NOW });
     release();
     expect(a.ledgersWritten).toEqual([]);
+    // 这一轮记成 deferred，不虚记一笔 ledger（R4 Kimi #6）
+    expect(a.actions.deferred).toBe(1);
+    expect(a.actions.ledger ?? 0).toBe(0);
     const key = readdirSync(e.stateDir)[0].replace(/\.json$/, "");
     const st = new SessionStateStore(e.stateDir).load(key)!;
     expect(st.processedUpto).toBeNull();
@@ -609,7 +627,7 @@ describe("一轮开始就写「在跑」心跳，doctor 不在长跑时假红（
     const dir = mkdtempSync(join(tmpdir(), "rn-sweep-doctor-run-"));
     const hbPath = join(dir, "hb.json");
     const write = (extra: Record<string, unknown>) => writeFileSync(hbPath, JSON.stringify({ at: new Date(NOW - 40 * MIN).toISOString(), wallMs: 10, discovered: 3, actions: {}, ledgersWritten: 1, llmCalls: 2, llmFailures: 0, llmFailStreak: 0, lastLlmFailureAt: null, llmConfigured: true, ...extra }));
-    const check = (alive: boolean) => checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: hbPath, nowMs: NOW, isPidAlive: () => alive });
+    const check = (running: boolean) => checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: hbPath, nowMs: NOW, isSweepRunning: () => running });
     it("这一轮 30 分钟前开始、还在跑（上次完成在 40 分钟前）：绿", () => {
       write({ runningSince: new Date(NOW - 30 * MIN).toISOString(), runningPid: 4242, startsSinceDone: 1 });
       expect(check(true)?.status).toBe("pass");
@@ -625,7 +643,7 @@ describe("一轮开始就写「在跑」心跳，doctor 不在长跑时假红（
       write({ runningSince: new Date(NOW - 5 * MIN).toISOString(), runningPid: 4242, startsSinceDone: 2 });
       expect(check(true)?.status).toBe("pass");
     });
-    it("写 runningSince 的进程已经不在：不算在跑，按上次完成判旧", () => {
+    it("写了 runningSince、扫描锁却没人拿着（那一轮被杀或崩了）：不算在跑，按上次完成判旧", () => {
       write({ runningSince: new Date(NOW - 30 * MIN).toISOString(), runningPid: 4242, startsSinceDone: 1 });
       const r = check(false);
       expect(r?.status).toBe("fail");
@@ -633,11 +651,23 @@ describe("一轮开始就写「在跑」心跳，doctor 不在长跑时假红（
       write({ at: new Date(NOW - 5 * MIN).toISOString(), runningSince: new Date(NOW - 30 * MIN).toISOString(), runningPid: 4242, startsSinceDone: 1 });
       expect(check(false)?.status).toBe("pass");
     });
+    it("默认判据是扫描锁有没有人拿着：pid 被复用也骗不过（R4 Codex #4）", () => {
+      write({ runningSince: new Date(NOW - 30 * MIN).toISOString(), runningPid: 1, startsSinceDone: 1 });
+      // pid 1 永远活着，但扫描锁没人拿：那一轮早退出了 → 按上次完成（40 分钟前）判旧
+      expect(checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: hbPath, nowMs: NOW })?.status).toBe("fail");
+      const cfg = { lockPath: lockPathForKey("sessions-sweep", join(dir, "locks")), expireMs: 60_000 };
+      expect(acquireLock(cfg)).toBe(true);
+      try {
+        expect(checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: hbPath, nowMs: NOW })?.status).toBe("pass");
+      } finally {
+        releaseLock(cfg);
+      }
+    });
     it("第一轮还在跑（没有完成过）：绿；第一轮的进程没了：红", () => {
       const first = join(dir, "first.json");
       markHeartbeatRunning(first, { nowIso: new Date(NOW - 10 * MIN).toISOString(), pid: 4242, llmConfigured: true });
       expect(readHeartbeat(first)?.at).toBe("");
-      const checkFirst = (alive: boolean) => checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: first, nowMs: NOW, isPidAlive: () => alive });
+      const checkFirst = (running: boolean) => checkSessionsSweep({ ledgersConfigured: true, heartbeatPath: first, nowMs: NOW, isSweepRunning: () => running });
       expect(checkFirst(true)?.status).toBe("pass");
       expect(checkFirst(false)?.status).toBe("fail");
     });

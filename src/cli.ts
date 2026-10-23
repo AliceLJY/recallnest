@@ -3094,14 +3094,22 @@ sessionsCmd
       const llmCfg = config.sessionsSweep?.llm ?? config.llm;
       llm = llmCfg ? createLLMClient({ ...llmCfg, apiKey: resolveEnv(llmCfg.apiKey), timeoutMs: 90_000 }) : null;
     }
-    const r = await writeSessionLedgerNow({
-      file: hits[0],
-      ledgerDir: resolveSourcePath(ledgerSource.path, "ledgers"),
-      stateDir: join(resolve(envDataDir()), "session-state"),
-      trigger: options.trigger === "precompact" ? "precompact" : "manual-收工",
-      body,
-      llm,
-    });
+    let r: Awaited<ReturnType<typeof writeSessionLedgerNow>>;
+    try {
+      r = await writeSessionLedgerNow({
+        file: hits[0],
+        ledgerDir: resolveSourcePath(ledgerSource.path, "ledgers"),
+        stateDir: join(resolve(envDataDir()), "session-state"),
+        trigger: options.trigger === "precompact" ? "precompact" : "manual-收工",
+        body,
+        llm,
+      });
+    } catch (error) {
+      // 提交锁等不到（另一个进程卡在提交里）等：账本与游标都没动，干净地退出 3（P1 互审 R4 Kimi #4）
+      console.error(`❌ ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 3;
+      return;
+    }
     if (r.skipped === "agent-ledger") {
       console.log(`✅ 这场已有当场写的账本、之后没有新的用户发言，没用 LLM 版去盖它：${r.path}`);
       return;
