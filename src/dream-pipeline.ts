@@ -100,7 +100,9 @@ export const DEFAULT_DREAM_CONFIG: DreamConfig = {
   autoExcludeScopes: ["memory"],
   // checkpoint（2026-10-07）：每场会话一行的 checkpoint 镜像（src/checkpoint-mirror.ts），只由镜像自己按会话覆盖；
   // 合并它会把不同会话的状态揉成一条，或把正在被覆盖的行标成 superseded。
-  neverDreamScopes: ["memory:pivot", "checkpoint"],
+  // memory:ledger（2026-10-23）：会话账本的切片只归账本对账（ledger-docs.ts）管——账本改写后旧片要能按文件下架，
+  // 被合并进别的行就成了对账的「合并链」，一场会话的账本也会和别场揉在一起。
+  neverDreamScopes: ["memory:pivot", "checkpoint", "memory:ledger"],
   gc: DEFAULT_AUTO_GC_CONFIG,
 };
 
