@@ -115,7 +115,7 @@ export function normalizeTriggerTexts(texts: readonly string[] | undefined | nul
  *
  * 认的是 §5.3 那条纪律的各种手写变体：「她以后会这么问起：「A」「B」」「她以后可能会这样问起：A、B、C」
  * 「检索锚点：…」「她会说…」。段落里有引号就取引号内的，没有就按 、；/ 或 拆。
- * 只认正文里已经写下的话，不生成、不改写——生成是另一条线（qwen-turbo，按 T-Mem 三条禁令），
+ * 只认正文里已经写下的话，不生成、不改写——生成是另一条线（config.llm 的模型，按 T-Mem 三条禁令），
  * 且要等批量提炼那批的忠实度有结论再做。
  */
 export function extractTriggerCandidates(source: string): string[] {
