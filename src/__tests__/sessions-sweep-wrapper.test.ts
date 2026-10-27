@@ -7,16 +7,21 @@ import { spawnSync } from "node:child_process";
 /**
  * launchd 包装 scripts/sessions-sweep.sh 的失败计数（P1 互审 R1 Codex #7）：沙箱里桩掉 bun 与 TG，
  * 按退出码序列跑脚本副本，看 TG 发了几条。bash 3.2（/bin/bash）、精简 PATH，同 launchd。
+ * 桩 bun 放在 $HOME/.bun/bin：脚本会把 $HOME/.bun/bin、/opt/homebrew/bin、/usr/local/bin 插到 PATH 最前，
+ * 只放在测试自己的 PATH 里的话，装在 /usr/local/bin 的真 bun（如云端容器）会抢先，跑沙箱副本报 Module not found。
  */
+const stubBin = (root: string) => join(root, "home", ".bun", "bin");
+const sweepPath = (root: string) => `${stubBin(root)}:/usr/bin:/bin`;
+
 function sandbox() {
   const root = mkdtempSync(join(tmpdir(), "rn-sweep-wrapper-"));
   mkdirSync(join(root, "repo", "scripts"), { recursive: true });
   cpSync(join(import.meta.dir, "..", "..", "scripts", "sessions-sweep.sh"), join(root, "repo", "scripts", "sessions-sweep.sh"));
-  mkdirSync(join(root, "bin"));
+  mkdirSync(stubBin(root), { recursive: true });
   // 桩 bun：退出码取 $root/next-code 的内容
-  writeFileSync(join(root, "bin", "bun"), `#!/bin/bash\nexit "$(cat ${root}/next-code)"\n`);
+  writeFileSync(join(stubBin(root), "bun"), `#!/bin/bash\nexit "$(cat ${root}/next-code)"\n`);
   writeFileSync(join(root, "notify"), `#!/bin/bash\nprintf '%s\\n<<<END>>>\\n' "$1" >> ${root}/tg.log\n`);
-  chmodSync(join(root, "bin", "bun"), 0o755);
+  chmodSync(join(stubBin(root), "bun"), 0o755);
   chmodSync(join(root, "notify"), 0o755);
   return root;
 }
@@ -26,7 +31,7 @@ function runSeq(root: string, codes: number[]): number[] {
   for (const c of codes) {
     writeFileSync(join(root, "next-code"), String(c));
     const r = spawnSync("/bin/bash", [join(root, "repo", "scripts", "sessions-sweep.sh")], {
-      env: { HOME: join(root, "home"), PATH: `${join(root, "bin")}:/usr/bin:/bin`, SESSIONS_SWEEP_NOTIFY: join(root, "notify"), SESSIONS_SWEEP_TIMEOUT: "30" },
+      env: { HOME: join(root, "home"), PATH: sweepPath(root), SESSIONS_SWEEP_NOTIFY: join(root, "notify"), SESSIONS_SWEEP_TIMEOUT: "30" },
       encoding: "utf-8",
     });
     rcs.push(r.status ?? -1);
@@ -42,7 +47,7 @@ describe("sessions-sweep.sh 看门狗", () => {
     const t0 = Date.now();
     // 经 `| cat` 跑：管道的读端要等所有持有写端的进程都退出才拿到 EOF——孤儿 sleep 会让它等满 SESSIONS_SWEEP_TIMEOUT
     const r = spawnSync("/bin/bash", ["-c", `/bin/bash "${join(root, "repo", "scripts", "sessions-sweep.sh")}" | cat`], {
-      env: { HOME: join(root, "home"), PATH: `${join(root, "bin")}:/usr/bin:/bin`, SESSIONS_SWEEP_NOTIFY: join(root, "notify"), SESSIONS_SWEEP_TIMEOUT: "20" },
+      env: { HOME: join(root, "home"), PATH: sweepPath(root), SESSIONS_SWEEP_NOTIFY: join(root, "notify"), SESSIONS_SWEEP_TIMEOUT: "20" },
       encoding: "utf-8",
       timeout: 30_000,
     });
