@@ -58,6 +58,8 @@ export interface ConsolidationConfig {
    * （`memory` → `memory:pivot`）卷进同一批候选与 vectorSearch 结果。
    */
   scopeMatch?: ScopeMatchMode;
+  /** 取数与 vectorSearch 都排除这些精确 scope（dream 家族匹配时传 neverDreamScopes 里的兄弟，P1 互审 R1 Codex #5） */
+  excludeScopes?: string[];
 }
 
 export const DEFAULT_CONSOLIDATION_CONFIG: ConsolidationConfig = {
@@ -244,10 +246,11 @@ export class ConsolidationEngine {
       tripleJaccardThreshold = 0.5,
       minTriplesForEvidence = 2,
       scopeMatch = "family",
+      excludeScopes,
     } = this.config;
 
     // 1. Fetch entries in scope
-    const entries = await this.store.list([scope], undefined, maxEntriesPerRun, 0, scopeMatch);
+    const entries = await this.store.list([scope], undefined, maxEntriesPerRun, 0, scopeMatch, excludeScopes);
     // 派生 insight 不参与去重（2026-08-16 加，与 dream gather 的既有排除对齐）。
     // 此前只有 gather（dream-pipeline.ts）排除派生物，3a 自己重新取数时不排除 ——
     // 实测后果：`memory:pivot` 里 3 条手写原件被 3a 合并进 LLM 复述、复述当了 canonical
@@ -288,7 +291,7 @@ export class ConsolidationEngine {
         if (!full?.vector?.length) continue;
 
         const similar = await this.store.vectorSearch(
-          full.vector, 10, clusterThreshold, [scope], scopeMatch,
+          full.vector, 10, clusterThreshold, [scope], scopeMatch, excludeScopes,
         );
 
         // Seeds are active-only (above), but vectorSearch filters by scope alone, so
@@ -353,7 +356,7 @@ export class ConsolidationEngine {
 
         // Get similarity scores relative to canonical
         const pairResults = await this.store.vectorSearch(
-          canonical.vector, memberEntries.length + 5, clusterThreshold, [scope], scopeMatch,
+          canonical.vector, memberEntries.length + 5, clusterThreshold, [scope], scopeMatch, excludeScopes,
         );
         const scoreMap = new Map<string, number>();
         for (const r of pairResults) scoreMap.set(r.entry.id, r.score);

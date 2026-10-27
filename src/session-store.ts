@@ -95,6 +95,7 @@ export class SessionCheckpointStore {
     // other's, leaving nothing. The lock lives in the checkpoint directory itself so every
     // process writing that directory shares it, whatever its data dir; it ends in ".lock",
     // so listRecent / gc never read it.
+    // lock-wait: no store-write inside — publish() only renames and sweeps checkpoint files.
     return withWriteLock(CHECKPOINT_SAVE_LOCK_KEY, async () => this.publish(dir, parsed), {
       lockDir: dir,
       expireMs: 60_000,
