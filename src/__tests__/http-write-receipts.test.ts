@@ -7,6 +7,7 @@ import {
   persistCaseMemory,
   persistMemoryBatch,
   persistWorkflowPattern,
+  promoteMemory,
   type PersistMemoryDeps,
 } from "../capture-engine.js";
 import type {
@@ -50,7 +51,7 @@ function harness() {
   };
   const rowCount = async (): Promise<number> =>
     (await store.list([SCOPE], undefined, 100, 0, "exact")).length;
-  return { deps, rowCount };
+  return { deps, store, rowCount };
 }
 
 const PATTERN = {
@@ -126,6 +127,34 @@ describe("/v1/pattern and /v1/case report what actually landed", () => {
 });
 
 describe("/v1/promote", () => {
+  it("real store: promoting evidence is 201 stored:true; promoting it again folds into the same row, still 201", async () => {
+    const h = harness();
+    const evidence = await h.store.store({
+      text: "Session decided: release tokens live only in the secret manager, scripts fetch them by name",
+      vector: SAME_VECTOR,
+      category: "events",
+      scope: "cc:http-receipt-session",
+      importance: 0.6,
+      metadata: "{}",
+    });
+    const input = { memoryId: evidence.id, category: "patterns" as const, scope: SCOPE };
+
+    const first = await promoteMemory(h.deps, input);
+    expect(first.disposition).toBe("promoted");
+    expect(await h.rowCount()).toBe(1);
+    expect(buildPromoteHttpResponse(first)).toMatchObject({
+      status: 201,
+      body: { stored: true, disposition: "promoted", sourceMemoryId: evidence.id },
+    });
+
+    // Same text again: no new row, the promotion is recorded on the existing durable entry.
+    const second = await promoteMemory(h.deps, input);
+    expect(second.disposition).toBe("promoted");
+    expect(second.id).toBe(first.id);
+    expect(await h.rowCount()).toBe(1);
+    expect(buildPromoteHttpResponse(second)).toMatchObject({ status: 201, body: { stored: true, id: first.id } });
+  }, 30_000);
+
   it("stored is true and status 201 only for stored / updated / promoted", () => {
     const base: StoredPromotedMemoryRecord = {
       text: "User prefers concise, direct replies.",
