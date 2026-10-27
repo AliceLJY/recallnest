@@ -38,7 +38,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import type { AuditLogger } from "./audit-log.js";
 import { inspectLock, lockPathForKey, withLock } from "./distill-lock.js";
@@ -72,6 +72,33 @@ const LOCK_HEARTBEAT_MS = 60_000;
  * 对账整轮持有它们（忙就跳过本轮），dream / GC 也就不会在对账的规划与提交之间拿旧判断写入。
  */
 export const RECONCILE_LOCK_KEYS = ["memory-reconcile", `consolidate-${MEMORY_DOC_SCOPE}`, "gc-run"] as const;
+
+/**
+ * 一种「按文件对账」的文档源。记忆文件是一种（scope "memory"、目录顶层 *.md），会话账本是另一种
+ * （scope "memory:ledger"、`ledgers/YYYY-MM/<sid8>.md` 递归、按节切片，见 ledger-docs.ts）。
+ * 两种各管各的 scope：行的 metadata.source 等于 scope、scope 精确匹配，互不下架对方的行；
+ * 锁、对账日志、护栏状态按 name 分开，可以各自跑、各自撤销（P1 ①，2026-10-23）。
+ */
+export interface DocReconcileSource {
+  /** 入库 scope，也是行 metadata.source（两者相同；规划只看 scope 恰为它的行） */
+  scope: string;
+  /** runId / 对账日志文件名 / 护栏状态文件名的前缀 */
+  name: string;
+  /** 写入时持有的锁（键名须与持锁方逐字一致） */
+  lockKeys: readonly string[];
+  /** 人读的目录叫法（报错与护栏说明里用） */
+  dirLabel: string;
+  /** 收集现行切片；fileNames 含 sync-conflict 文件（用来区分「文件已删」与「冲突副本」） */
+  collect(dir: string): { chunks: CurrentChunk[]; fileNames: Set<string> };
+}
+
+export const MEMORY_DOC_SOURCE: DocReconcileSource = {
+  scope: MEMORY_DOC_SCOPE,
+  name: "memory-reconcile",
+  lockKeys: RECONCILE_LOCK_KEYS,
+  dirLabel: "记忆目录",
+  collect: (dir) => collectCurrentChunks(dir),
+};
 /**
  * 对账自己持锁时登记的「预计最长持有」：不设上限，不触发 distill-lock 的超时告警（对账跑多久都正常）。
  * 「持有者进程还活着就绝不抢」现在由内核保证：锁是 flock，活着的持有者谁都拿不走，进程一退出或被杀就自动释放，
@@ -217,8 +244,8 @@ export function isActiveStatus(status: string): boolean {
   return status === "active" || status === "pending_review";
 }
 
-export function isMemoryDocSlice(meta: Record<string, unknown>): boolean {
-  return meta.source === MEMORY_DOC_SCOPE && asRecord(meta.boundary)?.authority === "document-ingest";
+export function isMemoryDocSlice(meta: Record<string, unknown>, scope: string = MEMORY_DOC_SCOPE): boolean {
+  return meta.source === scope && asRecord(meta.boundary)?.authority === "document-ingest";
 }
 
 export function isSyncConflictFile(name: string): boolean {
@@ -263,8 +290,8 @@ function pickPreferred(rows: ExistingRow[], exactText: string): ExistingRow {
  * 这时插入会撞 id 被跳过、那一行又因正文不在现行文件而下架，这段文字就一个活跃代表都没有。
  * 用固定推导的备用 id 插入：可重跑、下一轮同文已有活跃行就不会再插。
  */
-export function altInsertId(text: string): string {
-  return deterministicId(MEMORY_DOC_SCOPE, `${text}\u0000memory-reconcile:alt-id`);
+export function altInsertId(text: string, scope: string = MEMORY_DOC_SCOPE): string {
+  return deterministicId(scope, `${text}\u0000memory-reconcile:alt-id`);
 }
 
 function parseMeta(raw: string | undefined): Record<string, unknown> {
@@ -296,6 +323,8 @@ export interface ForgetSet {
 }
 
 export interface PlanInput {
+  /** 对账的 scope（默认 "memory"）；行的 metadata.source 要等于它才算这个源的文档切片 */
+  scope?: string;
   /** 现行切片（已跳过 sync-conflict 文件） */
   current: CurrentChunk[];
   /** 现行记忆目录顶层 *.md 文件名（含 sync-conflict 文件，用来区分「文件已删」与「冲突副本」） */
@@ -312,6 +341,8 @@ export interface PlanInput {
 
 export function planMemoryReconcile(input: PlanInput): MemoryReconcilePlan {
   const { current, currentFileNames, existing, forgottenIds } = input;
+  const scope = input.scope ?? MEMORY_DOC_SCOPE;
+  const isDoc = (meta: Record<string, unknown>) => isMemoryDocSlice(meta, scope);
   const forgottenNorms = input.forgottenNorms ?? new Set<string>();
   const externalStatus = input.externalStatus ?? new Map<string, string>();
 
@@ -338,7 +369,7 @@ export function planMemoryReconcile(input: PlanInput): MemoryReconcilePlan {
     rowsByNorm.set(norm, list);
     const state = rowState(row.meta);
     statusById.set(row.id, state.status);
-    if (isActiveStatus(state.status) && isMemoryDocSlice(row.meta)) {
+    if (isActiveStatus(state.status) && isDoc(row.meta)) {
       activeDocRows++;
       const file = fileOf(row.meta);
       if (file) activeDocFiles.add(file);
@@ -361,14 +392,14 @@ export function planMemoryReconcile(input: PlanInput): MemoryReconcilePlan {
     keep++;
     const keeper = pickPreferred(active, chunk.text);
     for (const row of active) {
-      if (row.id !== keeper.id && isMemoryDocSlice(row.meta)) addRetire(row, "duplicate-text", norm);
+      if (row.id !== keeper.id && isDoc(row.meta)) addRetire(row, "duplicate-text", norm);
     }
   }
   // 第一遍（续）：文本已不在任何现行文件里的活跃文档切片
   for (const row of existing) {
     const norm = normById.get(row.id)!;
     if (curByNorm.has(norm)) continue;
-    if (!isMemoryDocSlice(row.meta) || !isActiveStatus(rowState(row.meta).status)) continue;
+    if (!isDoc(row.meta) || !isActiveStatus(rowState(row.meta).status)) continue;
     const file = fileOf(row.meta);
     const reason: RetireReason = file && isSyncConflictFile(file)
       ? "sync-conflict-file"
@@ -405,8 +436,8 @@ export function planMemoryReconcile(input: PlanInput): MemoryReconcilePlan {
     }
     // 2. forget 过：审计里有这段文字的确定性 id / 备用 id / 归一指纹，或还没删掉的同文行带 forgotten: 标记
     //    → 不补回，也不恢复同文的别的行（forget 删的是一行，要忘的是这段文字）
-    const id = deterministicId(MEMORY_DOC_SCOPE, chunk.text);
-    const altId = altInsertId(chunk.text);
+    const id = deterministicId(scope, chunk.text);
+    const altId = altInsertId(chunk.text, scope);
     if (forgottenIds.has(id) || forgottenIds.has(altId) || forgottenNorms.has(fingerprintNormalized(norm))
       || rows.some((r) => isForgottenNote(rowState(r.meta)))) {
       exceptionForgotten++;
@@ -417,14 +448,14 @@ export function planMemoryReconcile(input: PlanInput): MemoryReconcilePlan {
       .map((r) => rowState(r.meta).consolidatedInto)
       .filter((t): t is string => t !== null && retireIds.has(t)))];
     // 3. 对账下架过的 → 恢复
-    const retiredByUs = rows.filter((r) => isMemoryDocSlice(r.meta) && isReconcileRetired(rowState(r.meta)));
+    const retiredByUs = rows.filter((r) => isDoc(r.meta) && isReconcileRetired(rowState(r.meta)));
     if (retiredByUs.length > 0) {
       const row = pickPreferred(retiredByUs, chunk.text);
       reactivate.push({ id: row.id, file: fileOf(row.meta), kind: "reconcile-retired", dependentRetireIds, targetRetiredThisRun: dependentRetireIds.length > 0, norm, expect: rowState(row.meta), before: journalFields(row.meta) });
       continue;
     }
     // 4. 合并链已断（目标不活跃、不存在，或本轮要被下架）→ 恢复被合并的那一行
-    const brokenConsolidation = consolidated.filter((r) => isMemoryDocSlice(r.meta));
+    const brokenConsolidation = consolidated.filter((r) => isDoc(r.meta));
     if (brokenConsolidation.length > 0) {
       const row = pickPreferred(brokenConsolidation, chunk.text);
       reactivate.push({
@@ -496,25 +527,25 @@ export function collectCurrentChunks(memDir: string): { chunks: CurrentChunk[]; 
   return { chunks, fileNames };
 }
 
-export async function loadMemoryScopeRows(store: MemoryStore): Promise<ExistingRow[]> {
+export async function loadMemoryScopeRows(store: MemoryStore, scope: string = MEMORY_DOC_SCOPE): Promise<ExistingRow[]> {
   const entries = await store.listPage({
-    scopeFilter: [MEMORY_DOC_SCOPE],
+    scopeFilter: [scope],
     scopeMatch: "exact",
     limit: 10_000_000,
   });
   return entries
-    .filter((entry) => entry.scope === MEMORY_DOC_SCOPE)
+    .filter((entry) => entry.scope === scope)
     .map((entry) => ({ id: entry.id, scope: entry.scope, text: entry.text, timestamp: entry.timestamp, meta: parseMeta(entry.metadata) }));
 }
 
 const FORGET_NORM_RE = /(?:^|\s)norm=([0-9a-f]{16})(?:\s|$)/;
 
-function collectForgets(chunk: string, into: ForgetSet): void {
+function collectForgets(chunk: string, into: ForgetSet, scope: string): void {
   for (const line of chunk.split("\n")) {
     if (!line.includes("\"forget\"")) continue;
     try {
       const e = asRecord(JSON.parse(line));
-      if (!e || e.operation !== "forget" || e.scope !== MEMORY_DOC_SCOPE) continue;
+      if (!e || e.operation !== "forget" || e.scope !== scope) continue;
       if (typeof e.memoryId === "string") into.ids.add(e.memoryId);
       const m = typeof e.details === "string" ? FORGET_NORM_RE.exec(e.details) : null;
       if (m) into.norms.add(m[1]);
@@ -523,17 +554,17 @@ function collectForgets(chunk: string, into: ForgetSet): void {
 }
 
 /** 这段文字是否已被 forget：行自己的 id、这段文字的确定性 id 或备用 id、归一指纹，任一在 forget 记录里都算 */
-function isTextForgotten(forgets: ForgetSet, text: string, rowId?: string): boolean {
+function isTextForgotten(forgets: ForgetSet, text: string, rowId: string | undefined, scope: string): boolean {
   return (rowId !== undefined && forgets.ids.has(rowId))
-    || forgets.ids.has(deterministicId(MEMORY_DOC_SCOPE, text))
-    || forgets.ids.has(altInsertId(text))
+    || forgets.ids.has(deterministicId(scope, text))
+    || forgets.ids.has(altInsertId(text, scope))
     || forgets.norms.has(textFingerprint(text));
 }
 
-/** 审计日志里 scope "memory" 的 forget 事件。文件不在就是空集（识别失效，不报错）。 */
-export function loadForgetSet(auditPath: string): ForgetSet {
+/** 审计日志里这个 scope（默认 "memory"）的 forget 事件。文件不在就是空集（识别失效，不报错）。 */
+export function loadForgetSet(auditPath: string, scope: string = MEMORY_DOC_SCOPE): ForgetSet {
   const set: ForgetSet = { ids: new Set(), norms: new Set() };
-  if (existsSync(auditPath)) collectForgets(readFileSync(auditPath, "utf-8"), set);
+  if (existsSync(auditPath)) collectForgets(readFileSync(auditPath, "utf-8"), set, scope);
   return set;
 }
 
@@ -546,7 +577,7 @@ export class ForgetWatcher {
   private carry = "";
   readonly set: ForgetSet = { ids: new Set(), norms: new Set() };
 
-  constructor(private readonly auditPath: string) {
+  constructor(private readonly auditPath: string, private readonly scope: string = MEMORY_DOC_SCOPE) {
     this.refresh();
   }
 
@@ -566,7 +597,7 @@ export class ForgetWatcher {
       const text = this.carry + buf.toString("utf-8");
       const lastNl = text.lastIndexOf("\n");
       this.carry = lastNl >= 0 ? text.slice(lastNl + 1) : text;
-      if (lastNl >= 0) collectForgets(text.slice(0, lastNl), this.set);
+      if (lastNl >= 0) collectForgets(text.slice(0, lastNl), this.set, this.scope);
     } finally {
       closeSync(fd);
     }
@@ -629,6 +660,10 @@ export interface ApplyResult {
 }
 
 export interface ApplyContext {
+  /** 对账的 scope（默认 "memory"）：插入行的 scope / source、提交时核对、审计都用它 */
+  scope?: string;
+  /** 源名（DocReconcileSource.name）：写进日志第一行，撤销据此选源；不给时 scope 是 "memory" 就记记忆文件源，否则不写头 */
+  sourceName?: string;
   runId: string;
   journalPath: string | null;
   /** 下架是否被护栏（上限）拦下；拦下时只插入与恢复（因目标本轮下架而断的合并链也不恢复） */
@@ -682,10 +717,11 @@ async function applyInserts(
         toInsert.push({ item, vector, extraction: extractions[j], summary: summaries[j] });
       });
       if (toInsert.length === 0) continue;
+      const scope = ctx.scope ?? MEMORY_DOC_SCOPE;
       const entries = toInsert.map(({ item, vector, extraction, summary }) => {
         const built = buildIngestedEntry({
-          source: MEMORY_DOC_SCOPE,
-          scope: MEMORY_DOC_SCOPE,
+          source: scope,
+          scope,
           text: item.chunk.text,
           vector,
           extraction,
@@ -803,7 +839,7 @@ async function applyPatches<T extends PatchItem>(
     for (const item of batchApplied) {
       const d = describe(item);
       try {
-        deps.auditLogger?.log({ operation: d.auditOp, scope: MEMORY_DOC_SCOPE, memoryId: item.id, actor: "system", details: `${RECONCILE_NOTE_PREFIX} ${d.detail}` });
+        deps.auditLogger?.log({ operation: d.auditOp, scope: ctx.scope ?? MEMORY_DOC_SCOPE, memoryId: item.id, actor: "system", details: `${RECONCILE_NOTE_PREFIX} ${d.detail}` });
       } catch { /* 审计失败不影响对账 */ }
     }
   }
@@ -819,6 +855,10 @@ export async function applyMemoryReconcile(
   const nowMs = (ctx.now ?? Date.now)();
   const isoNow = new Date(nowMs).toISOString();
   const journal = new Journal(ctx.journalPath);
+  const docScope = ctx.scope ?? MEMORY_DOC_SCOPE;
+  // 日志第一行写明这是哪个源、哪个 scope 的：撤销按它选 scope 与锁，日志被改名、拷走也不选错（P1 互审 R3 Codex NEW-4）
+  const sourceName = ctx.sourceName ?? (docScope === MEMORY_DOC_SCOPE ? MEMORY_DOC_SOURCE.name : null);
+  if (sourceName) journal.write([journalHeader(sourceName, docScope)]);
   const result: ApplyResult = {
     inserted: 0,
     insertSkippedExisting: 0,
@@ -860,7 +900,7 @@ export async function applyMemoryReconcile(
       { ...ctx, journal },
       (item, meta, text, scope) => {
         const state = rowState(meta);
-        if (scope !== MEMORY_DOC_SCOPE || !isMemoryDocSlice(meta) || normalizeDedupText(text) !== item.norm) return false;
+        if (scope !== docScope || !isMemoryDocSlice(meta, docScope) || normalizeDedupText(text) !== item.norm) return false;
         if (item.kind === "reconcile-retired") return isReconcileRetired(state);
         return state.status === "consolidated" && state.consolidatedInto === item.expect.consolidatedInto;
       },
@@ -899,8 +939,8 @@ export async function applyMemoryReconcile(
       deps,
       ready,
       { ...ctx, journal },
-      (item, meta, text, scope) => scope === MEMORY_DOC_SCOPE
-        && isMemoryDocSlice(meta)
+      (item, meta, text, scope) => scope === docScope
+        && isMemoryDocSlice(meta, docScope)
         && normalizeDedupText(text) === item.norm
         && rowState(meta).status === item.expect.status,
       (item, meta) => {
@@ -924,6 +964,8 @@ export async function applyMemoryReconcile(
 
 export interface ReconcileOptions extends ApplyDeps {
   memDir: string;
+  /** 哪种文档源（默认记忆文件 MEMORY_DOC_SOURCE；会话账本用 ledger-docs.ts 的 LEDGER_DOC_SOURCE） */
+  source?: DocReconcileSource;
   /**
    * 数据目录：锁（<dataDir>/locks）、审计（<dataDir>/audit.jsonl）、对账日志与护栏状态都在这里。
    * 必须是其他进程用的同一个目录（resolve(envConfig.dataDir())），CLI 会核对它与库所在目录一致。
@@ -960,16 +1002,16 @@ export function resolveMaxRetire(activeDocRows: number, override?: number): numb
     ?? Math.max(DEFAULT_MAX_RETIRE_FLOOR, Math.ceil(activeDocRows * DEFAULT_MAX_RETIRE_FRACTION));
 }
 
-export function guardStatePath(dataDir: string): string {
-  return join(dataDir, "memory-reconcile-guard.json");
+export function guardStatePath(dataDir: string, name: string = MEMORY_DOC_SOURCE.name): string {
+  return join(dataDir, `${name}-guard.json`);
 }
 
 /**
  * 护栏报警去抖：同一原因 24 小时内只报一次（第三轮 Kimi / Agy：护栏持续触发时每天最多 7 次报警会被当噪音）。
  * 没有护栏触发时清掉状态，下次触发立刻报。
  */
-export function decideGuardAlert(dataDir: string, guard: ReconcileOutcome["guard"], nowMs: number): boolean {
-  const path = guardStatePath(dataDir);
+export function decideGuardAlert(dataDir: string, guard: ReconcileOutcome["guard"], nowMs: number, name: string = MEMORY_DOC_SOURCE.name): boolean {
+  const path = guardStatePath(dataDir, name);
   if (!guard) {
     if (existsSync(path)) rmSync(path, { force: true });
     return false;
@@ -1015,9 +1057,9 @@ function touchLocks(keys: readonly string[]): void {
 }
 
 /** 拿齐三把锁、定期续期，再跑 fn；拿不齐就返回被谁占着 */
-async function underReconcileLocks<T>(fn: () => Promise<T>): Promise<LockedOutcome<T>> {
-  return withLocks(RECONCILE_LOCK_KEYS, async () => {
-    const heartbeat = setInterval(() => touchLocks(RECONCILE_LOCK_KEYS), LOCK_HEARTBEAT_MS);
+async function underReconcileLocks<T>(fn: () => Promise<T>, keys: readonly string[] = RECONCILE_LOCK_KEYS): Promise<LockedOutcome<T>> {
+  return withLocks(keys, async () => {
+    const heartbeat = setInterval(() => touchLocks(keys), LOCK_HEARTBEAT_MS);
     heartbeat.unref?.();
     try {
       return await fn();
@@ -1028,23 +1070,24 @@ async function underReconcileLocks<T>(fn: () => Promise<T>): Promise<LockedOutco
 }
 
 function busyDescription(key: string): string {
-  return key === "memory-reconcile" ? "另一轮对账或撤销" : key === "gc-run" ? "GC" : "dream 合并";
+  return key.endsWith("-reconcile") ? "另一轮对账或撤销" : key === "gc-run" ? "GC" : "dream 合并";
 }
 
 export async function reconcileMemoryDocuments(opts: ReconcileOptions): Promise<ReconcileOutcome> {
   const now = opts.now ?? Date.now;
+  const src = opts.source ?? MEMORY_DOC_SOURCE;
   const runId = `mr-${new Date(now()).toISOString().replace(/[:.]/g, "-")}`;
   if (!opts.explicitPath) {
     throw new Error("memory 对账需要显式配置 sources.memory.path（当前为 auto）；auto 路径请继续用 ingestMarkdownFiles");
   }
   if (!existsSync(opts.memDir) || !statSync(opts.memDir).isDirectory()) {
-    throw new Error(`记忆目录不存在：${opts.memDir}`);
+    throw new Error(`${src.dirLabel}不存在：${opts.memDir}`);
   }
 
   const run = async (): Promise<ReconcileOutcome> => {
-    const forgetWatcher = new ForgetWatcher(join(opts.dataDir, "audit.jsonl"));
-    const { chunks, fileNames } = collectCurrentChunks(opts.memDir);
-    const existing = await loadMemoryScopeRows(opts.store);
+    const forgetWatcher = new ForgetWatcher(join(opts.dataDir, "audit.jsonl"), src.scope);
+    const { chunks, fileNames } = src.collect(opts.memDir);
+    const existing = await loadMemoryScopeRows(opts.store, src.scope);
 
     // 合并目标不在 scope "memory" 里的，单独查一次状态
     const known = new Set(existing.map((r) => r.id));
@@ -1057,6 +1100,7 @@ export async function reconcileMemoryDocuments(opts: ReconcileOptions): Promise<
     }
 
     const plan = planMemoryReconcile({
+      scope: src.scope,
       current: chunks,
       currentFileNames: fileNames,
       existing,
@@ -1067,7 +1111,7 @@ export async function reconcileMemoryDocuments(opts: ReconcileOptions): Promise<
     const maxRetire = resolveMaxRetire(plan.activeDocRows, opts.maxRetire);
     let guard: ReconcileOutcome["guard"] = null;
     if (plan.filesWithActiveDocRows > 0 && plan.currentFiles < plan.filesWithActiveDocRows * DIR_SANITY_MIN_RATIO) {
-      guard = { reason: "dir-sanity", detail: `记忆目录现行文件 ${plan.currentFiles} 个，不到有活跃文档切片的文件数 ${plan.filesWithActiveDocRows} 的一半，本轮不写入` };
+      guard = { reason: "dir-sanity", detail: `${src.dirLabel}现行文件 ${plan.currentFiles} 个，不到有活跃文档切片的文件数 ${plan.filesWithActiveDocRows} 的一半，本轮不写入` };
     } else if (plan.retire.length > maxRetire) {
       guard = { reason: "cap", detail: `计划下架 ${plan.retire.length} 条，超过单轮上限 ${maxRetire}，本轮只插入与恢复` };
     }
@@ -1076,25 +1120,25 @@ export async function reconcileMemoryDocuments(opts: ReconcileOptions): Promise<
       return { ran: true, mode: "dry-run", runId, plan, maxRetire, guard, applied: null, journalPath: null, alert: false };
     }
     if (guard?.reason === "dir-sanity") {
-      return { ran: true, mode: "apply", runId, plan, maxRetire, guard, applied: null, journalPath: null, alert: decideGuardAlert(opts.dataDir, guard, now()) };
+      return { ran: true, mode: "apply", runId, plan, maxRetire, guard, applied: null, journalPath: null, alert: decideGuardAlert(opts.dataDir, guard, now(), src.name) };
     }
 
-    const journalPath = join(opts.dataDir, "reconcile-journals", `memory-reconcile-${runId.slice(3)}.jsonl`);
+    const journalPath = join(opts.dataDir, "reconcile-journals", `${src.name}-${runId.slice(3)}.jsonl`);
     const applied = await applyMemoryReconcile(
       { store: opts.store, embedder: opts.embedder, llm: opts.llm, auditLogger: opts.auditLogger },
       plan,
-      { runId, journalPath, retireAllowed: guard === null, forgetWatcher, now },
+      { scope: src.scope, sourceName: src.name, runId, journalPath, retireAllowed: guard === null, forgetWatcher, now },
     );
     if (guard === null && applied.insertErrors.length > 0) {
       guard = { reason: "insert-failed", detail: `${applied.insertPending} 段没插进去（所在文件本轮不下架）：${applied.insertErrors.slice(0, 3).join("；")}` };
     }
-    return { ran: true, mode: "apply", runId, plan, maxRetire, guard, applied, journalPath, alert: decideGuardAlert(opts.dataDir, guard, now()) };
+    return { ran: true, mode: "apply", runId, plan, maxRetire, guard, applied, journalPath, alert: decideGuardAlert(opts.dataDir, guard, now(), src.name) };
   };
 
   // 只看计划不写库：不持锁，任何时候都能跑
   if (!opts.apply) return run();
 
-  const outcome = await underReconcileLocks(run);
+  const outcome = await underReconcileLocks(run, src.lockKeys);
   if (!outcome.ran) {
     const holder = inspectLock(outcome.busy);
     const stale = holder.exists && holder.pidAlive && (holder.ageMs ?? 0) >= LOCK_STALE_ALERT_MS;
@@ -1112,7 +1156,7 @@ export async function reconcileMemoryDocuments(opts: ReconcileOptions): Promise<
       guard,
       applied: null,
       journalPath: null,
-      alert: stale ? decideGuardAlert(opts.dataDir, guard, now()) : false,
+      alert: stale ? decideGuardAlert(opts.dataDir, guard, now(), src.name) : false,
     };
   }
   return outcome.result;
@@ -1175,6 +1219,53 @@ export interface UndoResult {
   /** 日志里解析不了的行（比如写到一半崩溃留下的截断尾行） */
   unparsedLines: number;
   undoJournalPath: string;
+  /** 日志里记的 id 此刻那一行不在本次撤销的 scope 里：不动（源选错时不会去改别的源的行） */
+  skippedWrongScope: string[];
+  /** 本次按哪个源撤、怎么定下来的 */
+  source: string;
+  sourceVia: UndoSourceVia;
+}
+
+/** 对账日志第一行：{ journal: "doc-reconcile", v: 1, source, scope }（没有 run / action，旧版读日志时自然跳过） */
+export const JOURNAL_HEADER_KIND = "doc-reconcile";
+
+function journalHeader(source: string, scope: string): object {
+  return { journal: JOURNAL_HEADER_KIND, v: 1, source, scope };
+}
+
+/** 读日志第一个非空行里的头；没有头（P1 之前的日志）返回 null */
+export function readJournalHeader(journalPath: string): { source: string; scope: string } | null {
+  const first = readFileSync(journalPath, "utf-8").split("\n").find((l) => l.trim());
+  if (!first) return null;
+  let rec: Record<string, unknown> | null;
+  try {
+    rec = asRecord(JSON.parse(first));
+  } catch {
+    return null;
+  }
+  if (!rec || rec.journal !== JOURNAL_HEADER_KIND || typeof rec.source !== "string" || typeof rec.scope !== "string") return null;
+  return { source: rec.source, scope: rec.scope };
+}
+
+export type UndoSourceVia = "explicit" | "header" | "filename" | "default";
+
+/**
+ * 撤销按哪个源：显式给的（命令行 --ledgers）优先；其次日志头；再次文件名前缀（没有头的旧日志）；都没有按记忆文件源。
+ * 日志头写的源不在已知清单里就拒绝——不悄悄退回记忆文件源（P1 互审 R3 Codex NEW-4 / Kimi NEW-3）
+ */
+export function resolveUndoSource(journalPath: string, opts: { explicit?: DocReconcileSource; known?: readonly DocReconcileSource[] } = {}): { source: DocReconcileSource; via: UndoSourceVia } {
+  if (opts.explicit) return { source: opts.explicit, via: "explicit" };
+  const known = opts.known?.length ? opts.known : [MEMORY_DOC_SOURCE];
+  const header = readJournalHeader(journalPath);
+  if (header) {
+    const hit = known.find((k) => k.name === header.source && k.scope === header.scope);
+    if (!hit) throw new Error(`日志头写的源 ${header.source}（scope ${header.scope}）不在已知的源里，不撤销`);
+    return { source: hit, via: "header" };
+  }
+  const base = basename(journalPath);
+  const byName = known.find((k) => base.startsWith(`${k.name}-`));
+  if (byName) return { source: byName, via: "filename" };
+  return { source: MEMORY_DOC_SOURCE, via: "default" };
 }
 
 interface UndoRecord {
@@ -1301,9 +1392,10 @@ function expectedFromMarker(meta: Record<string, unknown>, rec: UndoRecord): { b
 export async function undoMemoryReconcile(
   deps: { store: MemoryStore; auditLogger?: Pick<AuditLogger, "log"> | null },
   journalPath: string,
-  opts: { now?: () => number; auditPath?: string } = {},
+  opts: { now?: () => number; auditPath?: string; source?: DocReconcileSource; knownSources?: readonly DocReconcileSource[] } = {},
 ): Promise<UndoResult> {
-  const outcome = await underReconcileLocks(() => undoUnlocked(deps, journalPath, opts));
+  const { source: src, via } = resolveUndoSource(journalPath, { explicit: opts.source, known: opts.knownSources });
+  const outcome = await underReconcileLocks(async () => ({ ...(await undoUnlocked(deps, journalPath, { ...opts, scope: src.scope })), source: src.name, sourceVia: via }), src.lockKeys);
   if (!outcome.ran) {
     throw new Error(`撤销没执行：${busyDescription(outcome.busy)}正在运行（锁 ${outcome.busy} 被占用），稍后再试`);
   }
@@ -1313,16 +1405,16 @@ export async function undoMemoryReconcile(
 async function undoUnlocked(
   deps: { store: MemoryStore; auditLogger?: Pick<AuditLogger, "log"> | null },
   journalPath: string,
-  opts: { now?: () => number; auditPath?: string },
-): Promise<UndoResult> {
+  opts: { now?: () => number; auditPath?: string; scope: string },
+): Promise<Omit<UndoResult, "source" | "sourceVia">> {
   const { records, unparsed } = readUndoRecords(journalPath);
-  const forgets = opts.auditPath ? loadForgetSet(opts.auditPath) : null;
+  const forgets = opts.auditPath ? loadForgetSet(opts.auditPath, opts.scope) : null;
   const nowMs = (opts.now ?? Date.now)();
   const isoNow = new Date(nowMs).toISOString();
   const undoRun = `undo-${isoNow.replace(/[:.]/g, "-")}`;
   const undoJournalPath = `${journalPath.replace(/\.jsonl$/, "")}.${undoRun}.jsonl`;
   const journal = new Journal(undoJournalPath);
-  const result: UndoResult = {
+  const result: Omit<UndoResult, "source" | "sourceVia"> = {
     restored: 0,
     insertsRetired: 0,
     skippedConflict: [],
@@ -1330,6 +1422,7 @@ async function undoUnlocked(
     skippedForgotten: [],
     unparsedLines: unparsed,
     undoJournalPath,
+    skippedWrongScope: [],
   };
 
   // 本次撤销会撤成不活跃的行：插入的行（改成 archived）与恢复过的行（撤回原来的非活跃状态）。
@@ -1338,7 +1431,7 @@ async function undoUnlocked(
   // 反过来：此刻已有合并成员指向的行（比如对账之后 dream 把别的行合并进了本轮插入或恢复的行），撤成不活跃也会造出断链
   const targetsInUse = new Set<string>();
   if (willDeactivate.size > 0) {
-    for (const row of await loadMemoryScopeRows(deps.store)) {
+    for (const row of await loadMemoryScopeRows(deps.store, opts.scope)) {
       const st = rowState(row.meta);
       if (st.status === "consolidated" && st.consolidatedInto) targetsInUse.add(st.consolidatedInto);
     }
@@ -1385,6 +1478,11 @@ async function undoUnlocked(
         patchFn: (meta, entry) => {
           const r = byId.get(entry.id)!;
           seen.add(entry.id);
+          // 行不在本次撤销的 scope 里：源选错了（或这个 id 后来被别的写方占了），不动它
+          if (entry.scope !== opts.scope) {
+            result.skippedWrongScope.push(r.id);
+            return meta;
+          }
           const current = journalFields(meta);
           if (r.action !== "retire" && targetsInUse.has(entry.id)) {
             result.skippedDependency.push(r.id);
@@ -1416,7 +1514,7 @@ async function undoUnlocked(
             return meta;
           }
           // 撤回去会重新活跃（撤下架）：这段文字已被 forget 就不撤
-          if (isActiveStatus(expected.before.status) && forgets && isTextForgotten(forgets, entry.text, entry.id)) {
+          if (isActiveStatus(expected.before.status) && forgets && isTextForgotten(forgets, entry.text, entry.id, opts.scope)) {
             result.skippedForgotten.push(r.id);
             return meta;
           }
@@ -1431,7 +1529,7 @@ async function undoUnlocked(
     }
   }
   try {
-    deps.auditLogger?.log({ operation: "update", scope: MEMORY_DOC_SCOPE, actor: "system", details: `${RECONCILE_NOTE_PREFIX} undo restored=${result.restored} insertsRetired=${result.insertsRetired} conflicts=${result.skippedConflict.length} dependency=${result.skippedDependency.length} forgotten=${result.skippedForgotten.length}` });
+    deps.auditLogger?.log({ operation: "update", scope: opts.scope, actor: "system", details: `${RECONCILE_NOTE_PREFIX} undo restored=${result.restored} insertsRetired=${result.insertsRetired} conflicts=${result.skippedConflict.length} dependency=${result.skippedDependency.length} forgotten=${result.skippedForgotten.length}` });
   } catch { /* 审计失败不影响撤销 */ }
   return result;
 }

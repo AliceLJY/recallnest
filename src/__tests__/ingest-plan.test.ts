@@ -38,6 +38,13 @@ describe("planIngest — 开关关着（默认）", () => {
     expect(plan.skippedTranscriptSources).toEqual(["minis"]);
   });
 
+  it("账本（ledgers）是单独一项：all 带上它，点名 ledgers 只跑它，点名 memory 不带它（P1 互审 R1 Kimi #7）", () => {
+    expect(planIngest("all", false).ledgers).toBe(true);
+    expect(planIngest("ledgers", false)).toMatchObject({ ledgers: true, memory: false, transcriptSources: [], skippedTranscriptSources: [] });
+    expect(planIngest("memory", false).ledgers).toBe(false);
+    expect(planIngest("cc", true).ledgers).toBe(false);
+  });
+
   it("点名 --source memory：照常跑，没有被跳过的对话来源", () => {
     const plan = planIngest("memory", false);
     expect(plan.memory).toBe(true);

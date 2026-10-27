@@ -11,10 +11,11 @@
  */
 
 import { existsSync, accessSync, constants, readFileSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { dirname, resolve, join } from "node:path";
+import { acquireLock, lockPathForKey, releaseLock } from "./distill-lock.js";
 import { homedir } from "node:os";
 import { metaDir } from "./compat.js";
-import { loadConfig, expandHome, resolveEnv, findConfigPath, loadDotEnv, resolveDbPath } from "./runtime-config.js";
+import { loadConfig, expandHome, resolveEnv, findConfigPath, loadDotEnv, resolveDataDir, resolveDbPath } from "./runtime-config.js";
 import { createEmbedder, type EmbeddingConfig } from "./embedder.js";
 import { extractCanonicalKey, normalizeCanonicalKey } from "./memory-boundaries.js";
 import {
@@ -28,6 +29,7 @@ import {
 import { collectScopeInventory, type ScopeInventoryReport } from "./scope-inventory.js";
 import { MemoryStore, type MemoryEntry, validateStoragePath } from "./store.js";
 import { readHeartbeats, formatAge } from "./source-heartbeat.js";
+import { readBusyAt, SWEEP_HEARTBEAT_FILE, SWEEP_STALE_MS, SWEEP_STUCK_MS, SWEEP_UNFINISHED_STARTS_RED, type SweepHeartbeat } from "./sessions-sweep-run.js";
 
 interface CheckResult {
   name: string;
@@ -301,6 +303,82 @@ export function assessContinuityBaseline(
   };
 }
 
+/**
+ * 扫描器此刻在不在跑：试拿一下它跑时持有的那把锁（sessions-sweep，flock）。拿得到 = 没人在跑（立刻放掉）。
+ * 不看 pid 活没活：pid 会被复用，一个无关进程就能让早已退出的那一轮显得还在跑（P1 互审 R4 Codex #4）；
+ * flock 由内核在持有进程退出时释放，不会被复用骗过。锁目录与心跳同在数据目录下。
+ */
+function defaultSweepRunning(heartbeatPath: string): boolean {
+  const cfg = { lockPath: lockPathForKey("sessions-sweep", join(dirname(heartbeatPath), "locks")), expireMs: 1000 };
+  if (!acquireLock(cfg)) return true;
+  releaseLock(cfg);
+  return false;
+}
+
+/**
+ * 会话扫描心跳在哪：配置解析出的数据目录（库所在的那个 data），不按当前目录——从别处跑 doctor 不该报「没有心跳」
+ * （P1 互审 R4 R3 Codex NEW-5）。扫描器写心跳用的是当前目录下的 data，但它不在库所在的数据目录下跑就拒跑
+ * （cli sessions sweep 的核对），两者是同一个。
+ */
+export function sweepHeartbeatPath(config: Parameters<typeof resolveDataDir>[0]): string {
+  return join(resolveDataDir(config), SWEEP_HEARTBEAT_FILE);
+}
+
+/**
+ * 会话扫描（P1 ④）验活：只在 sources.ledgers.path 显式配置时检查。launchd 每 10 分钟一轮，
+ * 心跳超过 SWEEP_STALE_MS（20 分钟）或从没写过 → 红；正在跑的一轮超过 SWEEP_STUCK_MS 或接连几轮没跑完 → 红；
+ * 最近一轮 LLM 全失败 → 黄。
+ */
+export function checkSessionsSweep(opts: { ledgersConfigured: boolean; heartbeatPath: string; nowMs?: number; isSweepRunning?: () => boolean }): CheckResult | null {
+  if (!opts.ledgersConfigured) return null;
+  const name = "Sessions sweep";
+  const fix = "launchctl print gui/$(id -u)/com.recallnest.sessions-sweep；手动跑一轮（在仓库根目录）：bun run src/cli.ts sessions sweep";
+  if (!existsSync(opts.heartbeatPath)) return fail(name, "还没有扫描心跳（sources.ledgers 已配置，但 sessions sweep 从没跑完过一轮）", fix);
+  let hb: SweepHeartbeat;
+  try {
+    hb = JSON.parse(readFileSync(opts.heartbeatPath, "utf-8")) as SweepHeartbeat;
+  } catch {
+    return fail(name, `心跳文件读不了：${opts.heartbeatPath}`, fix);
+  }
+  const now = opts.nowMs ?? Date.now();
+  const mins = (ms: number) => `${Math.round(ms / 60_000)} 分钟`;
+  const doneMs = Date.parse(hb.at); // NaN：一轮都没跑完过（第一轮开始时建的心跳 at 为空）
+  const doneNote = Number.isFinite(doneMs) ? `最近完成的一轮在 ${mins(now - doneMs)}前、写账本 ${hb.ledgersWritten} 份` : "还没有跑完过一轮";
+  // 一轮开始时写 runningSince（跑完清掉）：launchd 在上一轮没完时不起下一轮，长跑期间没有别的心跳（P1 互审 R3 Codex K6）。
+  // 写了 runningSince、扫描锁却没人拿着 = 那一轮被杀或崩了，不算在跑
+  const runningMs = hb.runningSince ? Date.parse(hb.runningSince) : Number.NaN;
+  const running = Number.isFinite(runningMs) && (opts.isSweepRunning ?? (() => defaultSweepRunning(opts.heartbeatPath)))();
+  const starts = hb.startsSinceDone ?? 0;
+  let detail: string;
+  if (running) {
+    // 在跑就不按 20 分钟判旧（一轮可以合法地跑几十分钟），只看这一轮跑了多久、之前有没有接连没跑完
+    const runFor = now - runningMs;
+    if (runFor > SWEEP_STUCK_MS) return fail(name, `这一轮 ${mins(runFor)}前开始、到现在还没跑完（pid ${hb.runningPid ?? "?"}；包装脚本 45 分钟就该杀掉它），可能卡住了；${doneNote}`, fix);
+    if (starts >= SWEEP_UNFINISHED_STARTS_RED) return fail(name, `连续 ${starts} 轮开始了都没跑完（含正在跑的这一轮，之前的被杀或崩溃）；${doneNote}`, fix);
+    if (!Number.isFinite(doneMs)) return pass(name, `第一轮 ${mins(runFor)}前开始、还在跑`);
+    detail = `这一轮 ${mins(runFor)}前开始、还在跑；${doneNote}`;
+  } else {
+    // 手动跑撞上 launchd 那一轮、因锁跳过（busyAt）也算活着：取完成心跳与 busyAt 里较新的那个。
+    // busyAt 记在心跳旁的 .busy 文件里（锁外不改写主心跳，R4 R3 Codex NEW-4）；旧版写在主心跳里的也认
+    const busyAt = readBusyAt(opts.heartbeatPath, hb);
+    const last = Math.max(doneMs, busyAt ? Date.parse(busyAt) : Number.NEGATIVE_INFINITY);
+    const age = now - last;
+    const ago = `${mins(age)}前`;
+    const diedNote = Number.isFinite(runningMs) ? `；${hb.runningSince} 开始的那一轮没跑完就退出了（pid ${hb.runningPid ?? "?"}，扫描锁已没人拿着）` : "";
+    if (!Number.isFinite(age) || age > SWEEP_STALE_MS) return fail(name, `上次扫描 ${Number.isFinite(age) ? ago : "时间不明"}（超过 ${SWEEP_STALE_MS / 60_000} 分钟）${diedNote}`, fix);
+    // 一直因锁跳过、最近完成的一轮却在 2 小时之前：上一轮多半卡住了（包装脚本 45 分钟就该杀掉它）
+    const sinceDone = now - doneMs;
+    if (busyAt && Date.parse(busyAt) > doneMs && sinceDone > SWEEP_STUCK_MS) return fail(name, `最近完成的一轮在 ${mins(sinceDone)}前，之后一直因锁跳过——上一轮可能卡住了`, fix);
+    detail = busyAt && Date.parse(busyAt) > doneMs
+      ? `上一轮还在跑（${ago}因锁跳过），最近完成的一轮写账本 ${hb.ledgersWritten} 份`
+      : `上次扫描 ${ago}，写账本 ${hb.ledgersWritten} 份，LLM ${hb.llmCalls} 次${diedNote}`;
+  }
+  if (hb.llmConfigured === false) return warn(name, `${detail}；没配 LLM（sessionsSweep.llm / llm），账本只有机器抽取的两节`, "在 config.json 配 sessionsSweep.llm 或 llm");
+  const streak = hb.llmFailStreak ?? (hb.llmCalls > 0 && hb.llmFailures >= hb.llmCalls ? 1 : 0);
+  if (streak > 0) return warn(name, `${detail}；LLM 已连续 ${streak} 轮全失败（最近 ${hb.lastLlmFailureAt ?? "时间不明"}），这期间的账本只有机器抽取的两节`, "检查 sessionsSweep.llm / llm 的 key 与额度");
+  return pass(name, detail);
+}
+
 export async function runDoctor(options: { ci?: boolean } = {}): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
 
@@ -544,6 +622,15 @@ export async function runDoctor(options: { ci?: boolean } = {}): Promise<CheckRe
     }
   } catch {
     results.push(warn("Source heartbeats", "unable to read heartbeat file"));
+  }
+
+  try {
+    const cfg = loadConfig();
+    const ledgers = cfg.sources.ledgers;
+    const sweep = checkSessionsSweep({ ledgersConfigured: !!ledgers && ledgers.path !== "auto", heartbeatPath: sweepHeartbeatPath(cfg) });
+    if (sweep) results.push(sweep);
+  } catch {
+    results.push(warn("Sessions sweep", "unable to read config / heartbeat"));
   }
 
   return results;

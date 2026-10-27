@@ -100,9 +100,25 @@ export const DEFAULT_DREAM_CONFIG: DreamConfig = {
   autoExcludeScopes: ["memory"],
   // checkpoint（2026-10-07）：每场会话一行的 checkpoint 镜像（src/checkpoint-mirror.ts），只由镜像自己按会话覆盖；
   // 合并它会把不同会话的状态揉成一条，或把正在被覆盖的行标成 superseded。
-  neverDreamScopes: ["memory:pivot", "checkpoint"],
+  // memory:ledger（2026-10-23）：会话账本的切片只归账本对账（ledger-docs.ts）管——账本改写后旧片要能按文件下架，
+  // 被合并进别的行就成了对账的「合并链」，一场会话的账本也会和别场揉在一起。
+  neverDreamScopes: ["memory:pivot", "checkpoint", "memory:ledger"],
   gc: DEFAULT_AUTO_GC_CONFIG,
 };
+
+/**
+ * 巩固（dream、MCP consolidate_memories）对一个 scope 的策略：它本身在 neverDreamScopes 里就不做；家族匹配时
+ * 把名单里的兄弟 scope 排除在取数之外（`memory` 家族带出 memory:pivot / memory:ledger）。两个入口共用这一处，
+ * 免得再出现「dream 挡住了、独立工具没挡」（P1 互审 R3 Codex NEW-2）
+ */
+export function consolidationScopePolicy(
+  scope: string,
+  scopeMatch: ScopeMatchMode = "family",
+  neverScopes: readonly string[] = DEFAULT_DREAM_CONFIG.neverDreamScopes,
+): { excluded: boolean; familyExcludes: string[] } {
+  if (neverScopes.includes(scope)) return { excluded: true, familyExcludes: [] };
+  return { excluded: false, familyExcludes: scopeMatch === "family" ? neverScopes.filter((s) => s !== scope) : [] };
+}
 
 export interface DreamPhaseResult {
   phase: "orient" | "gather" | "consolidate" | "prune";
@@ -242,7 +258,8 @@ async function runDreamInner(params: {
   // =========================================================================
   // 在写计数门槛**之前**判：策略排除与"今天写得够不够"无关，force 也不该越过它。
   // 放在 runDream 内部 = CLI / weekly / MCP 三条入口同受约束（互审 C2）。
-  if (config.neverDreamScopes.includes(scope)) {
+  const scopePolicy = consolidationScopePolicy(scope, scopeMatch, config.neverDreamScopes);
+  if (scopePolicy.excluded) {
     return {
       ran: false,
       reason: `policy_excluded (${scope} is in neverDreamScopes)`,
@@ -285,7 +302,10 @@ async function runDreamInner(params: {
   // =========================================================================
   // Phase 2: Gather — collect active entries for consolidation
   // =========================================================================
-  const entries = await store.list([scope], undefined, config.maxEntriesPerRun, 0, scopeMatch);
+  // 家族匹配（手动 `dream --scope memory` 不带 --exact-scope）会把 neverDreamScopes 里的兄弟 scope
+  // （memory:pivot、memory:ledger）一起取出来——上面的策略闸只看参数本身，挡不住；行级再排除一次（P1 互审 R1 Codex #5）
+  const familyExcludes = scopePolicy.familyExcludes;
+  const entries = await store.list([scope], undefined, config.maxEntriesPerRun, 0, scopeMatch, familyExcludes.length ? familyExcludes : undefined);
   const active = entries.filter(e => isActiveMemory(e.metadata));
   stats.activeMemories = active.length;
 
@@ -364,8 +384,9 @@ async function runDreamInner(params: {
       clusterThreshold: config.clusterThreshold,
       maxEntriesPerRun: config.maxEntriesPerRun,
       // 3a 自己重新取数（list + 两处 vectorSearch），gather 收窄了它不会跟着窄 ——
-      // 模式必须显式传进来，漏传就只修了一半（2026-08-16 互审 K3）。
+      // 模式必须显式传进来，漏传就只修了一半（2026-08-16 互审 K3）。排除的 scope 同理。
       scopeMatch,
+      excludeScopes: familyExcludes.length ? familyExcludes : undefined,
     }, params.kgStore ?? null);
     const consolidation = await engine.run(scope);
     stats.dedupeClustersFound += consolidation.clustersFound;
