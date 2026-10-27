@@ -280,10 +280,13 @@ jobs:
             const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
             let metadata;
             let latest;
-            for (let attempt = 1; attempt <= 10; attempt += 1) {
+            // npm's CDN can take several minutes to show a fresh publish (v4.0.0: not visible
+            // after 30 s, visible a few minutes later), so poll for up to 10 minutes without cache.
+            const noCache = { redirect: 'error', headers: { 'cache-control': 'no-cache' } };
+            for (let attempt = 1; attempt <= 40; attempt += 1) {
               const [versionResponse, packumentResponse] = await Promise.all([
-                fetch(versionUrl, { redirect: 'error' }),
-                fetch(packageUrl, { redirect: 'error' }),
+                fetch(`${versionUrl}?attempt=${attempt}`, noCache),
+                fetch(`${packageUrl}?attempt=${attempt}`, noCache),
               ]);
 
               if (versionResponse.ok) {
@@ -300,8 +303,8 @@ jobs:
               }
 
               if (metadata && latest === version) break;
-              console.log(`Registry metadata is not fully visible yet (attempt ${attempt}/10)`);
-              await wait(3000);
+              console.log(`Registry metadata is not fully visible yet (attempt ${attempt}/40)`);
+              await wait(15000);
             }
 
             if (!metadata) throw new Error(`${pkg.name}@${version} was not visible after publication`);

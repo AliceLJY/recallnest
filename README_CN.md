@@ -10,7 +10,7 @@
 
 [![GitHub](https://img.shields.io/github/stars/AliceLJY/recallnest?style=social)](https://github.com/AliceLJY/recallnest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Runtime](https://img.shields.io/badge/Runtime-Bun_|_Node.js_22+-f9f1e1?logo=bun)](https://bun.sh)
+[![Runtime](https://img.shields.io/badge/Runtime-Bun-f9f1e1?logo=bun)](https://bun.sh)
 [![LanceDB](https://img.shields.io/badge/LanceDB-Vector+FTS-orange)](https://lancedb.com)
 [![MCP](https://img.shields.io/badge/MCP-44_tools-blue)](https://modelcontextprotocol.io)
 [![CI](https://github.com/AliceLJY/recallnest/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLJY/recallnest/actions/workflows/ci.yml)
@@ -229,7 +229,7 @@ npm install -g recallnest      # 全局安装
 recallnest doctor
 ```
 
-支持 Node.js 22+（通过 tsx）或 Bun，无需 clone 仓库。
+需要 [Bun](https://bun.sh)：RecallNest 不能在 Node.js 上运行。npm 装的启动脚本只负责转交给 Bun，找不到 `bun` 时会给出安装方法后退出。无需 clone 仓库。
 
 ### 方式 C：手动安装
 
@@ -527,17 +527,21 @@ bun run src/ui-server.ts
 
 ## 最近更新
 
-**v3.0** 把运行时下限提到 **Node 22**（本次唯一的破坏性变更，Bun 用户不受影响），
-并给"合成出来的结论"开了一条通往稳定记忆的路：`dream` 产出的洞察现在可以凭它自己
-那套已验证的证据被提升，而不是永远卡在证据层、下游谁也不敢依赖。
+**v4.0** 只在 **Bun** 上运行，跨进程锁交给了内核。以前 RecallNest 靠锁文件里的
+pid 和时间戳判断锁是不是过期了，判断过期就删掉重建——两个进程同时看到同一个过期锁，
+就可能都以为自己拿到了（八个进程抢一把锁，四十轮里最多有三十轮不止一个赢家）。
+现在用 `flock(2)`：进程退出或被杀，内核自动放锁；压力测试每 15 到 60 毫秒杀掉一个
+写入进程、连续六秒，临界区里从没出现过两个写方。
 
-同批还修了一个限流回复引发的无限请求风暴——实测在一个正让我们慢下来的接口上
-五秒打了六万多次请求。它是被新加的 HTTP 契约测试抓出来的：那些测试让真实的客户端类
-去打一个本地回环服务，而不是把 SDK 打桩糊过去。
+这一版其余的修复，针对的都是会悄悄出错的数据：并发更新把刚删掉的记忆写回来、
+历史行指向不存在的记录、密钥留在 metadata 里还随 trigger 发给嵌入接口、
+搜 `git push 规则`、`#22` 这类查询直接返回空、写入被拒却在回执里报成已保存。
 
-已有的 LanceDB 数据原地打开，不需要导出导入。
+**升级：**先装 Bun，再停掉全部 RecallNest 进程后启动 v4——新旧两版的锁不能同时跑。
+有几处默认值和 HTTP 返回变了，清单在 CHANGELOG 的 v4.0.0 一节开头。
+已有的 LanceDB 数据原地打开。
 
-**完整变更历史（v3.0 到 v1.0，含每个版本的升级说明）在
+**完整变更历史（v4.0 到 v1.0，含每个版本的升级说明）在
 [CHANGELOG.md](CHANGELOG.md)。**
 
 

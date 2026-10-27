@@ -777,6 +777,45 @@ describe("memory-reconcile 真实 LanceDB", () => {
     expect(out!.skippedReason).toContain("consolidate-memory");
   });
 
+  // PR #27 互审（Codex 4 / Grok 1）：持锁方把自己的租期写进锁文件之后，dream 的 10 分钟、GC 的 30 分钟反倒成了
+  // 对账可以抢锁的时限。锁改成 flock 后，活着的持有者谁都拿不走。这里用真的子进程、照生产的租期持锁，再把锁文件
+  // mtime 拨到租期之外，对账仍然跳过。上面那条 C2 用例在同一进程里持锁、租期是永不过期，测不到这个回归。
+  it.each([
+    ["dream 合并（consolidate-memory，10 分钟）", "consolidate-memory", 600_000, "withLock"],
+    ["GC 运行锁（gc-run，30 分钟）", "gc-run", 30 * 60_000, "acquireLock"],
+  ] as const)("%s：另一个进程活着持锁、超过它自己的租期，对账也不抢、本轮跳过", async (_label, key, leaseMs, how) => {
+    await buildScenario();
+    const lockModule = join(import.meta.dir, "../distill-lock.ts");
+    const holder = join(env.root, "holder.ts");
+    writeFileSync(holder, how === "withLock"
+      ? `import { withLock } from ${JSON.stringify(lockModule)};
+await withLock(${JSON.stringify(key)}, async () => { console.log("HELD"); await new Promise(() => { setInterval(() => {}, 1000); }); },
+  { lockDir: process.argv[2], onBusy: "skip", expireMs: ${leaseMs} });`
+      : `import { acquireLock, lockPathForKey } from ${JSON.stringify(lockModule)};
+if (!acquireLock({ lockPath: lockPathForKey(${JSON.stringify(key)}, process.argv[2]), expireMs: ${leaseMs} })) process.exit(3);
+console.log("HELD"); setInterval(() => {}, 1000);`);
+    const child = Bun.spawn([process.execPath, holder, join(env.dataDir, "locks")], { stdout: "pipe", stderr: "pipe" });
+    try {
+      const reader = child.stdout.getReader();
+      let seen = "";
+      while (!seen.includes("HELD")) {
+        const { value, done } = await reader.read();
+        if (done) throw new Error(`holder exited: ${await new Response(child.stderr).text()}`);
+        seen += new TextDecoder().decode(value);
+      }
+      const pastLease = new Date(Date.now() - leaseMs - 60_000);
+      utimesSync(lockPathForKey(key), pastLease, pastLease);
+      const out = await run();
+      expect(out.ran).toBe(false);
+      expect(out.skippedReason).toContain(key);
+      expect(out.skippedReason).toContain(String(child.pid));
+      expect(child.exitCode).toBeNull();
+    } finally {
+      child.kill("SIGKILL");
+      await child.exited;
+    }
+  }, 30_000);
+
   it("forget 发生在 LLM 抽取的等待期间：写库前一刻重读审计日志，不补回（上线前代码单审 C3）", async () => {
     const s = await buildScenario();
     const watcher = new ForgetWatcher(env.auditPath);

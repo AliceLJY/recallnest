@@ -227,9 +227,12 @@ export const CATEGORY_DEFAULT_IMPORTANCE: Record<SmartCategory, number> = {
 // Default Config
 // ============================================================================
 
+// 2026-10-23：qwen-turbo 已随百炼「部分历史主线模型下线」于 10-10 停服（限流先于下线生效，表现为 429）。
+// 没选官方推荐替代的 qwen3.7/3.6-flash：它们默认开思考，而这里的调用方都不传 enableThinking，
+// 同一次 JSON 抽取实测 9.2s / 750 推理 token；qwen-flash 0.6s、不出推理 token，档位与 turbo 一致。
 export const DEFAULT_LLM_CONFIG: LLMConfig = {
   apiKey: "${QWEN_API_KEY}",
-  model: "qwen-turbo",
+  model: "qwen-flash",
   baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1",
   timeoutMs: 15000,
   temperature: 0.1,

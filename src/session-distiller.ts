@@ -9,6 +9,7 @@ import { persistMemory } from "./capture-engine.js";
 import { detectLang, getSessionPromptHook } from "./language-hook.js";
 import { redactSecrets } from "./pii-detector.js";
 import { withWriteLock } from "./distill-lock.js";
+import { STORE_WRITE_NESTED_WAIT_MS } from "./store-write-budget.js";
 
 // ============================================================================
 // Types
@@ -311,11 +312,14 @@ export async function distillSession(
   if (shouldPersist && Object.keys(summaryResult.dimensions).length > 0) {
     // P0-1: serialize the persist phase per scope across processes. Wait (not skip) —
     // skipping would drop this session's distilled knowledge when two sessions distill
-    // the same scope at once. Writes are fast and store-write already makes each write
-    // idempotent, so the brief wait is lossless; microcompact/summary above run unlocked.
+    // the same scope at once; microcompact/summary above run unlocked. The persist phase
+    // takes store-write for each dimension, so the holder may itself be waiting on it: a
+    // timeout here throws out of distillSession and the summary computed above is never
+    // stored, hence at least the nested store-write budget.
     persistResult = await withWriteLock(
       `distill-${scope}`,
       () => extractAndPersist(summaryResult, deps, scope),
+      { waitTimeoutMs: STORE_WRITE_NESTED_WAIT_MS },
     );
   }
 

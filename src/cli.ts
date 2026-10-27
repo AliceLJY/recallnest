@@ -57,10 +57,12 @@ import { isTranscriptScope } from "./memory-boundaries.js";
 import { maybeRunGc } from "./auto-gc.js";
 import {
   formatReconcileSummary,
+  MEMORY_DOC_SOURCE,
   reconcileMemoryDocuments,
   undoMemoryReconcile,
   type ReconcileOutcome,
 } from "./memory-reconcile.js";
+import { LEDGER_DOC_SOURCE } from "./ledger-docs.js";
 import {
   CaseMemoryInputSchema,
   type CaseMemoryInput,
@@ -1537,7 +1539,7 @@ program
 program
   .command("ingest")
   .description("导入对话记录到索引")
-  .option("-s, --source <source>", "数据源: cc / codex / gemini / kimi / memory / desktop / minis / all", "all")
+  .option("-s, --source <source>", "数据源: cc / codex / gemini / kimi / memory / ledgers / desktop / minis / all", "all")
   .option("-l, --limit <n>", "限制处理文件数（调试用）")
   .option("-v, --verbose", "详细输出")
   .option("--no-dedup", "跳过向量去重")
@@ -1776,6 +1778,45 @@ program
           }
         }
       }
+
+    }
+
+    // 会话账本（ledgers/YYYY-MM/<sid8>.md）：记忆文件对账只认顶层 *.md，账本走自己的源与 scope memory:ledger。
+    // 只在 sources.ledgers.path 显式配置时跑（P1 ①，2026-10-23）；`--source ledgers` 可单跑（P1 互审 R1 Kimi #7）
+    const ledgerSource = config.sources.ledgers;
+    if (plan.ledgers && (!ledgerSource || ledgerSource.path === "auto")) {
+      // 只在点名 --source ledgers 时说一声；--source all 而没配账本是常态，不打扰
+      if (source === "ledgers") console.log("  ⚠️ Ledgers: 没有显式配置 sources.ledgers.path，账本对账没有执行");
+    } else if (plan.ledgers && ledgerSource) {
+      const ledgerDir = resolveSourcePath(ledgerSource.path, "ledgers");
+      const paths = checkReconcilePaths(config);
+      if (!paths.ok) {
+        console.log(`  ⚠️ Ledgers: 对账没有执行——${paths.reason}`);
+        memoryReconcileAlert = true;
+      } else if (!existsSync(ledgerDir)) {
+        console.log(`  ℹ️  Ledgers: 账本目录还不存在（${ledgerDir}），跳过`);
+      } else {
+        try {
+          const outcome = await reconcileMemoryDocuments({
+            store,
+            embedder,
+            llm: effectiveLlm,
+            auditLogger: createAuditLogger(),
+            memDir: ledgerDir,
+            dataDir: paths.dataDir,
+            explicitPath: true,
+            apply: true,
+            source: LEDGER_DOC_SOURCE,
+          });
+          results.push({ ...reconcileToIngestResult(outcome), source: "ledgers" });
+          console.log(`  ✅ Ledgers: ${formatReconcileSummary(outcome)}`);
+          if (outcome.journalPath) console.log(`     对账日志: ${outcome.journalPath}`);
+          if (outcome.alert) memoryReconcileAlert = true;
+        } catch (err) {
+          console.log(`  ❌ Ledgers: 对账出错——${err instanceof Error ? err.message : String(err)}`);
+          memoryReconcileAlert = true;
+        }
+      }
     }
 
     // Obsidian vault (--obsidian <path>)
@@ -1835,7 +1876,7 @@ program
     );
     console.log();
     if (memoryReconcileAlert) {
-      console.log("⚠️ 记忆对账需要人看（见上面 Memory: 行），以退出码 3 结束");
+      console.log("⚠️ 记忆 / 账本对账需要人看（见上面 Memory: / Ledgers: 行），以退出码 3 结束");
       process.exitCode = 3;
     }
   });
@@ -1949,7 +1990,8 @@ program
   .description("记忆文件对账：让 memory 源的文档切片与现行记忆文件一一对应（默认只看计划，不写库）")
   .option("--apply", "执行：插入 → 恢复 → 下架")
   .option("--max-retire <n>", "本次下架上限（默认 max(300, 活跃文档切片数的 25%)，也可用 RECALLNEST_MEMORY_RECONCILE_MAX_RETIRE）")
-  .option("--undo <journal>", "按对账日志（data/reconcile-journals/*.jsonl）逐条撤销")
+  .option("--undo <journal>", "按对账日志（data/reconcile-journals/*.jsonl）逐条撤销；按日志第一行写的源撤（旧日志看文件名），--ledgers 显式指定账本源")
+  .option("--ledgers", "对会话账本目录（sources.ledgers.path，scope memory:ledger）而不是记忆文件目录")
   .option("--json", "以 JSON 输出计划与结果")
   .action(async (options) => {
     const config = loadConfig();
@@ -1967,14 +2009,19 @@ program
       const journalPath = resolve(String(options.undo));
       let r: Awaited<ReturnType<typeof undoMemoryReconcile>>;
       try {
-        r = await undoMemoryReconcile({ store, auditLogger: createAuditLogger() }, journalPath, { auditPath: join(paths.dataDir, "audit.jsonl") });
+        // 按哪个源撤：--ledgers 显式优先，其次日志第一行写的源，再次文件名前缀（没有头的旧日志），都没有按记忆文件；
+        // 撤销只动 scope 对得上的行（P1 互审 R3 Codex NEW-4 / Kimi NEW-3）
+        r = await undoMemoryReconcile({ store, auditLogger: createAuditLogger() }, journalPath, { auditPath: join(paths.dataDir, "audit.jsonl"), source: options.ledgers ? LEDGER_DOC_SOURCE : undefined, knownSources: [MEMORY_DOC_SOURCE, LEDGER_DOC_SOURCE] });
       } catch (err) {
         console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
         process.exitCode = 2;
         return;
       }
       const ids8 = (ids: string[]) => `${ids.slice(0, 20).map((id) => id.slice(0, 8)).join(" ")}${ids.length > 20 ? ` …（共 ${ids.length}）` : ""}`;
-      console.log(`撤销完成：写回 ${r.restored} 条，本轮插入的 ${r.insertsRetired} 条改为下架，期间被改过而跳过 ${r.skippedConflict.length} 条，合并链依赖未满足而保留 ${r.skippedDependency.length} 条，文字已被 forget 而保留非活跃 ${r.skippedForgotten.length} 条`);
+      const viaLabel = { explicit: "--ledgers 指定", header: "日志头", filename: "日志文件名", default: "默认" }[r.sourceVia];
+      console.log(`按源 ${r.source} 撤销（${viaLabel}）`);
+      console.log(`撤销完成：写回 ${r.restored} 条，本轮插入的 ${r.insertsRetired} 条改为下架，期间被改过而跳过 ${r.skippedConflict.length} 条，合并链依赖未满足而保留 ${r.skippedDependency.length} 条，文字已被 forget 而保留非活跃 ${r.skippedForgotten.length} 条，不在这个源的 scope 里而没动 ${r.skippedWrongScope.length} 条`);
+      if (r.skippedWrongScope.length > 0) console.log(`  ⚠️ 不在 scope 里的 id（前 8 位，源多半选错了）: ${ids8(r.skippedWrongScope)}`);
       if (r.skippedConflict.length > 0) console.log(`  被改过而跳过的 id（前 8 位）: ${ids8(r.skippedConflict)}`);
       if (r.skippedDependency.length > 0) console.log(`  保留的合并链成员 id（它原来指向的那一行已不活跃、或本次撤销会把它撤掉，撤了会断链）: ${ids8(r.skippedDependency)}`);
       if (r.skippedForgotten.length > 0) console.log(`  文字已被 forget、没撤回活跃的 id: ${ids8(r.skippedForgotten)}`);
@@ -1984,14 +2031,15 @@ program
       return;
     }
 
-    const memSource = config.sources.memory;
+    const sourceKey = options.ledgers ? "ledgers" : "memory";
+    const memSource = config.sources[sourceKey];
     if (!memSource || memSource.path === "auto") {
-      console.error("❌ 需要在 config.json 里显式配置 sources.memory.path（当前为 auto 或未配置）");
+      console.error(`❌ 需要在 config.json 里显式配置 sources.${sourceKey}.path（当前为 auto 或未配置）`);
       process.exitCode = 2;
       return;
     }
-    const memDir = resolveSourcePath(memSource.path, "memory");
-    console.log(`记忆目录: ${memDir}`);
+    const memDir = resolveSourcePath(memSource.path, sourceKey);
+    console.log(`${options.ledgers ? "账本目录" : "记忆目录"}: ${memDir}`);
     const maxRetire = options.maxRetire !== undefined
       ? parseRequiredLimitOption(options.maxRetire, "--max-retire", 0, Number.MAX_SAFE_INTEGER)
       : undefined;
@@ -2006,6 +2054,7 @@ program
       explicitPath: true,
       apply: Boolean(options.apply),
       maxRetire,
+      source: options.ledgers ? LEDGER_DOC_SOURCE : undefined,
     });
 
     const plan = outcome.plan;
@@ -2944,6 +2993,285 @@ program
     console.log(formatDoctorResults(results));
     const hasFailure = results.some(r => r.status === "fail");
     if (hasFailure) process.exitCode = 1;
+  });
+
+// ---------------------------------------------------------------------------
+// sessions —— 会话扫描与账本（--shadow 影子模式只写影子目录；正式模式写 sources.ledgers.path，P1 ④）
+// 设计：sync-bridge AI产出/2026-10-22-RecallNest自动总结经验/plan.md（v3 节 + v2.1 D2 / D5）
+// ---------------------------------------------------------------------------
+const sessionsCmd = program
+  .command("sessions")
+  .description("会话转录扫描与账本（影子模式 / 正式模式）");
+
+function parseRootsOption(value: string | undefined): import("./sessions-sweep.js").RootSpec[] {
+  const { defaultLocalRoots, truthRoots } = require("./sessions-sweep.js") as typeof import("./sessions-sweep.js");
+  if (!value || value === "local") return defaultLocalRoots();
+  if (value === "truth") return truthRoots();
+  // source=dir[,source=dir...]
+  return value.split(",").map((pair) => {
+    const [source, dir] = pair.split("=");
+    if (!source || !dir) throw new Error(`--roots 项格式应为 source=dir，收到 ${pair}`);
+    return { source: source as import("./session-events.js").SessionSource, dir: dir.replace(/^~\//, `${require("node:os").homedir()}/`) };
+  });
+}
+
+sessionsCmd
+  .command("scan")
+  .description("只做文件发现并计时（数⑦：stat 墙钟），不解析不写")
+  .option("--roots <spec>", "local（本机四端 + MacBook agy 落点）| truth（conversation-truth）| source=dir,...", "local")
+  .option("--since-days <n>", "只数最近 N 天的文件", "30")
+  .option("--json", "JSON 输出")
+  .action(async (options) => {
+    const { discoverTranscripts } = await import("./sessions-sweep.js");
+    const roots = parseRootsOption(options.roots);
+    const sinceMs = Date.now() - Number(options.sinceDays) * 86_400_000;
+    const r = discoverTranscripts(roots, { sinceMs });
+    const by: Record<string, number> = {};
+    for (const f of r.files) by[f.source] = (by[f.source] ?? 0) + 1;
+    const out = { files: r.files.length, bySource: by, statCalls: r.statCalls, wallMs: r.wallMs, missingRoots: r.missingRoots };
+    if (options.json) console.log(JSON.stringify(out, null, 2));
+    else console.log(`发现 ${out.files} 个转录（${Object.entries(by).map(([k, v]) => `${k} ${v}`).join("，")}），stat ${out.statCalls} 次，${out.wallMs} ms${r.missingRoots.length ? `；缺目录：${r.missingRoots.join(" ")}` : ""}`);
+  });
+
+/** 收工命令 / 正式扫描遇到账本目录不归本机写时的那一行（没有标记 = 还没认领写入端；R5 Codex #2） */
+function ledgerWriterRefusal(w: { host: string; owner: string | null; path: string }, where: string): string {
+  if (w.owner === null) return `❌ 账本目录还没有写入端（${w.path} 不存在）：在要当写入端的那台机器上、仓库根目录下跑一次 bun run src/cli.ts sessions writer --claim`;
+  return `❌ 账本目录只由 ${w.owner || "（标记文件是空的）"} 写（${w.path}），本机是 ${w.host}：${where}。确实要换写入端，先停掉旧写入端的扫描，再改那个文件`;
+}
+
+sessionsCmd
+  .command("writer")
+  .description("看账本目录归哪台机器写；--claim 把本机认领成写入端（没有标记时才建；安装脚本 install 时调）")
+  .option("--claim", "认领：标记不存在就写本机主机名")
+  .action(async (options) => {
+    const { checkLedgerWriter, claimLedgerWriter } = await import("./sessions-sweep-run.js");
+    const config = loadConfig();
+    const ledgerSource = config.sources.ledgers;
+    if (!ledgerSource || ledgerSource.path === "auto") {
+      console.error("❌ 需要在 config.json 里显式配置 sources.ledgers.path（账本落点）");
+      process.exitCode = 2;
+      return;
+    }
+    const dir = resolveSourcePath(ledgerSource.path, "ledgers");
+    const r = options.claim ? claimLedgerWriter(dir) : checkLedgerWriter(dir);
+    if (r.ok) {
+      console.log(`✅ 账本目录 ${dir} 归本机（${r.host}）写${"claimed" in r && r.claimed ? "，刚认领" : ""}`);
+      return;
+    }
+    console.error(ledgerWriterRefusal(r, "本机不是写入端"));
+    process.exitCode = 2;
+  });
+
+sessionsCmd
+  .command("ledger")
+  .description("当场为一场会话写账本（收工第五步：和扫描器同一格式、同一落点；正文优先用 --body 给的）")
+  .requiredOption("--session <id>", "session id 或它的前 8 位")
+  .option("--body <file>", "当场 agent 写好的正文 JSON（- 从 stdin 读）：{oneLine, solved[], decisions[], experience[], unfinished[]}，experience 可以直接是字符串；不给就调 LLM 生成")
+  .option("--trigger <name>", "frontmatter 的 trigger：manual-收工 | precompact", "manual-收工")
+  .option("--roots <spec>", "到哪找转录：local（默认，找不到再找 truth）| truth | source=dir,...")
+  .action(async (options) => {
+    if (options.trigger !== "manual-收工" && options.trigger !== "precompact") {
+      console.error(`❌ --trigger 只认 manual-收工 或 precompact，收到 ${String(options.trigger)}`);
+      process.exitCode = 2;
+      return;
+    }
+    const { writeSessionLedgerNow } = await import("./sessions-sweep-run.js");
+    const { discoverTranscripts, truthRoots } = await import("./sessions-sweep.js");
+    const config = loadConfig();
+    // 账本提交锁与游标都在数据目录下（默认按当前目录解析）：不在仓库根目录跑，拿的就不是扫描器那把锁
+    const dirs = checkReconcilePaths(config, { requireTable: false });
+    if (!dirs.ok) {
+      console.error(`❌ ${dirs.reason}`);
+      process.exitCode = 2;
+      return;
+    }
+    const ledgerSource = config.sources.ledgers;
+    if (!ledgerSource || ledgerSource.path === "auto") {
+      console.error("❌ 需要在 config.json 里显式配置 sources.ledgers.path（账本落点）");
+      process.exitCode = 2;
+      return;
+    }
+    const { checkLedgerWriter } = await import("./sessions-sweep-run.js");
+    const writer = checkLedgerWriter(resolveSourcePath(ledgerSource.path, "ledgers"));
+    if (!writer.ok) {
+      console.error(ledgerWriterRefusal(writer, "到那台机器上、仓库根目录下跑这条命令"));
+      process.exitCode = 2;
+      return;
+    }
+    const want = String(options.session).trim();
+    const sinceMs = Date.now() - 45 * 86_400_000;
+    const find = (roots: import("./sessions-sweep.js").RootSpec[]) => discoverTranscripts(roots, { sinceMs }).files.filter((f) => f.sessionId === want || f.sessionId.startsWith(want));
+    let hits = find(parseRootsOption(options.roots ?? "local"));
+    if (hits.length === 0 && !options.roots) hits = find(truthRoots());
+    if (hits.length !== 1) {
+      console.error(hits.length === 0 ? `❌ 近 45 天的转录里找不到 session ${want}` : `❌ session ${want} 对上 ${hits.length} 个转录，给完整 id：${hits.slice(0, 5).map((h) => h.sessionId).join(" ")}`);
+      process.exitCode = 2;
+      return;
+    }
+    let body: import("./session-ledger.js").LedgerBody | null = null;
+    if (options.body) {
+      const raw = options.body === "-" ? readFileSync(0, "utf-8") : readFileSync(resolve(String(options.body)), "utf-8");
+      const j = JSON.parse(raw) as Record<string, unknown>;
+      const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((x) => x.trim()) : []);
+      const experience = (Array.isArray(j.experience) ? j.experience : []).flatMap((x) => {
+        if (typeof x === "string" && x.trim()) return [{ text: x.trim(), anchor: "", anchorSeq: null, anchorVerified: true, kind: "" }];
+        if (x && typeof x === "object" && typeof (x as { text?: unknown }).text === "string") {
+          const o = x as { text: string; kind?: unknown };
+          return [{ text: o.text.trim(), anchor: "", anchorSeq: null, anchorVerified: true, kind: typeof o.kind === "string" ? o.kind : "" }];
+        }
+        return [];
+      });
+      body = { oneLine: typeof j.oneLine === "string" ? j.oneLine.trim() : "", solved: strs(j.solved), decisions: strs(j.decisions), experience, unfinished: strs(j.unfinished) };
+    }
+    let llm: import("./llm-client.js").LLMClient | null = null;
+    if (!body) {
+      const { createLLMClient } = await import("./llm-client.js");
+      const { resolveEnv } = await import("./runtime-config.js");
+      const llmCfg = config.sessionsSweep?.llm ?? config.llm;
+      llm = llmCfg ? createLLMClient({ ...llmCfg, apiKey: resolveEnv(llmCfg.apiKey), timeoutMs: 90_000 }) : null;
+    }
+    let r: Awaited<ReturnType<typeof writeSessionLedgerNow>>;
+    try {
+      r = await writeSessionLedgerNow({
+        file: hits[0],
+        ledgerDir: resolveSourcePath(ledgerSource.path, "ledgers"),
+        stateDir: join(resolve(envDataDir()), "session-state"),
+        trigger: options.trigger === "precompact" ? "precompact" : "manual-收工",
+        body,
+        llm,
+      });
+    } catch (error) {
+      // 提交锁等不到（另一个进程卡在提交里）等：账本与游标都没动，干净地退出 3（P1 互审 R4 Kimi #4）
+      console.error(`❌ ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 3;
+      return;
+    }
+    if (r.skipped === "agent-ledger") {
+      console.log(`✅ 这场已有当场写的账本、之后没有新的用户发言，没用 LLM 版去盖它：${r.path}`);
+      return;
+    }
+    if (!r.written) {
+      console.error(`❌ 没写账本（正文生成失败：${r.failure ?? r.generator}）；已有的账本与游标都没动，扫描器之后会补。要当场写就加 --body 给正文`);
+      process.exitCode = 3;
+      return;
+    }
+    console.log(`✅ 账本：${r.path}（正文：${r.generator === "agent" ? "当场 agent 写的" : r.generator}）`);
+  });
+
+sessionsCmd
+  .command("sweep")
+  .description("扫一轮：静默会话 → 账本。给 --shadow 是影子模式；不给是正式模式（写 sources.ledgers.path，游标与心跳在数据目录）")
+  .option("--shadow <dir>", "影子输出目录（ledgers/ session-state/ sweep-log.jsonl 都写在这里）")
+  .option("--roots <spec>", "同 scan；影子模式默认 local，正式模式默认 truth（conversation-truth，两台机都在）")
+  .option("--since-days <n>", "只看最近 N 天的转录", "30")
+  .option("--idle-minutes <n>", "静默多少分钟算结束（给了就对所有端生效；不给按端默认：CC 60，其余 30）")
+  .option("--candidate-after-minutes <n>", "经验候选在最后一条消息多少分钟后才出（给了对所有端生效；不给按端默认：CC 720，其余 360）")
+  .option("--min-user-turns <n>", "少于这么多轮用户发言的会话跳过", String(3))
+  .option("--sources <list>", "只扫这些端：cc,codex,kimi,antigravity")
+  .option("--limit <n>", "本轮最多生成多少份账本（0 = 不限）", "0")
+  .option("--no-llm", "不调 LLM，只出机器抽取版账本（影子期先量覆盖与游标）")
+  .option("--candidates", "出经验候选节（默认出；正式模式下 config sessionsSweep.candidates: false 可关）")
+  .option("--no-candidates", "不出经验候选节")
+  .option("--mask-memory-writes", "回放用：隐藏当场写过的记忆，免得账本召回被灌水")
+  .option("--now <iso>", "把「现在」定在某个时刻（回放用）")
+  .option("--only <sids>", "只处理这些 session id（逗号分隔，可用前 8 位）")
+  .option("--trigger <name>", "frontmatter 的 trigger：auto-sweep | replay", "auto-sweep")
+  .option("--llm-delay-ms <n>", "两次 LLM 调用之间至少隔多少毫秒（限速余量）", "0")
+  .option("--dry-run", "只决策不写任何文件")
+  .option("--json", "结尾输出 JSON 汇总")
+  .action(async (options) => {
+    const { runSweep, SWEEP_DEFAULT_POLICY_BY_SOURCE, SWEEP_HEARTBEAT_FILE } = await import("./sessions-sweep-run.js");
+    const { SIGNATURE_INDEX_FILE } = await import("./ledger-signatures.js");
+    const config = loadConfig();
+    const sweepCfg = config.sessionsSweep ?? {};
+    const formal = !options.shadow;
+    let ledgerDir: string | undefined;
+    if (formal) {
+      // 正式模式的游标、心跳、账本提交锁都在数据目录下：与收工命令必须是同一个（同 sessions ledger 的核对）
+      const dirs = checkReconcilePaths(config, { requireTable: false });
+      if (!dirs.ok) {
+        console.error(`❌ ${dirs.reason}`);
+        process.exitCode = 2;
+        return;
+      }
+      const ledgerSource = config.sources.ledgers;
+      if (!ledgerSource || ledgerSource.path === "auto") {
+        console.error("❌ 正式模式需要在 config.json 里显式配置 sources.ledgers.path（账本落点）；只想试跑就加 --shadow <dir>");
+        process.exitCode = 2;
+        return;
+      }
+      ledgerDir = resolveSourcePath(ledgerSource.path, "ledgers");
+      // 账本目录只许一台机器写（本机提交锁管不到 Syncthing 同步进来的写入）；dry-run 什么都不写，只在标记是别的机器时拒绝
+      const { checkLedgerWriter } = await import("./sessions-sweep-run.js");
+      const writer = checkLedgerWriter(ledgerDir);
+      if (!writer.ok && !(options.dryRun && writer.owner === null)) {
+        console.error(ledgerWriterRefusal(writer, "正式扫描只在那台机器上跑"));
+        process.exitCode = 2;
+        return;
+      }
+    }
+    let llm: import("./llm-client.js").LLMClient | null = null;
+    if (options.llm !== false) {
+      const { createLLMClient } = await import("./llm-client.js");
+      const { resolveEnv } = await import("./runtime-config.js");
+      const llmCfg = sweepCfg.llm ?? config.llm;
+      llm = llmCfg ? createLLMClient({ ...llmCfg, apiKey: resolveEnv(llmCfg.apiKey), timeoutMs: 90_000 }) : null;
+      if (!llm) console.error("⚠️ config.llm 缺失或无法初始化，退回 --no-llm 行为");
+    }
+    const policyBySource: Record<string, { idleMinutes?: number; candidateAfterMinutes?: number }> = {};
+    for (const [src, p] of Object.entries(SWEEP_DEFAULT_POLICY_BY_SOURCE)) {
+      policyBySource[src] = {
+        idleMinutes: options.idleMinutes !== undefined ? Number(options.idleMinutes) : (sweepCfg.idleMinutes?.[src] ?? p.idleMinutes),
+        candidateAfterMinutes: options.candidateAfterMinutes !== undefined ? Number(options.candidateAfterMinutes) : (sweepCfg.candidateAfterMinutes?.[src] ?? p.candidateAfterMinutes),
+      };
+    }
+    // 经验候选节（D2 第二步）：默认出；config sessionsSweep.candidates: false 可关（P1 ⑥，候选精度复测 30 / 40 过线）
+    const candidates = options.candidates !== undefined ? Boolean(options.candidates) : formal ? sweepCfg.candidates !== false : true;
+    const dataDir = resolve(envDataDir());
+    const runOpts: Parameters<typeof runSweep>[0] = {
+      roots: parseRootsOption(options.roots ?? (formal ? "truth" : "local")),
+      ...(formal
+        ? { ledgerDir, stateDir: join(dataDir, "session-state"), logPath: join(dataDir, "logs", "sessions-sweep.jsonl"), heartbeatPath: join(dataDir, SWEEP_HEARTBEAT_FILE), signatureIndexPath: join(dataDir, SIGNATURE_INDEX_FILE), recallLogRoot: dataDir }
+        : { shadowDir: options.shadow.replace(/^~\//, `${require("node:os").homedir()}/`) }),
+      policy: { minUserTurns: Number(options.minUserTurns) },
+      policyBySource,
+      candidates,
+      sinceDays: Number(options.sinceDays),
+      nowMs: options.now ? Date.parse(options.now) : undefined,
+      sources: options.sources ? String(options.sources).split(",") as import("./session-events.js").SessionSource[] : undefined,
+      limit: Number(options.limit) || 0,
+      llm,
+      render: { maskMemoryWrites: !!options.maskMemoryWrites },
+      dryRun: !!options.dryRun,
+      onlySessionIds: options.only ? new Set(String(options.only).split(",").map((s) => s.trim()).filter(Boolean)) : undefined,
+      trigger: options.trigger === "replay" ? "replay" : "auto-sweep",
+      llmDelayMs: Number(options.llmDelayMs) || 0,
+      log: (line) => console.log(line),
+    };
+    // 正式模式：launchd 每 10 分钟拉一次，上一轮（LLM 慢）没跑完就跳过本轮，不叠跑
+    let result: Awaited<ReturnType<typeof runSweep>>;
+    if (formal && !options.dryRun) {
+      const { withLock } = await import("./distill-lock.js");
+      const outcome = await withLock("sessions-sweep", () => runSweep(runOpts), { onBusy: "skip", expireMs: 2 * 3_600_000 });
+      if (!outcome.ran) {
+        console.log("上一轮扫描还在跑（锁 sessions-sweep 被占），本轮跳过");
+        const { touchHeartbeatBusy } = await import("./sessions-sweep-run.js");
+        touchHeartbeatBusy(join(dataDir, SWEEP_HEARTBEAT_FILE)); // 长跑期间 doctor 看 busyAt，不误判扫描死了
+        process.exitCode = 5; // 包装脚本：既不算失败、也不清零失败计数
+        return;
+      }
+      result = outcome.result;
+    } else {
+      result = await runSweep(runOpts);
+    }
+    // 退出码给包装脚本数连续失败（P1 互审 R1 Codex #7）：4 = 本轮调了 LLM 且全失败；
+    // 6 = 本轮没调 LLM、但之前的 LLM 故障还没恢复（不清零）；0 = 正常
+    if (result.heartbeat) {
+      if (result.llmCalls > 0 && result.llmFailures >= result.llmCalls) process.exitCode = 4;
+      else if (result.llmCalls === 0 && result.heartbeat.llmFailStreak > 0) process.exitCode = 6;
+    }
+    if (options.json) console.log(JSON.stringify(result, null, 2));
+    else console.log(`发现 ${result.discovered}（stat ${result.statCalls} 次 / ${result.discoveryWallMs} ms）；决策 ${JSON.stringify(result.actions)}；写账本 ${result.ledgersWritten.length} 份；LLM ${result.llmCalls} 次（${result.llmPromptTokens}+${result.llmCompletionTokens} tokens，失败 ${result.llmFailures}）；${result.wallMs} ms`);
   });
 
 program

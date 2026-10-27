@@ -12,6 +12,7 @@ import type { DurableMemoryCategory } from "./memory-schema.js";
 import { matchesScopeFilter, type ScopeMatchMode } from "./scope-policy.js";
 import { detectEmotionIfEnabled } from "./emotion-detector.js";
 import { withWriteLock } from "./distill-lock.js";
+import { STORE_WRITE_LOCK_OPTS, STORE_WRITE_LONG_LOCK_OPTS } from "./store-write-budget.js";
 import { incrementWriteCount } from "./activity-counter.js";
 import type { MemoryStorePort, MemoryStoreStats, MemoryStoreUpdate } from "./memory-store-port.js";
 import { clearVersionGroupMetadata, planSingletonVersionGroupRepairs } from "./version-manager.js";
@@ -98,6 +99,14 @@ export interface LegacyScopeAudit {
   counts: Record<LegacyScopeIssueKind, number>;
   samples: LegacyScopeAuditSample[];
 }
+
+// ============================================================================
+// store-write lock options
+// ============================================================================
+
+// The store-write lock options live in store-write-budget.ts (the HTTP servers size their timeouts
+// from them too); re-exported here for existing callers.
+export { STORE_WRITE_LOCK_OPTS, STORE_WRITE_LONG_LOCK_OPTS };
 
 // ============================================================================
 // Deterministic ID
@@ -493,7 +502,7 @@ export class MemoryStore implements MemoryStorePort {
         // window a crash could tear). toWrite is already in-batch deduped by id above,
         // so the merge key matches ≤1 existing row (given no pre-existing dup-id rows).
         await this.table!.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute(toWrite);
-      }, { expireMs: 30_000 });
+      }, STORE_WRITE_LOCK_OPTS);
     } catch (err: any) {
       const code = err.code || "";
       const message = err.message || String(err);
@@ -560,7 +569,7 @@ export class MemoryStore implements MemoryStorePort {
           inserted: fresh.map((e) => e.id),
           skippedExisting: candidates.filter((e) => existingIds.has(e.id)).map((e) => e.id),
         };
-      }, { expireMs: 30_000 });
+      }, STORE_WRITE_LOCK_OPTS);
     } catch (err: any) {
       const code = err.code || "";
       const message = err.message || String(err);
@@ -603,7 +612,7 @@ export class MemoryStore implements MemoryStorePort {
     await this.ensureInitialized();
     await withWriteLock("store-write", async () => {
       await this.table!.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute([entry]);
-    }, { expireMs: 30_000 });
+    }, STORE_WRITE_LOCK_OPTS);
     // Per-scope write count drives dream activation. Best-effort — never block a write.
     try {
       await incrementWriteCount(entry.scope, 1, { statsPath: this.activityStatsPath() });
@@ -633,7 +642,7 @@ export class MemoryStore implements MemoryStorePort {
         .whenMatchedUpdateAll({ where: "target.timestamp <= source.timestamp" })
         .whenNotMatchedInsertAll()
         .execute([full]),
-    { expireMs: 30_000 });
+    STORE_WRITE_LOCK_OPTS);
     const written = (result?.numInsertedRows ?? 0) + (result?.numUpdatedRows ?? 0) > 0;
     if (written) {
       try {
@@ -1219,7 +1228,7 @@ export class MemoryStore implements MemoryStorePort {
       // 只更新已存在的行：锁内读完之后被不拿锁的 delete() 删掉的行不插回来
       const res = await this.table!.mergeInsert("id").whenMatchedUpdateAll().execute([updated]);
       return res.numUpdatedRows > 0 ? updated : null;
-    }, { expireMs: 30_000 });
+    }, STORE_WRITE_LOCK_OPTS);
   }
 
   /**
@@ -1289,7 +1298,7 @@ export class MemoryStore implements MemoryStorePort {
         return { status: "missing" };
       }
       return { status: "replaced", entry: updated, history };
-    }, { expireMs: 30_000 });
+    }, STORE_WRITE_LOCK_OPTS);
 
     if (result.status === "replaced") {
       // 与 upsert() 一致：历史行算一次写入，驱动 dream 激活。尽力而为，不阻塞写入。
@@ -1398,7 +1407,7 @@ export class MemoryStore implements MemoryStorePort {
       // 不能把它插回来（2026-09-24 上线前代码单审）
       const res = await this.table!.mergeInsert("id").whenMatchedUpdateAll().execute([updated]);
       return res.numUpdatedRows > 0 ? updated : null;
-    }, { expireMs: 30_000 });
+    }, STORE_WRITE_LOCK_OPTS);
 
     const prev = this.metadataPatchQueues.get(fullId) ?? Promise.resolve();
     // Isolate prior failures so one rejected patch can't wedge the queue.
@@ -1505,7 +1514,7 @@ export class MemoryStore implements MemoryStorePort {
         // 只更新已存在的行：锁内读完之后被不拿锁的 delete() 删掉的行不插回来，返回实际更新数（2026-09-24 上线前代码单审）
         const res = await this.table!.mergeInsert("id").whenMatchedUpdateAll().execute(toWrite);
         return res.numUpdatedRows;
-      }, { expireMs: 30_000 });
+      }, STORE_WRITE_LOCK_OPTS);
     }
     return written;
   }
@@ -1522,7 +1531,7 @@ export class MemoryStore implements MemoryStorePort {
   async repairSingletonVersionGroups(): Promise<number> {
     await this.ensureInitialized();
 
-    return withWriteLock("store-write", async () => {
+    return withWriteLock("store-write", async (signal) => {
       const membershipRows = await this.table!.query()
         .select(["id", "metadata"])
         .toArray();
@@ -1537,6 +1546,12 @@ export class MemoryStore implements MemoryStorePort {
       let repaired = 0;
       const BATCH = 200;
       for (let i = 0; i < repairs.length; i += BATCH) {
+        // Past its max hold: stop between batches (each batch is an independent, re-checked
+        // commit) so the lock goes back to other writers; the rest is repaired next pass.
+        if (signal.aborted) {
+          logWarn(`[store] repairSingletonVersionGroups stopped after ${repaired} of ${repairs.length} repairs: held store-write past its max hold`);
+          break;
+        }
         const batch = repairs.slice(i, i + BATCH);
         const expectedById = new Map(batch.map(item => [item.id, item.groupId]));
         const conditions = batch
@@ -1583,7 +1598,7 @@ export class MemoryStore implements MemoryStorePort {
         repaired += result.numUpdatedRows;
       }
       return repaired;
-    }, { expireMs: 30 * 60_000 });
+    }, STORE_WRITE_LONG_LOCK_OPTS);
   }
 
   async bulkDelete(scopeFilter: string[], beforeTimestamp?: number): Promise<number> {

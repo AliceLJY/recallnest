@@ -10,7 +10,7 @@ A local-first memory system backed by LanceDB that turns scattered conversation 
 
 [![GitHub](https://img.shields.io/github/stars/AliceLJY/recallnest?style=social)](https://github.com/AliceLJY/recallnest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Runtime](https://img.shields.io/badge/Runtime-Bun_|_Node.js_22+-f9f1e1?logo=bun)](https://bun.sh)
+[![Runtime](https://img.shields.io/badge/Runtime-Bun-f9f1e1?logo=bun)](https://bun.sh)
 [![LanceDB](https://img.shields.io/badge/LanceDB-Vector+FTS-orange)](https://lancedb.com)
 [![MCP](https://img.shields.io/badge/MCP-44_tools-blue)](https://modelcontextprotocol.io)
 [![CI](https://github.com/AliceLJY/recallnest/actions/workflows/ci.yml/badge.svg)](https://github.com/AliceLJY/recallnest/actions/workflows/ci.yml)
@@ -235,7 +235,7 @@ npm install -g recallnest      # install globally
 recallnest doctor
 ```
 
-Works with Node.js 22+ (via tsx) or Bun. No git clone needed.
+Requires [Bun](https://bun.sh): RecallNest does not run on Node.js. The npm launcher only hands off to Bun, and exits with install instructions if `bun` is not on your PATH. No git clone needed.
 
 ### Option C: Manual setup
 
@@ -550,19 +550,24 @@ bun run src/ui-server.ts
 
 ## What's new
 
-**v3.0** raised the runtime floor to **Node 22** (the only breaking change — Bun users are
-unaffected) and gave synthesized conclusions a road into stable memory: a `dream` insight
-can now be promoted on the strength of its own validated evidence set, instead of being
-permanently stuck on the evidence layer where nothing downstream could lean on it.
+**v4.0** runs on **Bun only** and hands its cross-process locks to the kernel. RecallNest
+used to decide a lock file was stale from its pid and timestamp and then delete it — two
+processes that saw the same stale file could both end up holding the lock (more than one
+winner in up to 30 of 40 rounds of an eight-process race). Locks are now `flock(2)`: the
+kernel releases them when a process exits or is killed, and a stress test that kills a
+writer every 15–60 ms for six seconds never sees two writers inside.
 
-It also fixed a rate-limit reply that could trigger an unbounded request storm — measured
-at over 61,000 requests in five seconds against an endpoint asking us to slow down. Found
-by the new HTTP contract tests, which drive the real client classes against a loopback
-server instead of stubbing the SDK.
+The rest of the release fixes data that could go wrong quietly: a deleted memory written
+back by a concurrent update, history rows left pointing at nothing, secrets kept in
+metadata and sent to the embedding API inside triggers, explicit searches such as
+`git push rules` or `#22` returning nothing, and write receipts that reported rejected
+writes as stored.
 
-Existing LanceDB data opens in place; there is no export or import step.
+**Upgrading:** install Bun, then stop every RecallNest process before starting v4 — old and
+new lock code must not run together. A few defaults and HTTP replies changed; the list is
+at the top of the v4.0.0 entry in the changelog. Existing LanceDB data opens in place.
 
-**Full history — v3.0 through v1.0, with the upgrade notes for each — is in
+**Full history — v4.0 through v1.0, with the upgrade notes for each — is in
 [CHANGELOG.md](CHANGELOG.md).**
 
 
