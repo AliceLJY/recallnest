@@ -57,7 +57,7 @@ describe("POST /v1/checkpoint status codes", () => {
   it("answers 503 when the save lock is held by another process past the wait", async () => {
     const busy = {
       save: async (): Promise<never> => {
-        throw new LockTimeoutError("lock 'checkpoint-save' timed out after 10000ms (held by another process)");
+        throw new LockTimeoutError(CHECKPOINT_SAVE_LOCK_KEY, 10_000, null);
       },
     };
 
@@ -65,7 +65,7 @@ describe("POST /v1/checkpoint status codes", () => {
 
     expect(response.status).toBe(503);
     const payload = (await response.json()) as { error: string };
-    expect(payload.error).toContain("lock 'checkpoint-save' timed out");
+    expect(payload.error).toContain(`lock '${CHECKPOINT_SAVE_LOCK_KEY}' timed out after 10000ms (held by another process)`);
   });
 
   it("a real wait on the checkpoint save lock times out with LockTimeoutError, same message prefix", async () => {
