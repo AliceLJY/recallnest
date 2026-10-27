@@ -322,7 +322,7 @@ describe("HTTP /v1/checkpoint", () => {
   it("handleCheckpoint mirrors after the save and before the 201, through the never-throwing wrapper", () => {
     const src = readFileSync(join(import.meta.dir, "..", "api-server.ts"), "utf-8");
     const body = src.slice(src.indexOf("async function handleCheckpoint"), src.indexOf("async function handleWorkflowObserve"));
-    const save = body.indexOf("checkpointStore.save(");
+    const save = body.indexOf("checkpoints.save(");
     const mirror = body.indexOf("mirrorCheckpointWithDeadline(");
     const respond = body.indexOf("jsonResponse(stored, 201)");
     expect(save).toBeGreaterThan(0);
