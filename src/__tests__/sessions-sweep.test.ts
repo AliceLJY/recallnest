@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { SessionDoc } from "../session-events.js";
-import { applyDecision, decide, DEFAULT_POLICY, discoverTranscripts, ledgerRelPath, SessionStateStore, sid8, stateKey, type TranscriptFile } from "../sessions-sweep.js";
+import { applyDecision, decide, DEFAULT_POLICY, discoverTranscripts, isTmpWorkdirTranscript, ledgerRelPath, SessionStateStore, sid8, stateKey, type TranscriptFile } from "../sessions-sweep.js";
 
 const MIN = 60_000;
 const NOW = Date.parse("2026-10-23T12:00:00.000Z");
@@ -27,6 +27,21 @@ describe("sweep decide()", () => {
   it("uses message time, not mtime, as the silence clock", () => {
     const d = decide(file(45), store.fresh(file(45)), NOW, DEFAULT_POLICY, () => fakeDoc({ users: 5, endedAt: new Date(NOW - 5 * MIN).toISOString() }));
     expect(d.action).toBe("not-idle");
+  });
+  it("CC 在 /tmp、/private/tmp 下跑的会话不写账本、不解析；别的目录与别的端不受影响（10-31：规则实验回放混进账本）", () => {
+    const at = (path: string, source: TranscriptFile["source"] = "cc"): TranscriptFile => ({ path, source, sessionId: "s1", mtimeMs: NOW - 60 * MIN, sizeBytes: 1 });
+    const tmp = at("/Users/user/.claude/projects/-private-tmp-rule-exp2-work/s1.jsonl");
+    let parsed = false;
+    const d = decide(tmp, store.fresh(tmp), NOW, DEFAULT_POLICY, () => { parsed = true; return fakeDoc({ users: 9, endedAt: new Date(NOW - 60 * MIN).toISOString() }); });
+    expect(d.action).toBe("skip-tmp");
+    expect(parsed).toBe(false);
+    expect(applyDecision(store.fresh(tmp), tmp, d, NOW, DEFAULT_POLICY).skipReason).toBe("skip-tmp");
+    expect(isTmpWorkdirTranscript(at("/Users/user/.claude/projects/-tmp-x/s1.jsonl"))).toBe(true);
+    expect(isTmpWorkdirTranscript(at("/Users/user/.claude/projects/-private-tmp/s1.jsonl"))).toBe(true);
+    expect(isTmpWorkdirTranscript(at("/Users/user/.claude/projects/-Users-user/s1.jsonl"))).toBe(false);
+    expect(isTmpWorkdirTranscript(at("/Users/user/.claude/projects/-Users-user-tmpl/s1.jsonl"))).toBe(false);
+    expect(isTmpWorkdirTranscript(at("/Users/user/.claude/projects/-private-tmpfoo/s1.jsonl"))).toBe(false);
+    expect(isTmpWorkdirTranscript(at("/Users/user/.codex/sessions/-private-tmp-x/s1.jsonl", "codex"))).toBe(false);
   });
   it("skips short / imported / subagent sessions and remembers why", () => {
     const f = file(60);

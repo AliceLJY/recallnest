@@ -9,6 +9,7 @@ import { checkLedgerWriter, claimLedgerWriter, commitLedger, LEDGER_COMMIT_LOCK_
 import { acquireLock, LockTimeoutError, lockPathForKey, releaseLock, withLock } from "../distill-lock.js";
 import type { SessionDoc } from "../session-events.js";
 import { appendFileSync, symlinkSync } from "node:fs";
+import { ATTRIBUTION_SYSTEM_PROMPT } from "../ledger-attribution.js";
 import { spawnSync } from "node:child_process";
 import { discoverTranscripts, SessionStateStore } from "../sessions-sweep.js";
 import { listLedgerFiles } from "../ledger-files.js";
@@ -37,10 +38,18 @@ function writeCC(dir: string, sid: string, lastMsgAgoMin: number, users = 4): st
   return p;
 }
 
-function fakeLLM(): { llm: LLMClient; calls: () => number } {
+/** 决定归属复判那一次调用：回空判定（每条都退回关键词判法），不计入账本生成次数——calls() 仍只数账本 */
+const EMPTY_JUDGEMENT = { content: '{"judgements":[]}', finishReason: "stop", responseModel: "fake", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+
+function fakeLLM(): { llm: LLMClient; calls: () => number; judgeCalls: () => number } {
   let n = 0;
+  let j = 0;
   const llm = {
-    chatLongDetailed: async () => {
+    chatLongDetailed: async (system: string) => {
+      if (system === ATTRIBUTION_SYSTEM_PROMPT) {
+        j++;
+        return EMPTY_JUDGEMENT;
+      }
       n++;
       return {
         content: JSON.stringify({ oneLine: "挪日志目录", solved: ["日志改到 ops-logs"], decisions: ["定：日志一律放 ops-logs（用户拍板）"], experience: [{ text: "自建日志放 ops-logs", anchor: "把日志挪到 ops-logs", anchorSeq: 0, kind: "偏好" }], unfinished: [] }),
@@ -50,7 +59,7 @@ function fakeLLM(): { llm: LLMClient; calls: () => number } {
       };
     },
   } as unknown as LLMClient;
-  return { llm, calls: () => n };
+  return { llm, calls: () => n, judgeCalls: () => j };
 }
 
 function env() {
@@ -290,7 +299,7 @@ describe("扫描器 LLM 失败：不推进游标、按退避重试、不拿残�
     writeCC(e.cc, "adad1111-0000-4000-8000-000000000111", 90);
     let broken = true;
     let calls = 0;
-    const llm = { chatLongDetailed: async (...a: unknown[]) => { calls++; if (broken) throw new Error("429 limit"); return (fakeLLM().llm.chatLongDetailed as (...x: unknown[]) => Promise<unknown>)(...a); } } as unknown as LLMClient;
+    const llm = { chatLongDetailed: async (...a: unknown[]) => { if (a[0] === ATTRIBUTION_SYSTEM_PROMPT) return EMPTY_JUDGEMENT; calls++; if (broken) throw new Error("429 limit"); return (fakeLLM().llm.chatLongDetailed as (...x: unknown[]) => Promise<unknown>)(...a); } } as unknown as LLMClient;
     const base = { roots: [{ source: "cc" as const, dir: e.cc }], ledgerDir: e.ledgerDir, stateDir: e.stateDir, llm, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false, render: { retries: 0 } };
     const a = await runSweep({ ...base, nowMs: NOW });
     expect(a.llmFailures).toBe(1);
