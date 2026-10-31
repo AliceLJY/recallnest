@@ -362,7 +362,10 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
         next.recallLogSid = judged.sid;
       }
       stateStore.save(next);
-      if (sweepLog) appendFileSync(sweepLog, `${JSON.stringify({ ts: new Date(nowMs).toISOString(), source: file.source, sid8: file.sessionId.slice(0, 8), action: decision.action, reason: decision.reason, userTurns: decision.summary?.userTurns ?? null, rich: decision.summary?.rich ?? null, lastMessageAt: decision.lastMessageAt ?? null, ledger: ledgerPath ? show(ledgerPath) : null, ...usageNote })}\n`);
+      // 没变化的场不写逐场日志：每 10 分钟一轮、每轮上千场都是 unchanged，一周把日志堆到 353MB（2026-10-31 量）；
+      // 这两类的个数照旧进 actions / 心跳，逐场行只留真有动作或有原因可查的
+      const quiet = decision.action === "unchanged" || (decision.action === "up-to-date" && decision.reason === "mtime unchanged, candidates done or not due");
+      if (sweepLog && !quiet) appendFileSync(sweepLog, `${JSON.stringify({ ts: new Date(nowMs).toISOString(), source: file.source, sid8: file.sessionId.slice(0, 8), action: decision.action, reason: decision.reason, userTurns: decision.summary?.userTurns ?? null, rich: decision.summary?.rich ?? null, lastMessageAt: decision.lastMessageAt ?? null, ledger: ledgerPath ? show(ledgerPath) : null, ...usageNote })}\n`);
     }
     if (needsLedger) log(`${decision.action.padEnd(18)} ${file.source.padEnd(11)} ${file.sessionId.slice(0, 8)} ${decision.reason}${ledgerPath ? ` → ${show(ledgerPath)}` : ""}`);
   }
@@ -516,19 +519,19 @@ function assertWritableLedgerDir(dir: string, host: string, shadow?: boolean): v
   const marker = findLedgerWriterMarker(dir);
   if (!marker) return;
   if (shadow) throw new Error(`影子账本的落点 ${dir} 在正式账本目录里（${marker.path}），不写`);
-  if (marker.owner !== host) throw new Error(`账本目录归 ${marker.owner || "（标记文件是空的）"} 写（${marker.path}），本机是 ${host}，不写`);
+  if (marker.owner !== host) throw new Error(`账本目录归 ${marker.owner || (marker.readError ? `（标记文件读不了：${marker.readError}）` : "（标记文件是空的）")} 写（${marker.path}），本机是 ${host}，不写`);
 }
 
 /** 账本目录里记「哪台机器写这个目录」的文件（随目录同步到别的机器，别的机器读得到） */
 export const LEDGER_WRITER_FILE = ".writer-host";
 
-export type LedgerWriterCheck = { ok: true; host: string } | { ok: false; host: string; owner: string | null; path: string };
+export type LedgerWriterCheck = { ok: true; host: string } | { ok: false; host: string; owner: string | null; path: string; readError?: string };
 
 /**
  * 从 dir 往上找最近的写入端标记（dir 不存在就从它最近的现存上级开始，按真实路径解析符号链接）。
  * 往上找是为了影子目录、符号链接、嵌套目录落进正式账本目录时也认得出来（R5 Codex #3）。
  */
-export function findLedgerWriterMarker(dir: string): { path: string; owner: string } | null {
+export function findLedgerWriterMarker(dir: string): { path: string; owner: string; readError?: string } | null {
   let d = resolve(dir);
   while (!existsSync(d) && dirname(d) !== d) d = dirname(d);
   try {
@@ -540,12 +543,14 @@ export function findLedgerWriterMarker(dir: string): { path: string; owner: stri
     const p = join(d, LEDGER_WRITER_FILE);
     if (existsSync(p)) {
       let owner = "";
+      let readError: string | undefined;
       try {
         owner = readFileSync(p, "utf-8").trim();
-      } catch {
-        /* 读不了按空的算：谁都对不上 */
+      } catch (error) {
+        // 读不了按空的算：谁都对不上。但要把原因带出去——10-23、10-27 两晚 23:50 各有两轮读成空，文件本身没变过，原因被吞了查不到
+        readError = (error as NodeJS.ErrnoException).code ?? String(error);
       }
-      return { path: p, owner };
+      return readError ? { path: p, owner, readError } : { path: p, owner };
     }
     const up = dirname(d);
     if (up === d) return null;
@@ -563,7 +568,7 @@ export function checkLedgerWriter(ledgerDir: string, opts: { host?: string } = {
   const host = opts.host ?? hostname();
   const marker = findLedgerWriterMarker(ledgerDir);
   if (!marker) return { ok: false, host, owner: null, path: join(ledgerDir, LEDGER_WRITER_FILE) };
-  return marker.owner === host ? { ok: true, host } : { ok: false, host, owner: marker.owner, path: marker.path };
+  return marker.owner === host ? { ok: true, host } : { ok: false, host, owner: marker.owner, path: marker.path, ...(marker.readError ? { readError: marker.readError } : {}) };
 }
 
 /** 显式认领账本目录（`sessions writer --claim`）：没有标记就独占创建；已经是本机照常；别的机器的不动 */

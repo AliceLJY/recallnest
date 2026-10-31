@@ -79,6 +79,19 @@ describe("runSweep 正式模式", () => {
     expect(existsSync(join(e.root, "data", "ledgers"))).toBe(false);
   });
 
+  it("第二轮没有变化：逐场日志不再追加 unchanged / up-to-date 行，个数照旧计进 actions", async () => {
+    const e = env();
+    writeCC(e.cc, "cccc3333-0000-4000-8000-000000000003", 120);
+    const { llm } = fakeLLM();
+    const opts = { roots: [{ source: "cc" as const, dir: e.cc }], ledgerDir: e.ledgerDir, stateDir: e.stateDir, logPath: e.logPath, heartbeatPath: e.heartbeatPath, nowMs: NOW, llm, policyBySource: SWEEP_DEFAULT_POLICY_BY_SOURCE, candidates: false };
+    await runSweep(opts);
+    const before = readFileSync(e.logPath, "utf-8");
+    const second = await runSweep({ ...opts, nowMs: NOW + 600_000 });
+    const quietCount = (second.actions["unchanged"] ?? 0) + (second.actions["up-to-date"] ?? 0);
+    expect(quietCount).toBe(1);
+    expect(readFileSync(e.logPath, "utf-8")).toBe(before);
+  });
+
   it("没给 shadowDir 也没给 ledgerDir + stateDir：报错", async () => {
     await expect(runSweep({ roots: [], llm: null })).rejects.toThrow("shadowDir");
   });
@@ -740,6 +753,12 @@ describe("R4 R3 修复：锁忙不改写主心跳、doctor 按配置找心跳、
     expect(readFileSync(join(dir, LEDGER_WRITER_FILE), "utf-8")).toBe("mini\n");
     // 标记文件不是账本：不进账本列表（对账导入与签名索引都按它）
     expect(listLedgerFiles(dir)).toEqual([]);
+  });
+  it("标记文件读不了：照旧拒写，但把读错的原因带出来，不再只说「标记文件是空的」（10-23、10-27 两晚原因被吞）", () => {
+    const dir = join(mkdtempSync(join(tmpdir(), "rn-writer-err-")), "ledgers");
+    mkdirSync(join(dir, LEDGER_WRITER_FILE), { recursive: true }); // 同名目录：existsSync 为真、readFileSync 抛 EISDIR
+    const r = checkLedgerWriter(dir, { host: "mini" });
+    expect(r).toMatchObject({ ok: false, host: "mini", owner: "", readError: "EISDIR" });
   });
   it("两台机器各自的副本都还没有标记（Syncthing 还没同步过来）：收工命令与正式扫描都不会自己认领（R5 Codex #2 的反例）", () => {
     const mini = join(mkdtempSync(join(tmpdir(), "rn-writer-a-")), "ledgers");
