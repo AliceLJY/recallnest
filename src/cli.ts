@@ -3034,9 +3034,9 @@ sessionsCmd
   });
 
 /** 收工命令 / 正式扫描遇到账本目录不归本机写时的那一行（没有标记 = 还没认领写入端；R5 Codex #2） */
-function ledgerWriterRefusal(w: { host: string; owner: string | null; path: string }, where: string): string {
+function ledgerWriterRefusal(w: { host: string; owner: string | null; path: string; readError?: string }, where: string): string {
   if (w.owner === null) return `❌ 账本目录还没有写入端（${w.path} 不存在）：在要当写入端的那台机器上、仓库根目录下跑一次 bun run src/cli.ts sessions writer --claim`;
-  return `❌ 账本目录只由 ${w.owner || "（标记文件是空的）"} 写（${w.path}），本机是 ${w.host}：${where}。确实要换写入端，先停掉旧写入端的扫描，再改那个文件`;
+  return `❌ 账本目录只由 ${w.owner || (w.readError ? `（标记文件读不了：${w.readError}）` : "（标记文件是空的）")} 写（${w.path}），本机是 ${w.host}：${where}。确实要换写入端，先停掉旧写入端的扫描，再改那个文件`;
 }
 
 sessionsCmd
