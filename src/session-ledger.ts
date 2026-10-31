@@ -17,6 +17,7 @@ import { redactSecrets } from "./pii-detector.js";
 import { extractErrorSignatures } from "./error-signature.js";
 import { classifySignatureSpecificity } from "./error-signature-specificity.js";
 import { isHookInterceptionText } from "./ledger-signatures.js";
+import { judgeDecisionAttribution, renderJudgedDecision, type DecisionItem } from "./ledger-attribution.js";
 import { summarizeSession, type SessionDoc, type SessionEvent, type SessionSummary } from "./session-events.js";
 
 export interface LedgerExperience {
@@ -460,26 +461,59 @@ export const DECISION_UNVERIFIED_NOTE = "（归属没核，按助手提议看）
  * 30 场里 5 场至少一位读者判「把助手建议写成用户拍板」）。旧格式（纯字符串）照收，但一律标「归属没核」——
  * 否则 LLM 只要退回旧格式、在字符串里自己写「（用户拍板）」，就绕过了原话核对（P1 互审 R4 Codex #3）。
  */
-export function parseDecisions(v: unknown, doc: SessionDoc): string[] {
+export function parseDecisionItems(v: unknown): DecisionItem[] {
   if (!Array.isArray(v)) return [];
-  const out: string[] = [];
+  const out: DecisionItem[] = [];
   for (const item of v) {
     if (typeof item === "string") {
-      if (item.trim()) out.push(`${item.trim()}${DECISION_UNVERIFIED_NOTE}`);
+      if (item.trim()) out.push({ text: item.trim(), by: "旧格式", anchor: "" });
       continue;
     }
     if (!item || typeof item !== "object") continue;
     const it = item as { text?: unknown; by?: unknown; anchor?: unknown };
     if (typeof it.text !== "string" || !it.text.trim()) continue;
-    const text = it.text.trim();
-    const anchor = typeof it.anchor === "string" ? it.anchor.trim() : "";
-    if (it.by === "用户") {
-      out.push(anchor && verifyAnchor(doc, anchor, null, { userOnly: true }).verified ? `${text}（用户原话：「${anchor}」）` : `${text}（用户原话没核到，按助手提议看）`);
-    } else {
-      out.push(`${text}（助手的取舍）`);
-    }
+    out.push({ text: it.text.trim(), by: it.by === "用户" ? "用户" : "助手", anchor: typeof it.anchor === "string" ? it.anchor.trim() : "" });
   }
   return out;
+}
+
+/** 关键词判法（LLM 复判失败时的退路） */
+export function renderDecisionByKeyword(item: DecisionItem, doc: SessionDoc): string {
+  if (item.by === "旧格式") return `${item.text}${DECISION_UNVERIFIED_NOTE}`;
+  if (item.by === "用户") {
+    return item.anchor && verifyAnchor(doc, item.anchor, null, { userOnly: true }).verified ? `${item.text}（用户原话：「${item.anchor}」）` : `${item.text}（用户原话没核到，按助手提议看）`;
+  }
+  return `${item.text}（助手的取舍）`;
+}
+
+export function parseDecisions(v: unknown, doc: SessionDoc): string[] {
+  return parseDecisionItems(v).map((it) => renderDecisionByKeyword(it, doc));
+}
+
+/**
+ * 决定的归属交 LLM 再判一次（ledger-attribution.ts，10-31 ⑤ 超线后换的做法）；复判拿不到结果就保留关键词判法。
+ * 返回新的 decisions 与多花的 token；content 解析不出 decisions 时原样返回 null。
+ */
+async function rejudgeDecisions(content: string, doc: SessionDoc, llm: LLMClient): Promise<{ decisions: string[]; promptTokens: number; completionTokens: number } | null> {
+  let raw: unknown;
+  try {
+    raw = (JSON.parse(content.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")) as { decisions?: unknown }).decisions;
+  } catch {
+    return null;
+  }
+  const items = parseDecisionItems(raw);
+  if (items.length === 0) return null;
+  const judged = await judgeDecisionAttribution(doc, items, llm);
+  if (!judged) return null;
+  if (judged.judgements.every((j) => j === null)) return null;
+  return {
+    decisions: items.map((it, i) => {
+      const j = judged.judgements[i];
+      return j ? renderJudgedDecision(doc, it, j) : renderDecisionByKeyword(it, doc);
+    }),
+    promptTokens: judged.promptTokens,
+    completionTokens: judged.completionTokens,
+  };
 }
 
 export function parseLedgerJson(raw: string, doc: SessionDoc): LedgerBody {
@@ -512,6 +546,8 @@ export interface GenerateLedgerOptions extends RenderTranscriptOptions {
   /** 429 / 超时类错误的重试次数（默认 3）与退避起点毫秒（默认 8000，逐次翻倍） */
   retries?: number;
   retryBaseMs?: number;
+  /** 决定归属交 LLM 复判（默认开）；false 只用关键词判法 */
+  attribution?: boolean;
 }
 
 /** 账本 JSON 的输出上限：回放（P0 / P1 复测）用的就是 2600，生产对齐它（P1 互审 R1 Kimi #8：此前生产默认 1800） */
@@ -553,6 +589,21 @@ export async function generateLedgerBody(doc: SessionDoc, llm: LLMClient, opts: 
   if (!result?.content) return { body: null, usage: null, failure: "llm returned empty (breaker open or null content)", rendered };
   const usage: LedgerUsage = { model: result.responseModel, promptTokens: result.usage?.promptTokens ?? 0, completionTokens: result.usage?.completionTokens ?? 0, wallMs, inputChars: rendered.text.length };
   const finish = (body: LedgerBody): LedgerBody => (includeCandidates ? body : { ...body, experience: [] });
+  const withAttribution = async (body: LedgerBody, content: string): Promise<LedgerBody> => {
+    if (opts.attribution === false || body.decisions.length === 0) return body;
+    const r = await rejudgeDecisions(content, doc, llm);
+    if (!r) return body;
+    usage.promptTokens += r.promptTokens;
+    usage.completionTokens += r.completionTokens;
+    return { ...body, decisions: r.decisions };
+  };
+  let parsedBody: LedgerBody | null = null;
+  try {
+    parsedBody = parseLedgerJson(result.content, doc);
+  } catch {
+    parsedBody = null;
+  }
+  if (parsedBody) return { body: finish(await withAttribution(parsedBody, result.content)), usage, rendered };
   try {
     return { body: finish(parseLedgerJson(result.content, doc)), usage, rendered };
   } catch (error) {
@@ -562,7 +613,7 @@ export async function generateLedgerBody(doc: SessionDoc, llm: LLMClient, opts: 
       if (fix?.content) {
         usage.promptTokens += fix.usage?.promptTokens ?? 0;
         usage.completionTokens += fix.usage?.completionTokens ?? 0;
-        return { body: finish(parseLedgerJson(fix.content, doc)), usage, rendered };
+        return { body: finish(await withAttribution(parseLedgerJson(fix.content, doc), fix.content)), usage, rendered };
       }
     } catch {
       /* fall through */

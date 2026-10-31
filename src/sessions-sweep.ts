@@ -13,7 +13,7 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { parseSessionFile, sessionIdFromPath, summarizeSession, type SessionDoc, type SessionSource, type SessionSummary } from "./session-events.js";
 
@@ -64,6 +64,16 @@ export interface DiscoveryResult {
 }
 
 /** 四端的文件发现规则（与 session-events 的路径判据一致） */
+/**
+ * CC 把工作目录编码进项目目录名（/private/tmp/x → -private-tmp-x）。只认 CC：Codex / Kimi 等的转录路径里没有工作目录，
+ * 要判得先解析会话头，这里不做（10-31 实测混进账本的 20 场全是 CC）。
+ */
+export function isTmpWorkdirTranscript(file: Pick<TranscriptFile, "path" | "source">): boolean {
+  if (file.source !== "cc") return false;
+  const project = basename(dirname(file.path));
+  return /^-(private-)?tmp(-|$)/.test(project);
+}
+
 export function discoverTranscripts(roots: RootSpec[], opts: { sinceMs?: number } = {}): DiscoveryResult {
   const t0 = performance.now();
   const files: TranscriptFile[] = [];
@@ -164,6 +174,8 @@ export type SweepAction =
   | "skip-short"
   | "skip-imported"
   | "skip-subagent"
+  /** CC 在 /tmp 或 /private/tmp 下跑的会话：规则实验回放、派出去的一次性任务，不是人在聊（10-31 抽样 40 条里 8 条来自这里） */
+  | "skip-tmp"
   | "skip-no-timestamp"
   | "ledger"
   | "ledger+candidates"
@@ -260,6 +272,7 @@ export function decide(
     if (state.skipReason) return { action: "unchanged", reason: `still ${state.skipReason}` };
   }
 
+  if (isTmpWorkdirTranscript(file)) return { action: "skip-tmp", reason: "CC session started under /tmp" };
   const doc = parse();
   const summary = summarizeSession(doc);
   if (doc.importedSource) return { action: "skip-imported", reason: `imported ${doc.importedSource}`, doc, summary };
@@ -310,6 +323,7 @@ export function applyDecision(state: SessionState, file: TranscriptFile, decisio
     case "skip-short":
     case "skip-imported":
     case "skip-subagent":
+    case "skip-tmp":
     case "skip-no-timestamp":
       next.skipReason = decision.action;
       break;
