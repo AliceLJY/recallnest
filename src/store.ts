@@ -1488,7 +1488,7 @@ export class MemoryStore implements MemoryStorePort {
   async patchMetadataBatch(
     patches: Array<{
       id: string;
-      patchFn: (meta: Record<string, unknown>, entry: MemoryEntry) => Record<string, unknown>;
+      patchFn: (meta: Record<string, unknown>, entry: MemoryEntry) => Record<string, unknown> | null;
     }>,
     scopeFilter?: string[],
   ): Promise<number> {
@@ -1537,6 +1537,8 @@ export class MemoryStore implements MemoryStorePort {
           };
           try {
             const patched = patchFn(meta, entry);
+            // null：调用方看过锁内最新行后决定不改这一行（如 auto-gc 复判不再满足归档条件），不写、不计数
+            if (patched === null) continue;
             toWrite.push({ ...entry, metadata: JSON.stringify(patched) });
           } catch (err) {
             console.error(`[patchMetadataBatch] patchFn failed for ${id}, skipping: ${err instanceof Error ? err.message : String(err)}`);
