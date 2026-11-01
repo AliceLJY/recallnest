@@ -4,6 +4,8 @@ import { basename, join, resolve } from "node:path";
 
 import { metaDir } from "./compat.js";
 import { withWriteLock } from "./distill-lock.js";
+import { redactSecrets } from "./pii-detector.js";
+import { logInfo } from "./stderr-log.js";
 import type { SessionCheckpointRecord } from "./session-schema.js";
 import { SessionCheckpointRecordSchema } from "./session-schema.js";
 import { isFallbackSummary, normalizeCheckpointScope, type CheckpointQuality } from "./session-engine.js";
@@ -18,6 +20,142 @@ export function classifyCheckpointQuality(record: SessionCheckpointRecord): Chec
 /** File name a checkpoint is saved under (updatedAt with ":" and "." made file-safe, then the id). */
 export function checkpointFileName(record: Pick<SessionCheckpointRecord, "updatedAt" | "checkpointId">): string {
   return `${record.updatedAt.replace(/[:.]/g, "-")}-${record.checkpointId}.json`;
+}
+
+/**
+ * Per-field length caps of SessionCheckpointRecordSchema for the free-text fields, in
+ * the schema's own unit (UTF-16 code units, `String.length`). A placeholder can be
+ * longer than the secret it replaces (`pwd=12345678` → `pwd=[REDACTED:password]`), so
+ * a field pushed past its cap is shortened back to it instead of failing the save.
+ * Pinned to the schema by a test.
+ */
+export const CHECKPOINT_REDACTED_FIELD_CAPS = {
+  summary: 600,
+  task: 240,
+  decisions: 200,
+  openLoops: 200,
+  nextActions: 200,
+  entities: 120,
+  files: 220,
+} as const;
+
+type CheckpointRedactedField = keyof typeof CHECKPOINT_REDACTED_FIELD_CAPS;
+
+const PLACEHOLDER = /\[REDACTED(?::[a-z_]+)?\]/g;
+const TYPED_PLACEHOLDER = /\[REDACTED:[a-z_]+\]/g;
+/** What sits right before a placeholder and means nothing without it: `key=`, `"key": "`, `scheme://`. */
+const PLACEHOLDER_LEAD = /(?:["']?[A-Za-z][A-Za-z0-9_-]*["']?\s*[=:]\s*["']?|[a-z][a-z0-9+.-]*:\/\/)$/i;
+
+/**
+ * Names the generic rules would otherwise eat in a checkpoint: they are how the next
+ * window finds its way back (a session id, a file named sk-…), not credentials.
+ * Each is masked before redaction and put back after, so the rules never see it.
+ * - `sessionId=<uuid>` / `session_id: <uuid>`: only `id`, and only a plain UUID value —
+ *   `session_token=…` and any other value still go through sensitive_assignment.
+ * - `sk-` followed by two or more short all-lowercase words (`sk-checkpoint-redaction-design`):
+ *   a kebab-case name, while a real key's random tail mixes digits and case.
+ */
+const CHECKPOINT_PROTECTED_NAMES: readonly RegExp[] = [
+  /\bsession[_-]?id["']?\s*[=:]\s*["']?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi,
+  /(?<![A-Za-z0-9])sk(?:-[a-z]{2,20}){2,}(?![A-Za-z0-9_-])/g,
+];
+const MASK_OPEN = "";
+const MASK_CLOSE = "";
+
+/**
+ * The same `redactSecrets` the mirror uses, narrowed for checkpoint text: ordinary dotted
+ * names (`checkpoint.sessionstore.integration`) are kept via `keepIdentifiers`, and the
+ * names in CHECKPOINT_PROTECTED_NAMES are masked first. pii-detector itself is unchanged,
+ * so the mirror and every other caller redact exactly as before.
+ */
+function redactCheckpointText(value: string): string {
+  if (value.includes(MASK_OPEN) || value.includes(MASK_CLOSE)) {
+    // Text already carrying the mask characters: skip the protection rather than risk a mix-up.
+    return redactSecrets(value, { keepIdentifiers: true }).text;
+  }
+  const kept: string[] = [];
+  let masked = value;
+  for (const pattern of CHECKPOINT_PROTECTED_NAMES) {
+    pattern.lastIndex = 0;
+    masked = masked.replace(pattern, (match) => {
+      kept.push(match);
+      return `${MASK_OPEN}${kept.length - 1}${MASK_CLOSE}`;
+    });
+  }
+  const redacted = redactSecrets(masked, { keepIdentifiers: true }).text;
+  return redacted.replace(
+    new RegExp(`${MASK_OPEN}(\\d+)${MASK_CLOSE}`, "g"),
+    (_match, index: string) => kept[Number(index)] ?? "",
+  );
+}
+
+/** Largest cut ≤ `at` that does not split a surrogate pair. */
+function safeCut(text: string, at: number): number {
+  if (at <= 0 || at >= text.length) return Math.max(0, Math.min(at, text.length));
+  const before = text.charCodeAt(at - 1);
+  return before >= 0xd800 && before <= 0xdbff ? at - 1 : at;
+}
+
+/**
+ * Bring a redacted field back under its cap, losing as little as possible:
+ * 1. collapse typed placeholders to the short `[REDACTED]`, done locally and only on
+ *    overflow (pii-detector has no short-placeholder option and is not changed for this);
+ * 2. if still too long, cut at the cap without splitting a surrogate pair; a cut that would
+ *    land inside a placeholder drops that placeholder whole, with its `key=` lead.
+ * A real cut is logged with the field name and how many characters were dropped.
+ */
+function fitToCap(text: string, cap: number, field: CheckpointRedactedField): string {
+  if (text.length <= cap) return text;
+  const short = text.replace(TYPED_PLACEHOLDER, "[REDACTED]");
+  if (short.length <= cap) return short;
+
+  let cut = safeCut(short, cap);
+  PLACEHOLDER.lastIndex = 0;
+  for (let m = PLACEHOLDER.exec(short); m; m = PLACEHOLDER.exec(short)) {
+    const start = m.index;
+    const end = start + m[0].length;
+    if (start >= cut) break;
+    if (end > cut) {
+      const lead = PLACEHOLDER_LEAD.exec(short.slice(0, start));
+      cut = start - (lead ? lead[0].length : 0);
+      break;
+    }
+  }
+  const out = short.slice(0, cut).trimEnd();
+  logInfo(
+    `[checkpoint-redact] ${field}: redaction pushed it past ${cap} chars; dropped ${short.length - out.length} trailing chars`,
+  );
+  return out;
+}
+
+function redactField(value: string, field: CheckpointRedactedField): string {
+  const redacted = redactCheckpointText(value);
+  if (redacted === value) return value;
+  return fitToCap(redacted, CHECKPOINT_REDACTED_FIELD_CAPS[field], field);
+}
+
+function redactList(items: string[], field: CheckpointRedactedField): string[] {
+  return items.map((item) => redactField(item, field));
+}
+
+/**
+ * Scrub secrets from every free-text field of a checkpoint so the JSON file on disk only
+ * ever holds placeholders (see redactCheckpointText for what is deliberately kept).
+ * Identifier fields (sessionId, scope, idempotencyKey, checkpointId, resolvedScope,
+ * updatedAt) are left alone: they name the file and the record, and rewriting them
+ * would change which checkpoint a save replaces.
+ */
+export function redactCheckpointRecord(record: SessionCheckpointRecord): SessionCheckpointRecord {
+  return {
+    ...record,
+    summary: redactField(record.summary, "summary"),
+    ...(record.task !== undefined ? { task: redactField(record.task, "task") } : {}),
+    decisions: redactList(record.decisions, "decisions"),
+    openLoops: redactList(record.openLoops, "openLoops"),
+    nextActions: redactList(record.nextActions, "nextActions"),
+    entities: redactList(record.entities, "entities"),
+    files: redactList(record.files, "files"),
+  };
 }
 
 /** Named write lock held while a checkpoint file is published and older same-id files are removed. */
@@ -83,12 +221,18 @@ export class SessionCheckpointStore {
   }
 
   /**
-   * Write the new version to a temp file, rename it into place, and only then remove
-   * older files with the same checkpointId. Any failure throws, so a failed save never
+   * Secrets in the free-text fields are replaced with `[REDACTED:<type>]` first (see
+   * redactCheckpointRecord). Then write the new version to a temp file, rename it into
+   * place, and only then remove older files with the same checkpointId. Any failure throws, so a failed save never
    * deletes the previous version and is never reported as a success.
    */
   async save(record: SessionCheckpointRecord): Promise<SessionCheckpointRecord> {
-    const parsed = SessionCheckpointRecordSchema.parse(record);
+    // Redact before the final parse: the parse re-collapses whitespace and re-dedupes
+    // list items that redaction made identical. The returned record is the redacted one,
+    // so callers (managed observation, mirror, HTTP response) never see the raw text.
+    const parsed = SessionCheckpointRecordSchema.parse(
+      redactCheckpointRecord(SessionCheckpointRecordSchema.parse(record)),
+    );
     const dir = this.dataDir;
     // Publication and the same-id sweep run under one cross-process lock: without it two
     // processes saving the same id could each rename their file in, then each delete the
