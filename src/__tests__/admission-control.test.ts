@@ -285,19 +285,22 @@ describe("describeRejectionReason", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Source guard: production entry points do not inject a rate limiter (task Z)
+// Rate limiter is off by default: behaviour + source guard (task Z)
 // ---------------------------------------------------------------------------
 
 /**
  * 「每 scope 每分钟 50 条」只在调用方注入 ScopeRateLimiter 时生效，而生产入口一个都不传——
- * 文档已改成「可选注入、默认未启用」。这条守卫防止有人悄悄接上：接上会改写入行为，要另议，
- * 届时连同这条守卫与文档一起改。
+ * 文档已改成「可选注入、默认未启用」。下面两条一起防止有人悄悄接上（接上会改写入行为，要另议，
+ * 届时连同这些用例与文档一起改）：
  *
- * 扫 src/（不含测试）、scripts/、eval/ 下的 .ts：
- *   - 不出现 `new ScopeRateLimiter`
- *   - 不出现 `rateLimiter:` / `rateLimiter =` / `{ rateLimiter }` 这样的赋值、传参
- *     （capture-engine 里的可选字段声明 `rateLimiter?:` 除外）
- *   - checkAdmission 只在 capture-engine.ts（转交 deps.rateLimiter）与 pivot-apply.ts（第 4 个参数写死 undefined）调用
+ * 1. 行为：不传 limiter 连续调 checkAdmission 60 次（超过默认的 50），全部 accepted。
+ *    这是「默认未启用」的直接证据——在 admission-control.ts 里藏一个模块级单例当默认值，源码守卫未必认得出，这条一定红。
+ * 2. 源码守卫：扫 src/（不含测试）、scripts/、eval/ 下的 .ts，**admission-control.ts 也扫**，只豁免
+ *    `rateLimiter?:` 这种可选字段 / 参数声明行；`//`、`/*`、`*` 开头的注释行跳过。以下任一出现就红：
+ *    - `new ScopeRateLimiter`
+ *    - `rateLimiter:` / `rateLimiter =` / `??=` / `||=` / `{ …, rateLimiter }` 简写
+ *    - 带引号的属性：`deps["rateLimiter"]`、`"rateLimiter":`
+ *    - checkAdmission 在 capture-engine.ts（转交 deps.rateLimiter）与 pivot-apply.ts（第 4 个参数写死 undefined）以外被调用
  */
 const REPO_ROOT = join(import.meta.dir, "..", "..");
 const SCAN_DIRS = ["src", "scripts", "eval"];
@@ -316,16 +319,30 @@ function productionSources(): Array<{ path: string; text: string }> {
   return out;
 }
 
+/** 注释行与 `rateLimiter?:` 声明行去掉之后剩下的代码。 */
+function codeLines(text: string): string {
+  return text
+    .split("\n")
+    .filter((line) => {
+      const t = line.trim();
+      if (t.startsWith("//") || t.startsWith("/*") || t.startsWith("*")) return false;
+      if (/^(?:readonly\s+)?rateLimiter\?\s*:/.test(t)) return false;
+      return true;
+    })
+    .join("\n");
+}
+
 /** 返回违规描述；空数组 = 没有接上限流器。 */
 function rateLimiterWiring(path: string, text: string): string[] {
   const hits: string[] = [];
-  if (path === "src/admission-control.ts") return hits; // 定义处
-  if (/new\s+ScopeRateLimiter\b/.test(text)) hits.push(`${path}: constructs ScopeRateLimiter`);
-  // `rateLimiter:` / `rateLimiter =` 赋值或对象字面量传参；`rateLimiter?:` 是可选字段声明，放行
-  if (/\brateLimiter\s*(?::|=(?!=))/.test(text)) hits.push(`${path}: sets rateLimiter`);
-  // 对象字面量简写 `{ store, rateLimiter }`
-  if (/[{,]\s*rateLimiter\s*[,}]/.test(text)) hits.push(`${path}: passes rateLimiter by shorthand`);
-  const calls = [...text.matchAll(/\bcheckAdmission\s*\(([^;]*?)\);/gs)].map((m) => m[1]);
+  const code = codeLines(text);
+  if (/new\s+ScopeRateLimiter\b/.test(code)) hits.push(`${path}: constructs ScopeRateLimiter`);
+  if (/\brateLimiter\s*(?::|\?\?=|\|\|=|=(?!=))/.test(code)) hits.push(`${path}: sets rateLimiter`);
+  if (/[{,]\s*rateLimiter\s*[,}]/.test(code)) hits.push(`${path}: passes rateLimiter by shorthand`);
+  if (/\[\s*["'`]rateLimiter["'`]\s*\]|["'`]rateLimiter["'`]\s*:/.test(code)) {
+    hits.push(`${path}: uses a quoted rateLimiter property`);
+  }
+  const calls = [...code.matchAll(/(?<!function\s+)\bcheckAdmission\s*\(([^;]*?)\);/gs)].map((m) => m[1]);
   for (const args of calls) {
     if (path === "src/capture-engine.ts" && /deps\.rateLimiter\s*\?\?\s*undefined/.test(args)) continue;
     if (path === "src/pivot-apply.ts" && /^[^,]+,[^,]+,[^,]+,\s*undefined\s*,/.test(args)) continue;
@@ -334,22 +351,48 @@ function rateLimiterWiring(path: string, text: string): string[] {
   return hits;
 }
 
-describe("rate limiter is not wired into production (source guard)", () => {
-  it("no production source constructs, passes or assigns a rate limiter", () => {
+describe("rate limiter is off by default", () => {
+  it("60 calls to checkAdmission without a limiter on one scope are all accepted (default cap is 50)", () => {
+    const verdicts = Array.from({ length: 60 }, (_, i) =>
+      checkAdmission(`distinct valid memory number ${i}`, 0.8, "project:rate-default").verdict,
+    );
+    expect(verdicts.filter((v) => v !== "accepted")).toEqual([]);
+  });
+
+  it("no production source (admission-control.ts included) constructs, passes or assigns a rate limiter", () => {
     const files = productionSources();
-    // 扫描确实扫到了两个调用点，不是空跑
-    expect(files.map((f) => f.path)).toEqual(expect.arrayContaining(["src/capture-engine.ts", "src/pivot-apply.ts", "src/mcp-tools-core.ts"]));
+    // 扫描确实扫到了定义处和两个调用点，不是空跑
+    expect(files.map((f) => f.path)).toEqual(expect.arrayContaining([
+      "src/admission-control.ts", "src/capture-engine.ts", "src/pivot-apply.ts", "src/mcp-tools-core.ts",
+    ]));
     expect(files.flatMap((f) => rateLimiterWiring(f.path, f.text))).toEqual([]);
   });
 
-  it("the detector catches the ways it could be wired (calibration)", () => {
-    expect(rateLimiterWiring("src/x.ts", "const l = new ScopeRateLimiter();")).not.toEqual([]);
-    expect(rateLimiterWiring("src/x.ts", "persistMemory({ store, embedder, rateLimiter: shared }, input);")).not.toEqual([]);
-    expect(rateLimiterWiring("src/x.ts", "persistMemory({ store, rateLimiter }, input);")).not.toEqual([]);
-    expect(rateLimiterWiring("src/x.ts", "deps.rateLimiter = limiter;")).not.toEqual([]);
-    expect(rateLimiterWiring("src/x.ts", "checkAdmission(text, 0.5, scope, limiter);")).not.toEqual([]);
+  it("the detector catches the ways it could be wired and skips declarations and comments (calibration)", () => {
+    const caught = [
+      "const l = new ScopeRateLimiter();",
+      "const SHARED = new ScopeRateLimiter();\nexport function checkAdmission(text: string, rateLimiter: ScopeRateLimiter | undefined = SHARED) {}",
+      "persistMemory({ store, embedder, rateLimiter: shared }, input);",
+      "persistMemory({ store, rateLimiter }, input);",
+      "deps.rateLimiter = limiter;",
+      "rateLimiter ??= SHARED;",
+      'deps["rateLimiter"] = limiter;',
+      "persistMemory({ ...deps, ['rateLimiter']: limiter }, input);",
+      'persistMemory({ "rateLimiter": limiter }, input);',
+      "checkAdmission(text, 0.5, scope, limiter);",
+    ];
+    for (const snippet of caught) expect(rateLimiterWiring("src/x.ts", snippet)).not.toEqual([]);
     expect(rateLimiterWiring("src/pivot-apply.ts", "checkAdmission(text, imp, PIVOT_SCOPE, limiter, cfg);")).not.toEqual([]);
-    expect(rateLimiterWiring("src/pivot-apply.ts", "checkAdmission(text, imp, PIVOT_SCOPE, undefined, cfg);")).toEqual([]);
-    expect(rateLimiterWiring("src/capture-engine.ts", "  rateLimiter?: ScopeRateLimiter | null;")).toEqual([]);
+
+    const allowed = [
+      "checkAdmission(text, imp, PIVOT_SCOPE, undefined, cfg);",
+      "  rateLimiter?: ScopeRateLimiter | null;",
+      "  rateLimiter?: ScopeRateLimiter,",
+      "// e.g. persistMemory({ rateLimiter: new ScopeRateLimiter() }, input)",
+      "/* rateLimiter: new ScopeRateLimiter() */",
+      " * const limiter = new ScopeRateLimiter();",
+      "export function checkAdmission(\n  text: string,\n  rateLimiter?: ScopeRateLimiter,\n): AdmissionResult {\n  const cfg = resolveAdmissionConfig(config);\n  if (rateLimiter && !rateLimiter.check(scope, cfg)) return REJECTED;\n}",
+    ];
+    for (const snippet of allowed) expect(rateLimiterWiring("src/pivot-apply.ts", snippet)).toEqual([]);
   });
 });
