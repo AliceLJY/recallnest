@@ -95,6 +95,17 @@ export interface RetrievalConfig {
    * Hard cutoff after rerank: discard results below this score.
    * Applied after all scoring stages (rerank, recency, importance, length norm).
    * Higher = fewer but more relevant results. (default: 0.35)
+   *
+   * Scope: this is only the floor for categories that are NOT keys of the
+   * active category map (`categoryMinScores`, or DEFAULT_CATEGORY_MIN_SCORES
+   * when unset). The default map lists all six durable categories, so in
+   * practice hardMinScore only reaches legacy categories (preference / fact /
+   * decision / entity / other). Changing it does not move the floor of
+   * profile / preferences / entities / events / cases / patterns — set
+   * `categoryMinScores` for that. This is intended, not a bug: the 2026-08-22
+   * shadow run attributed only 13.5% of drops to hard_min (vs 79.4% for
+   * applyLayerAdmission) and rejected widening admission; pinned by
+   * `retriever-category-min-score.test.ts`.
    */
   hardMinScore: number;
   /**
@@ -135,6 +146,11 @@ export interface RetrievalConfig {
    * Per-category score thresholds. When a result's category matches a key,
    * that threshold is used instead of hardMinScore. Categories not listed
    * fall back to hardMinScore. (default: see DEFAULT_CATEGORY_MIN_SCORES)
+   *
+   * A configured map REPLACES the default map as a whole (no per-key merge):
+   * a partial map sends every unlisted category to hardMinScore. The
+   * writing / debug / fact-check profiles set their own complete map
+   * (retrieval-profiles.ts), which overrides a value set in config.json.
    */
   categoryMinScores?: Record<string, number>;
   /** Enable Retrieval Interference Filter (RIF) — demotes near-duplicate weak results. Default: false. */
