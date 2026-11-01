@@ -101,8 +101,12 @@ export class EntityResolver {
       if (alias === canonical) continue; // skip identity mappings
       const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       // Always use word boundary to prevent matching inside other words
-      // (e.g. "pt" inside "typescript")
-      const re = new RegExp(`\\b${escaped}\\b`, "gi");
+      // (e.g. "pt" inside "typescript"). \b alone still treats "." as a boundary, so the
+      // extension in a filename ("retriever.ts", "app.js") would be rewritten to
+      // "retriever.typescript" and the exact token BM25 needs is lost. A dot glued to a word
+      // character on the far side makes the alias part of a dotted token, not a standalone
+      // word; a sentence-ending dot ("I use ts.") still counts as a boundary.
+      const re = new RegExp(`(?<!\\w\\.)\\b${escaped}\\b(?!\\.\\w)`, "gi");
       result = result.replace(re, canonical);
     }
     return result;
