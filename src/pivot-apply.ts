@@ -36,6 +36,7 @@ import {
 import { assignDefaultConfidence } from "./confidence-tracker.js";
 import { detectLang, tokenizeFts } from "./language-hook.js";
 import { scanForPII, redactSecrets } from "./pii-detector.js";
+import { MIN_MEMORY_TEXT_UNITS, weightedTextLength } from "./text-length.js";
 import {
   EvidenceCoordinateSchema,
   EvidenceWindowSchema,
@@ -70,7 +71,10 @@ const KIND_CATEGORY: Record<PivotKind, "cases" | "events" | "preferences"> = {
 export const PivotCandidateInputSchema = z
   .object({
     kind: PivotKindSchema,
-    text: z.string().min(10).max(4000),
+    // 最短长度与 checkAdmission 同一口径（text-length.ts：汉字算 2），否则准入放行的「我是左撇子」在这里抛 ZodError
+    text: z.string().max(4000).refine((t) => weightedTextLength(t) >= MIN_MEMORY_TEXT_UNITS, {
+      message: `text must be at least ${MIN_MEMORY_TEXT_UNITS} units long (CJK characters count as 2)`,
+    }),
     anchor: z.string().min(1).max(2000),
     canonicalKey: z.string().min(1).max(120),
     evidence: z.array(z.string().min(1).max(4000)).max(16),
