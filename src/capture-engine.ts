@@ -803,19 +803,31 @@ export async function writeDurableEntry(
       : { entry: existing, disposition: "deduped" as const };
     const isLiveSameText = (row: MemoryEntry) =>
       isActiveMemory(row.metadata) && normalizeMemoryText(row.text) === normalizedIncomingText;
+    // 窗口外的行要过和窗口内一样的判定（R1 Codex P1 / R3 Codex，2026-11-01）。先按 findCanonicalMatches 同一套资格认它：
+    // 同 scope（id 已含 scope）、durable 层、活跃、key 相同——evidence 行、历史行、别的 key 的行都不算 canonical 同 key，
+    // 照旧走下面的同文 / 替换。认了之后与扫描命中那条路逐一对应：
+    //   跨类别（同文异文都算）→ 冲突；晋升、同槽位 → 追加来源不改正文（promoted）；晋升、不同槽位 → 冲突；
+    //   其余（同类别同文 → deduped / promoted，非晋升异文 → 原位替换）照旧。改前这条路只有同文和替换两种去向。
+    const canonicalRow =
+      rowAtTargetId &&
+      isActiveMemory(rowAtTargetId.metadata) &&
+      extractBoundaryMetadata(rowAtTargetId.metadata)?.layer === "durable" &&
+      extractCanonicalKey(rowAtTargetId.metadata) === params.canonicalKey
+        ? rowAtTargetId
+        : null;
+    if (canonicalRow && canonicalRow.category !== params.category && deps.conflictStore) {
+      return await openCrossCategoryConflict(deps.conflictStore, params, canonicalRow);
+    }
     if (rowAtTargetId && isLiveSameText(rowAtTargetId)) {
       return await sameText(rowAtTargetId);
     }
-    // 窗口外的活跃行要过和窗口内一样的冲突判定（R1 Codex P1，2026-11-01）：改前这条路直接归档替换，
-    // 跨类别同 key、晋升到不同槽位的偏好都会绕过上面的 conflict 分支；同 scope 过滤之后，
-    // 「窗口内只剩别的 scope 的同 key 行」的写入也会走到这里，所以这条路不能再少一道闸。
-    // 同类别、同槽位、非晋升的异文照旧往下走原位替换（latest-wins 语义不变）。
-    if (rowAtTargetId && isActiveMemory(rowAtTargetId.metadata) && deps.conflictStore) {
-      if (rowAtTargetId.category !== params.category) {
-        return await openCrossCategoryConflict(deps.conflictStore, params, rowAtTargetId);
+    if (canonicalRow && canonicalRow.category === params.category && params.promotedFrom && conflictPolicy === "latest-wins") {
+      if (shouldAutoCollapsePromotionConflict(params, canonicalRow)) {
+        const entry = await appendPromotionObservationToExistingEntry(deps.store, canonicalRow, params.metadata);
+        return { entry, disposition: "promoted" };
       }
-      if (params.promotedFrom && conflictPolicy === "latest-wins" && !shouldAutoCollapsePromotionConflict(params, rowAtTargetId)) {
-        return await openPromotionConflict(deps.conflictStore, params, rowAtTargetId);
+      if (deps.conflictStore) {
+        return await openPromotionConflict(deps.conflictStore, params, canonicalRow);
       }
     }
     const atomic = atomicBeliefDeps(deps);

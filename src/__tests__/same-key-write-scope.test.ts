@@ -458,6 +458,55 @@ describe("本 scope 的旧行落在扫描窗口外、窗口内只有别的 scope
     expect(snapshot(await store.getById(p0.id))).toEqual(aBefore);
   }, 60_000);
 
+  it("跨类别同 key 同文：窗口外仍是冲突，不是 deduped（R3 Codex）", async () => {
+    const { store, deps } = makeDeps({ withConflictStore: true });
+    const a = await persistMemory(deps, {
+      text: "Primary editor is Neovim", category: "preferences", scope: A, source: "manual", canonicalKey: "editor",
+    });
+    await persistMemory(deps, { text: "Neovim on the build box", category: "entities", scope: B, source: "manual", canonicalKey: "editor" });
+    const aBefore = snapshot(await store.getById(a.id));
+    blindListToScope(store, A);
+    const write = await persistMemory(deps, {
+      text: "Primary editor is Neovim", category: "entities", scope: A, source: "manual", canonicalKey: "editor",
+    });
+    expect(write.disposition).toBe("conflict");
+    expect(snapshot(await store.getById(a.id))).toEqual(aBefore);
+  }, 60_000);
+
+  it("晋升同 key、同槽位异文：窗口外与窗口内一样只追加来源、不改正文（R3 Codex）", async () => {
+    const { store, deps } = makeDeps({ withConflictStore: true });
+    const p0 = await persistMemory(deps, {
+      text: "User prefers concise, direct replies.", category: "preferences", scope: A, source: "manual", canonicalKey: "user.reply.style",
+    });
+    await persistMemory(deps, { text: "User prefers long replies.", category: "preferences", scope: B, source: "manual", canonicalKey: "user.reply.style" });
+    blindListToScope(store, A);
+    const evidence = await seedEvidence(store, "[用户] 直接说，简短点。", "s-slot");
+    const promoted = await promoteMemory(deps, {
+      memoryId: evidence.id, text: "User prefers direct and concise answers.", category: "preferences", scope: A, canonicalKey: "user.reply.style",
+    });
+    expect(promoted.disposition).toBe("promoted");
+    expect(promoted.id).toBe(p0.id);
+    const row = await store.getById(p0.id);
+    expect(row!.text).toBe("User prefers concise, direct replies.");
+    expect(row!.metadata).toContain(evidence.id);
+  }, 60_000);
+
+  it("evidence 行恰好坐在 deterministicId(A, key) 上（key = 原正文）：不算 canonical 同 key，晋升照旧原位替换成功（R3 Codex N1）", async () => {
+    const { store, deps } = makeDeps({ withConflictStore: true });
+    const text = "用户喜欢深色主题";
+    const evidence = await store.store({
+      id: deterministicId(A, text),
+      text, vector: [1, 2, 3], category: "events", scope: A, importance: 0.5,
+      metadata: JSON.stringify({ source: "cc", boundary: { layer: "evidence", authority: "transcript-ingest", conflictPolicy: "append-only", originalCategory: "preferences" } }),
+    });
+    const promoted = await promoteMemory(deps, {
+      memoryId: evidence.id, text: "用户喜欢深色主题，编辑器和终端都要暗色。", category: "preferences", scope: A, canonicalKey: text,
+    });
+    expect(promoted.disposition).toBe("promoted");
+    expect(promoted.conflictId).toBeUndefined();
+    expect((await store.getById(deterministicId(A, normalizeCanonicalKey(text))))!.text).toBe("用户喜欢深色主题，编辑器和终端都要暗色。");
+  }, 60_000);
+
   it("对照：窗口外的同 scope 同类别异文修订照旧原位替换（updated 语义不变）", async () => {
     const { store, deps } = makeDeps({ withConflictStore: true });
     const a = await persistMemory(deps, {
