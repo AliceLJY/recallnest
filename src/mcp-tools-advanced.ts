@@ -948,7 +948,7 @@ registerTool(
           type: z.enum(["text", "tool_use", "tool_result"]),
           name: z.string().optional(),
           id: z.string().optional(),
-          input: z.record(z.unknown()).optional(),
+          input: z.record(z.string(), z.unknown()).optional(),
           content: z.string().optional(),
           text: z.string().optional(),
           tool_use_id: z.string().optional(),
