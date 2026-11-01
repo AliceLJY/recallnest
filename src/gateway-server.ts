@@ -36,10 +36,20 @@
  *   RECALLNEST_GATEWAY_FILE_ROOTS  optional, enables GET /files/search
  *                                  format: name=/abs/path,name=/abs/path
  *   RECALLNEST_GATEWAY_RG          path to ripgrep (default: rg on PATH)
+ *   RECALLNEST_GATEWAY_LOG         access log path (default ~/.config/recallnest/gateway-access.log)
+ *
+ * Public-door hardening (2026-11-01, after a read-only audit of the office page next door):
+ *   - A per-address budget runs BEFORE auth, so an anonymous flood cannot burn CPU or fill the
+ *     log; the address is the last X-Forwarded-For entry (the one the funnel proxy appended) or
+ *     the socket peer. Only the first few auth failures per address and window are logged.
+ *   - The log rotates at 5 MB (one .1 copy), so it can never eat the disk.
+ *   - /health without a token says only that the gateway is up and read-only; the route list
+ *     and file scopes are for callers that hold the token.
+ *   - Upstream errors go to the log, not to the caller.
  */
 
 import { timingSafeEqual, randomUUID } from "node:crypto";
-import { readFileSync, appendFile, existsSync, statSync } from "node:fs";
+import { readFileSync, appendFile, existsSync, statSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, isAbsolute } from "node:path";
 import { execFile } from "node:child_process";
@@ -55,7 +65,10 @@ const RATE_WINDOW_MS = 60_000;
 const MAX_RESPONSE_BYTES = 256 * 1024;
 const MAX_REQUEST_BYTES = 64 * 1024;
 const RG = envConfig.gatewayRgRaw()?.trim() || "rg";
-const LOG_FILE = join(HOME, ".config", "recallnest", "gateway-access.log");
+const LOG_FILE = envConfig.gatewayLogRaw()?.trim() || join(HOME, ".config", "recallnest", "gateway-access.log");
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+const ADDR_MAX = 60; // anonymous requests per address per minute, counted before auth
+const AUTH_LOG_PER_ADDR = 3; // auth failures logged per address per window; the rest are silent
 
 function clampInt(raw: string | undefined, fallback: number, min: number, max: number): number {
   const n = Number(raw);
@@ -131,11 +144,31 @@ function rateOk(): boolean {
   return true;
 }
 
+// Per-address budget, applied before the token is even looked at.
+interface AddrRecord { start: number; n: number; authLogged: number }
+const addrHits = new Map<string, AddrRecord>();
+function clientAddress(request: Request, peer: string | undefined): string {
+  const forwarded = (request.headers.get("x-forwarded-for") || "").split(",").map((s) => s.trim()).filter(Boolean);
+  return forwarded.at(-1) || peer || "unknown";
+}
+function addrBudget(addr: string, now: number): AddrRecord {
+  if (addrHits.size > 5_000) for (const [k, r] of addrHits) if (now - r.start >= RATE_WINDOW_MS) addrHits.delete(k);
+  if (addrHits.size > 20_000) addrHits.clear();
+  let rec = addrHits.get(addr);
+  if (!rec || now - rec.start >= RATE_WINDOW_MS) { rec = { start: now, n: 0, authLogged: 0 }; addrHits.set(addr, rec); }
+  rec.n++;
+  return rec;
+}
+
+let logWrites = 0;
 function log(entry: Record<string, unknown>): void {
+  if (++logWrites % 100 === 0) {
+    try { if (statSync(LOG_FILE).size > LOG_MAX_BYTES) renameSync(LOG_FILE, LOG_FILE + ".1"); } catch { /* no file yet, or rotation lost a race: both fine */ }
+  }
   appendFile(LOG_FILE, JSON.stringify(entry) + "\n", () => {});
 }
 
-function json(status: number, body: unknown): Response {
+function json(status: number, body: unknown, extra: Record<string, string> = {}): Response {
   let payload = JSON.stringify(body);
   if (payload.length > MAX_RESPONSE_BYTES) {
     payload = JSON.stringify({ error: "response too large", limit: MAX_RESPONSE_BYTES });
@@ -143,7 +176,7 @@ function json(status: number, body: unknown): Response {
   }
   return new Response(payload, {
     status,
-    headers: { "content-type": "application/json; charset=utf-8" },
+    headers: { "content-type": "application/json; charset=utf-8", "x-content-type-options": "nosniff", "cache-control": "no-store", ...extra },
   });
 }
 
@@ -200,15 +233,26 @@ const server = Bun.serve({
   // the connection while the handler still commits.
   idleTimeout: HTTP_WRITE_IDLE_TIMEOUT_S,
   hostname: HOST,
-  async fetch(request) {
+  async fetch(request, server) {
     const id = randomUUID().slice(0, 8);
     const url = new URL(request.url);
     const { pathname } = url;
     const method = request.method;
     const base = { id, at: new Date().toISOString(), path: pathname, method };
 
-    // liveness probe needs no token, and reveals nothing but shape
+    // Anonymous budget first: a flood from one address is answered with 429 before any work, and logged once.
+    const now = Date.now();
+    const rec = addrBudget(clientAddress(request, server.requestIP(request)?.address), now);
+    if (rec.n > ADDR_MAX) {
+      if (rec.n === ADDR_MAX + 1) log({ ...base, r: "addr-rate" });
+      return json(429, { error: "too many requests" }, { "retry-after": String(Math.ceil((RATE_WINDOW_MS - (now - rec.start)) / 1000)) });
+    }
+
+    const authed = authOk(request.headers.get("authorization"));
+
+    // liveness probe needs no token; without one it says only that the door is up and read-only
     if (method === "GET" && pathname === "/health") {
+      if (!authed) return json(200, { ok: true, readOnly: true });
       return json(200, {
         ok: true,
         readOnly: true,
@@ -218,8 +262,8 @@ const server = Bun.serve({
       });
     }
 
-    if (!authOk(request.headers.get("authorization"))) {
-      log({ ...base, r: "auth" });
+    if (!authed) {
+      if (rec.authLogged < AUTH_LOG_PER_ADDR) { rec.authLogged++; log({ ...base, r: "auth" }); }
       return json(401, { error: "unauthorized" });
     }
     if (!rateOk()) {
@@ -265,7 +309,8 @@ const server = Bun.serve({
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       log({ ...base, r: "err", msg: message });
-      return json(502, { error: "gateway error", detail: message });
+      // The message may name internal hosts and paths; the caller gets the request id to quote instead.
+      return json(502, { error: "gateway error", id });
     }
   },
 });
