@@ -1,7 +1,9 @@
 import { describe, expect, it } from "bun:test";
 
 import {
+  admissionLength,
   checkAdmission,
+  describeRejectionReason,
   resolveAdmissionConfig,
   ScopeRateLimiter,
 } from "../admission-control.js";
@@ -202,5 +204,80 @@ describe("checkAdmission — happy path", () => {
     );
     expect(result.verdict).toBe("accepted");
     expect(result.reason).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// admissionLength — CJK characters count as 2 units (task Z, 2026-11-01)
+// ---------------------------------------------------------------------------
+
+describe("checkAdmission — CJK-weighted minimum length", () => {
+  // owner 定的五个样例：下限数字不动（10），改计数口径
+  it("「我对花生过敏」(6 字 = 12) is accepted", () => {
+    expect(checkAdmission("我对花生过敏", 0.8, "project:test")).toEqual({ verdict: "accepted" });
+  });
+
+  it("「我是左撇子」(5 字 = 10, exactly the floor) is accepted", () => {
+    expect(checkAdmission("我是左撇子", 0.8, "project:test")).toEqual({ verdict: "accepted" });
+  });
+
+  it("「女儿生日是三月五号」(9 字 = 18) is accepted", () => {
+    expect(checkAdmission("女儿生日是三月五号", 0.8, "project:test")).toEqual({ verdict: "accepted" });
+  });
+
+  it("「hi」(2) is still rejected as too short", () => {
+    expect(checkAdmission("hi", 0.8, "project:test")).toEqual({ verdict: "rejected", reason: "text_too_short" });
+  });
+
+  it("「Alice likes tea」(15) is accepted, unchanged", () => {
+    expect(checkAdmission("Alice likes tea", 0.8, "project:test")).toEqual({ verdict: "accepted" });
+  });
+
+  it("four CJK characters (8 units) are still too short", () => {
+    expect(checkAdmission("我爱吃辣", 0.8, "project:test")).toEqual({ verdict: "rejected", reason: "text_too_short" });
+  });
+
+  it("CJK punctuation does not count double: 4 字 + 「。」 = 9 is rejected", () => {
+    expect(checkAdmission("我爱吃辣。", 0.8, "project:test")).toEqual({ verdict: "rejected", reason: "text_too_short" });
+  });
+
+  it("short Chinese boilerplate that now clears the length floor is still caught by the noise filter", () => {
+    expect(checkAdmission("好的好的好的", 0.8, "project:test")).toEqual({ verdict: "rejected", reason: "noise_detected" });
+  });
+});
+
+describe("admissionLength", () => {
+  it("counts ASCII as 1 per character", () => {
+    expect(admissionLength("Alice likes tea")).toBe(15);
+    expect(admissionLength("hi")).toBe(2);
+  });
+
+  it("counts Han, kana and Hangul as 2 per character", () => {
+    expect(admissionLength("我是左撇子")).toBe(10);
+    expect(admissionLength("ひらがな")).toBe(8);
+    expect(admissionLength("カタカナ")).toBe(8);
+    expect(admissionLength("한국어")).toBe(6);
+  });
+
+  it("counts CJK / fullwidth punctuation as 1", () => {
+    expect(admissionLength("。，、！？「」")).toBe(7);
+  });
+
+  it("counts by code point: an Extension-B ideograph (surrogate pair) is 2, an emoji is 1", () => {
+    expect(admissionLength("𠀀")).toBe(2);
+    expect(admissionLength("🎉")).toBe(1);
+  });
+
+  it("mixed text adds up per character", () => {
+    expect(admissionLength("用 Bun 跑")).toBe(2 + 1 + 3 + 1 + 2);
+  });
+});
+
+describe("describeRejectionReason", () => {
+  it("text_too_short says it is below the minimum length and how CJK is counted", () => {
+    const text = describeRejectionReason("text_too_short");
+    expect(text).toContain("below the minimum length of 10 units");
+    expect(text).toContain("CJK characters count as 2");
+    expect(text).not.toContain("noise");
   });
 });

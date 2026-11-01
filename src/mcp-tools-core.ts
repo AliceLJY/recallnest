@@ -86,7 +86,7 @@ export function registerCoreTools(deps: ToolRegistryDeps): void {
 
 registerTool(
   "store_memory",
-  "Store a durable memory when the user shares a stable preference, identity fact, project entity, reusable pattern, or solved case that should survive future windows. Do not use this for transient task state; use it only for memory worth keeping.",
+  "Store a durable memory when the user shares a stable preference, identity fact, project entity, reusable pattern, or solved case that should survive future windows. Do not use this for transient task state; use it only for memory worth keeping. Text shorter than 10 units is rejected (each CJK character counts as 2, other characters as 1), so \"我是左撇子\" is accepted but \"hi\" is not.",
   {
     text: z.string().min(1).max(4000).describe("Memory text to store"),
     category: DurableMemoryCategorySchema.default("events").describe("Durable memory category"),

@@ -5,7 +5,8 @@
  * 拦截低质量记忆，避免垃圾进库再过滤。
  *
  * 4 层准入检查：
- *   1. 最短文本长度 — 过短文本拒绝
+ *   1. 最短文本长度 — 过短文本拒绝。按 admissionLength() 计：汉字 / 假名 / 谚文每个算 2 个单位，
+ *      其余字符（按 code point）每个算 1 个，所以「我是左撇子」= 10 过线，「hi」= 2 仍被拒。
  *   2. Noise filter — 噪声模式前置过滤
  *   3. Importance 下限 — 低 importance 拒绝
  *   4. Scope 写入频率限制 — 防 flood
@@ -19,7 +20,7 @@ import { logInfo } from "./stderr-log.js";
 // ============================================================================
 
 export interface AdmissionConfig {
-  /** Minimum text length to accept (default: 10) */
+  /** Minimum text length to accept, measured by admissionLength() (default: 10) */
   minTextLength: number;
   /** Enable noise-filter pre-check (default: true) */
   noiseFilterEnabled: boolean;
@@ -62,6 +63,46 @@ export interface AdmissionResult {
 }
 
 const ACCEPTED: AdmissionResult = { verdict: "accepted" };
+
+// ============================================================================
+// Length measure — CJK counts double
+// ============================================================================
+
+/**
+ * 汉字（含扩展区）、平假名、片假名、谚文按 2 个单位计。标点、全角符号不在这几个 script 里，
+ * 照常按 1 计。用 Unicode script 属性而不是码位区间，扩展区与兼容区的汉字不会漏。
+ */
+const DOUBLE_WIDTH_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+
+/**
+ * 准入最短长度用的长度：汉字 / 假名 / 谚文每个 2，其余每个 code point 1。
+ * 一个中文字承载的信息约等于两三个英文字母，按 UTF-16 计会把「我对花生过敏」这类短事实挡掉。
+ * 按 code point 而不是 UTF-16 下标计：扩展区汉字（代理对）算一个字、2 个单位，emoji 算 1。
+ */
+export function admissionLength(text: string): number {
+  let units = 0;
+  for (const ch of text) {
+    units += DOUBLE_WIDTH_SCRIPT.test(ch) ? 2 : 1;
+  }
+  return units;
+}
+
+/**
+ * 回执里给人看的拒绝原因说明。`reason` 枚举值照旧原样给出，这里只附一句话。
+ * 数字取默认配置：会出回执的入口（store_memory / batch_store）都不覆盖准入配置。
+ */
+export function describeRejectionReason(reason: RejectionReason): string {
+  switch (reason) {
+    case "text_too_short":
+      return `below the minimum length of ${DEFAULT_CONFIG.minTextLength} units; CJK characters count as 2, other characters as 1`;
+    case "noise_detected":
+      return "matched the noise filter (greeting, filler or boilerplate)";
+    case "importance_too_low":
+      return `importance below the floor of ${DEFAULT_CONFIG.minImportance}`;
+    case "rate_limited":
+      return "too many writes to this scope within the rate window";
+  }
+}
 
 // ============================================================================
 // Rate Limiter — per-scope write frequency tracking
@@ -136,8 +177,9 @@ export function checkAdmission(
 
   // Layer 1: minimum text length
   const trimmed = text.trim();
-  if (trimmed.length < cfg.minTextLength) {
-    logInfo(`[admission-control] rejected: text too short (${trimmed.length} < ${cfg.minTextLength})`);
+  const length = admissionLength(trimmed);
+  if (length < cfg.minTextLength) {
+    logInfo(`[admission-control] rejected: text too short (${length} < ${cfg.minTextLength} units)`);
     return { verdict: "rejected", reason: "text_too_short" };
   }
 
