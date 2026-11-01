@@ -19,7 +19,9 @@ const DENIAL_PATTERNS = [
   /i don'?t have access to/i,
   // Chinese denial patterns (synced from upstream)
   /我没有(任何)?(相关)?(信息|数据|记忆|记录)/,
-  /我不(太)?确定/,
+  // 「我不确定」只认说话人开口就说的那一句（可带一个很短的开场如「抱歉，」），且后面不是「的」：
+  // 「遇到我不确定的 API 行为，先查文档」是规则正文、不是否认句（2026-11-01）
+  /^(?:[^，,。！？!?\n]{1,6}[，,]\s*)?我不(太)?确定(?!的)/,
   /我不记得/,
   /我想不起来/,
   /我没(有)?找到/,
@@ -44,9 +46,11 @@ const META_QUESTION_PATTERNS = [
   /我(跟你)?说过.*吗/,
 ];
 
-// Session boilerplate (anchored to prevent false positives on real content)
+// Session boilerplate (anchored to prevent false positives on real content).
+// Start-anchored rules here also only apply up to UTTERANCE_MAX_LENGTH (see isNoise()).
 const BOILERPLATE_PATTERNS = [
-  /^(hi|hello|hey|good morning|good evening|greetings)\b/i,
+  // 问候词后面要跟空白 / 标点 / 结尾：\b 会把「Hello-Agent 项目…」这类连字符名也当成问候
+  /^(hi|hello|hey|good morning|good evening|greetings)(?=$|[\s,.!?~，。！？、])/i,
   /^fresh session/i,
   /^new session/i,
   /^HEARTBEAT/i,
@@ -54,7 +58,8 @@ const BOILERPLATE_PATTERNS = [
   /^(早上好|早安|午安|晚上好|晚安)[!！\s,.，。]?$/,
   /^(嗨|哈[喽啰]|哈[喽啰]呀)[!！\s,.，。]?$/,
   /^(嗯|哦|噢|呃)[!！\s,.，。]?$/,
-  /^新(会话|对话|聊天)/,
+  // 「新会话」只认整句（可带「开始了」与结尾标点）；「新会话启动时先调 resume_context…」是正文
+  /^新(会话|对话|聊天)(开始了?)?[!！\s,.，。~]*$/,
 ];
 
 // Short boilerplate: only noise when total text is very short
@@ -73,8 +78,11 @@ const UTTERANCE_MAX_LENGTH = 200;
 // OpenClaw v3.2+ injected metadata headers (backport from v1.0.29)
 const METADATA_HEADER_PATTERNS = [
   /^Conversation info \(untrusted metadata\)/i,
-  /^---\s*\n\s*\{[\s\S]*?\}\s*\n\s*---/m, // YAML-like JSON blocks
-  /^\[?\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^\]]*\]?\s*$/m, // bare timestamps
+  // 下面两条锚定全文（不带 /m）：整段只有这块 / 这个时间戳才算噪声。带 /m 时正文里任意一行
+  // 以 ISO 时间戳开头的日志（`2026-10-05T16:38:03Z ERROR …`）就会让整条记忆在检索端消失（2026-11-01）
+  /^---\s*\n\s*\{[\s\S]*\}\s*\n\s*---\s*$/, // YAML-like JSON block, whole text
+  // bare timestamp, whole text: `[2026-10-05T16:38:03 GMT+8]` or `2026-10-05T16:38:03.123Z`
+  /^(?:\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^\]\n]*\]|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\S*)\s*$/,
 ];
 
 // Diagnostic artifact patterns (synced from upstream v1.1.0-beta.3)
@@ -172,7 +180,7 @@ export function isNoise(text: string, options: NoiseFilterOptions = {}): boolean
     return true;
   }
   if (opts.filterBoilerplate) {
-    if (BOILERPLATE_PATTERNS.some(p => p.test(trimmed))) {
+    if (isShortUtterance && BOILERPLATE_PATTERNS.some(p => p.test(trimmed))) {
       logInfo(`[INFO] noise-filter: boilerplate filtered: "${redactForLog(trimmed)}..."`);
       return true;
     }
