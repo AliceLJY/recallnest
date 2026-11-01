@@ -455,6 +455,7 @@ describe("本 scope 的旧行落在扫描窗口外、窗口内只有别的 scope
       memoryId: evidence.id, text: "User prefers long, detailed replies.", category: "preferences", scope: A, canonicalKey: "user.reply.style",
     });
     expect(promoted.disposition).toBe("conflict");
+    expect(promoted.id).toBe(p0.id); // 冲突对象是 A 自己的行，不是 B（R3 Grok：少了这条会假绿）
     expect(snapshot(await store.getById(p0.id))).toEqual(aBefore);
   }, 60_000);
 
