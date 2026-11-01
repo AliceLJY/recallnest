@@ -1,7 +1,7 @@
 [
   {
     "name": "store_memory",
-    "description": "Store a durable memory when the user shares a stable preference, identity fact, project entity, reusable pattern, or solved case that should survive future windows. Do not use this for transient task state; use it only for memory worth keeping.",
+    "description": "Store a durable memory when the user shares a stable preference, identity fact, project entity, reusable pattern, or solved case that should survive future windows. Do not use this for transient task state; use it only for memory worth keeping. Text shorter than 10 units is rejected (each CJK character counts as 2, other characters as 1), so \"我是左撇子\" is accepted but \"hi\" is not.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -1583,7 +1583,7 @@
   },
   {
     "name": "batch_store",
-    "description": "Store multiple memories in a single call with deduplication. Side effect: persists up to 20 entries. Use when you have several facts to store at once, more efficient than repeated store_memory calls.",
+    "description": "Store multiple memories in a single call with deduplication. Side effect: persists up to 20 entries. Use when you have several facts to store at once, more efficient than repeated store_memory calls. Each text shorter than 10 units is rejected (each CJK character counts as 2, other characters as 1).",
     "inputSchema": {
       "type": "object",
       "properties": {
