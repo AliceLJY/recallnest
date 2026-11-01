@@ -964,10 +964,10 @@ registerTool(
     const { store, embedder } = getComponents();
     const { llm } = getComponents();
     const kgExtractor = getKGExtractor();
-    const { distillSession } = await import("./session-distiller.js");
+    const { distillSession, normalizeDistillMessages } = await import("./session-distiller.js");
 
     const result = await distillSession(
-      messages,
+      normalizeDistillMessages(messages),
       { llm, store, embedder, conflictStore, kgExtractor },
       { scope, preserveRecent, keepRecentTools, persist },
     );

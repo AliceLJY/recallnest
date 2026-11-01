@@ -41,7 +41,6 @@ import type { KGStore } from "./kg-store.js";
 import { isKGModeEnabled } from "./kg-extractor.js";
 import { detectEntities } from "./query-entity-detector.js";
 import { buildGraph, pprTraverse } from "./ppr-traversal.js";
-import { logInfo } from "./stderr-log.js";
 import { AUDIT_RETRIEVED_CAP, type AuditLogger } from "./audit-log.js";
 import { parseEmotion, isEmotionScoringEnabled } from "./memory-schema.js";
 import { parseNarrative, isNarrativeModeEnabled } from "./narrative-schema.js";
@@ -2322,7 +2321,8 @@ export class MemoryRetriever {
     }
 
     // Evolution chain expansion — walk supersedes/supersededBy links
-    if (this.store.getById) {
+    // typeof, not truthiness: the declared type always has getById, but test doubles may not.
+    if (typeof this.store.getById === "function") {
       const store = this.store;
       deps.expandViaEvolution = async (results) => {
         const expanded: RetrievalResult[] = [];
@@ -2343,7 +2343,8 @@ export class MemoryRetriever {
     }
 
     // Cluster member expansion — get sourceMemories from cluster insights
-    if (this.store.getById) {
+    // typeof, not truthiness: the declared type always has getById, but test doubles may not.
+    if (typeof this.store.getById === "function") {
       const store = this.store;
       deps.expandViaClusters = async (results) => {
         const expanded: RetrievalResult[] = [];

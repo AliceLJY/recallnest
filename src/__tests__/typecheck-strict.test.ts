@@ -2,6 +2,7 @@
  * CLAUDE.md §1 says "TypeScript strict, no any". These tests make that a checked fact:
  *  1. a fixture proves MCP tool handlers get their argument types from the zod schema
  *     (they were implicit `any` while registerTool's types came from `Parameters<server.tool>`);
+ *  2. the whole of `src/` (tests excluded, as in tsconfig.json) type-checks with zero errors.
  * CI also runs `bunx tsc --noEmit`; this keeps `bun test` red locally for the same regression.
  */
 import { describe, expect, it } from "bun:test";
@@ -42,4 +43,15 @@ describe("TypeScript strict", () => {
     ]);
     expect(errors).toEqual([]);
   }, 60_000);
+
+  it("src/ type-checks with zero errors under tsconfig.json", () => {
+    const parsed = loadCompilerOptions();
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.options.strict).toBe(true);
+    expect(parsed.fileNames.length).toBeGreaterThan(100);
+    expect(parsed.fileNames.some((f) => f.includes("__tests__"))).toBe(false);
+    const program = ts.createProgram(parsed.fileNames, parsed.options);
+    const errors = formatDiagnostics(ts.getPreEmitDiagnostics(program));
+    expect(errors).toEqual([]);
+  }, 120_000);
 });

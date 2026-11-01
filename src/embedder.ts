@@ -9,6 +9,17 @@
  */
 
 import OpenAI from "openai";
+
+/**
+ * Request body for embeddings.create. `encoding_format: "float"` is a literal so the SDK's
+ * float overload (number[] embeddings) is the one that applies, not the base64 one (string).
+ * `task` / `normalized` are Jina extensions the OpenAI types do not know about.
+ */
+type EmbeddingPayload = OpenAI.EmbeddingCreateParams & {
+  encoding_format: "float";
+  task?: string;
+  normalized?: boolean;
+};
 import { createHash } from "node:crypto";
 import { smartChunk } from "./chunker.js";
 import { logInfo, logWarn } from "./stderr-log.js";
@@ -292,8 +303,8 @@ export class Embedder {
     }
   }
 
-  private buildPayload(input: string | string[], task?: string): any {
-    const payload: any = {
+  private buildPayload(input: string | string[], task?: string): EmbeddingPayload {
+    const payload: EmbeddingPayload = {
       model: this.model,
       input,
       // Force float output to avoid SDK default base64 decoding path.
@@ -336,7 +347,7 @@ export class Embedder {
     while (true) {
       try {
         return await this.withEmbeddingSlot(() =>
-          this.client.embeddings.create(this.buildPayload(input, task) as any)
+          this.client.embeddings.create(this.buildPayload(input, task))
         );
       } catch (error) {
         if (!isTransientEmbeddingError(error) || attempt >= EMBEDDING_RETRY_DELAYS_MS.length) {
@@ -371,7 +382,7 @@ export class Embedder {
 
     try {
       const response = await this.createEmbedding(text, task);
-      const embedding = response.data[0]?.embedding as number[] | undefined;
+      const embedding: number[] | undefined = response.data[0]?.embedding;
       if (!embedding) {
         throw new Error("No embedding returned from provider");
       }
@@ -475,7 +486,7 @@ export class Embedder {
       // Fill in embeddings for valid texts
       response.data.forEach((item, idx) => {
         const originalIndex = validIndices[idx];
-        const embedding = item.embedding as number[];
+        const embedding: number[] = item.embedding;
 
         this.validateEmbedding(embedding);
         results[originalIndex] = embedding;

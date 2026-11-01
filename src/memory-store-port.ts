@@ -28,6 +28,8 @@ export interface MemoryStorePort {
     limit?: number,
     offset?: number,
     scopeMatch?: ScopeMatchMode,
+    /** Scopes to leave out (matched exactly), same as MemoryStore.list; dream gather and 3a pass it. */
+    excludeScopes?: string[],
   ): Promise<MemoryEntry[]>;
   /** 按 id 批量取真实向量。list()/listPage() 为性能恒返回 vector:[]（假空数组），
    *  任何要做相似度/聚类的消费者必须用这个回填——promote_scan 与 dream 3b 都栽过同一坑。 */

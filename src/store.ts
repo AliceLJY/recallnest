@@ -40,7 +40,9 @@ export type MemoryCategory =
   | DurableMemoryCategory
   | "preference" | "fact" | "decision" | "entity" | "other";
 
-export interface MemoryEntry {
+// A type alias, not an interface: LanceDB takes rows as Record<string, unknown>, which only
+// object type aliases satisfy (interfaces have no implicit index signature).
+export type MemoryEntry = {
   id: string;
   text: string;
   vector: number[];
@@ -51,7 +53,7 @@ export interface MemoryEntry {
   metadata?: string; // JSON string for extensible metadata — includes l0_abstract/l1_overview/l2_content/tier
   language?: string;   // ISO 639-1: "zh"|"ja"|"ko"|"en"
   fts_text?: string;   // Pre-tokenized text for FTS indexing
-}
+};
 
 export interface MemorySearchResult {
   entry: MemoryEntry;
