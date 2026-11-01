@@ -5,34 +5,42 @@
  * 拦截低质量记忆，避免垃圾进库再过滤。
  *
  * 4 层准入检查：
- *   1. 最短文本长度 — 过短文本拒绝
+ *   1. 最短文本长度 — 过短文本拒绝。按 admissionLength() 计：汉字 / 假名 / 谚文每个算 2 个单位，
+ *      其余字符（按 code point）每个算 1 个，所以「我是左撇子」= 10 过线，「hi」= 2 仍被拒。
  *   2. Noise filter — 噪声模式前置过滤
  *   3. Importance 下限 — 低 importance 拒绝
- *   4. Scope 写入频率限制 — 防 flood
+ *   4. Scope 写入频率限制 — 防 flood。**只在调用方显式注入 `ScopeRateLimiter` 时才生效，默认未启用**：
+ *      生产写入入口（MCP store_memory / batch_store / 其余写工具、HTTP、CLI、对话导入、
+ *      session 提炼、pivot-apply）都不传 rateLimiter，所以「每 scope 每分钟 50 条」目前不限任何东西。
+ *      `admission-control.test.ts` 有一条源码守卫钉住这一点；要接上属于改写入行为，另议。
  */
 
 import { isNoise } from "./noise-filter.js";
 import { logInfo } from "./stderr-log.js";
+import { MIN_MEMORY_TEXT_UNITS, weightedTextLength } from "./text-length.js";
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
 export interface AdmissionConfig {
-  /** Minimum text length to accept (default: 10) */
+  /** Minimum text length to accept, measured by admissionLength() (default: 10) */
   minTextLength: number;
   /** Enable noise-filter pre-check (default: true) */
   noiseFilterEnabled: boolean;
   /** Minimum importance to accept (default: 0.2) */
   minImportance: number;
-  /** Max writes per scope within the rate window (default: 50) */
+  /**
+   * Max writes per scope within the rate window (default: 50). Only enforced when the
+   * caller injects a ScopeRateLimiter — no production entry point does (see file header).
+   */
   maxWritesPerScope: number;
   /** Rate limit window in milliseconds (default: 60_000 = 1 minute) */
   rateLimitWindowMs: number;
 }
 
 const DEFAULT_CONFIG: AdmissionConfig = {
-  minTextLength: 10,
+  minTextLength: MIN_MEMORY_TEXT_UNITS,
   noiseFilterEnabled: true,
   minImportance: 0.2,
   maxWritesPerScope: 50,
@@ -62,6 +70,33 @@ export interface AdmissionResult {
 }
 
 const ACCEPTED: AdmissionResult = { verdict: "accepted" };
+
+// ============================================================================
+// Length measure — CJK counts double
+// ============================================================================
+
+/**
+ * 准入最短长度用的长度：汉字 / 假名 / 谚文每个 2，其余每个 code point 1（先做 NFC）。
+ * 实现在 text-length.ts，下游几处短文本门槛共用同一口径。
+ */
+export const admissionLength = weightedTextLength;
+
+/**
+ * 回执里给人看的拒绝原因说明。`reason` 枚举值照旧原样给出，这里只附一句话。
+ * 数字取默认配置：会出回执的入口（store_memory / batch_store）都不覆盖准入配置。
+ */
+export function describeRejectionReason(reason: RejectionReason): string {
+  switch (reason) {
+    case "text_too_short":
+      return `below the minimum length of ${DEFAULT_CONFIG.minTextLength} units; CJK characters count as 2, other characters as 1`;
+    case "noise_detected":
+      return "matched the noise filter (greeting, filler or boilerplate)";
+    case "importance_too_low":
+      return `importance below the floor of ${DEFAULT_CONFIG.minImportance}`;
+    case "rate_limited":
+      return "too many writes to this scope within the rate window";
+  }
+}
 
 // ============================================================================
 // Rate Limiter — per-scope write frequency tracking
@@ -122,7 +157,8 @@ export class ScopeRateLimiter {
  * @param text       - Memory text to evaluate
  * @param importance - Importance score (0–1)
  * @param scope      - Target scope
- * @param rateLimiter - Optional shared rate limiter instance
+ * @param rateLimiter - Optional shared rate limiter instance. Omitted → no rate limit,
+ *                      which is what every production caller does today.
  * @param config     - Optional config overrides
  */
 export function checkAdmission(
@@ -136,8 +172,9 @@ export function checkAdmission(
 
   // Layer 1: minimum text length
   const trimmed = text.trim();
-  if (trimmed.length < cfg.minTextLength) {
-    logInfo(`[admission-control] rejected: text too short (${trimmed.length} < ${cfg.minTextLength})`);
+  const length = admissionLength(trimmed);
+  if (length < cfg.minTextLength) {
+    logInfo(`[admission-control] rejected: text too short (${length} < ${cfg.minTextLength} units)`);
     return { verdict: "rejected", reason: "text_too_short" };
   }
 

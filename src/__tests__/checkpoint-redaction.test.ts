@@ -282,6 +282,28 @@ describe("names a checkpoint needs are not mistaken for secrets (Codex P2-3)", (
     expect(keep(text)).toBe(text);
   });
 
+  it.each([
+    ["password=", "db password=sk-correct-horse-battery staple"],
+    ["api_key=", "api_key=sk-test-only-abcdefghijklmnop"],
+    ["Bearer ", "Authorization: Bearer sk-abc-def-ghi-jkl"],
+    ["quoted JSON value", '{"api_key": "sk-lowercase-words-only-here"}'],
+    ["URI userinfo", "postgres://admin:sk-correct-horse-battery@db"],
+  ])("a kebab-case sk- value after %s is a secret, not a protected name (audit 2026-11-01 #1)", (_label, text) => {
+    const out = keep(text);
+    expect(out).toContain("[REDACTED");
+    expect(out).not.toContain("sk-");
+  });
+
+  it("the kebab-case protection still holds for names that are not values", () => {
+    for (const text of [
+      "docs/sk-checkpoint-redaction-design.md",
+      "see sk-checkpoint-redaction-design and sk-redaction-notes",
+      "file: docs/sk-checkpoint-redaction-design.md",
+    ]) {
+      expect(keep(text)).toBe(text);
+    }
+  });
+
   it("still redacts the real secret shapes, including next to the kept names", () => {
     const secrets: Array<[string, string]> = [
       [OPENAI_KEY, "[REDACTED:api_key]"],

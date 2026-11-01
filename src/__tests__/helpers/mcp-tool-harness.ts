@@ -42,6 +42,8 @@ export interface CaptureOptions {
   checkpointStore?: SessionCheckpointStore;
   conflictStore?: ConflictCandidateStore;
   auditLogger?: AuditLogger;
+  /** 给了就把每个工具注册时的描述写进去（断言工具描述用）。 */
+  descriptions?: Map<string, string>;
 }
 
 /** 测试用审计记录器：只记在内存里，不落盘。 */
@@ -74,7 +76,8 @@ export function captureTools(
     save: async (record: unknown) => record,
   } as unknown as WorkflowObservationStore;
   const deps = {
-    registerTool: (name: string, _description: string, schema: unknown, handler: unknown) => {
+    registerTool: (name: string, description: string, schema: unknown, handler: unknown) => {
+      options.descriptions?.set(name, description);
       const parser = z.object((schema ?? {}) as ZodRawShape);
       const fn = handler as (args: Record<string, unknown>) => unknown;
       handlers.set(name, (args) =>
