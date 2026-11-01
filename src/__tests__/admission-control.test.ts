@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { join, sep } from "node:path";
 
 import {
   admissionLength,
@@ -279,5 +281,75 @@ describe("describeRejectionReason", () => {
     expect(text).toContain("below the minimum length of 10 units");
     expect(text).toContain("CJK characters count as 2");
     expect(text).not.toContain("noise");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Source guard: production entry points do not inject a rate limiter (task Z)
+// ---------------------------------------------------------------------------
+
+/**
+ * 「每 scope 每分钟 50 条」只在调用方注入 ScopeRateLimiter 时生效，而生产入口一个都不传——
+ * 文档已改成「可选注入、默认未启用」。这条守卫防止有人悄悄接上：接上会改写入行为，要另议，
+ * 届时连同这条守卫与文档一起改。
+ *
+ * 扫 src/（不含测试）、scripts/、eval/ 下的 .ts：
+ *   - 不出现 `new ScopeRateLimiter`
+ *   - 不出现 `rateLimiter:` / `rateLimiter =` / `{ rateLimiter }` 这样的赋值、传参
+ *     （capture-engine 里的可选字段声明 `rateLimiter?:` 除外）
+ *   - checkAdmission 只在 capture-engine.ts（转交 deps.rateLimiter）与 pivot-apply.ts（第 4 个参数写死 undefined）调用
+ */
+const REPO_ROOT = join(import.meta.dir, "..", "..");
+const SCAN_DIRS = ["src", "scripts", "eval"];
+
+function productionSources(): Array<{ path: string; text: string }> {
+  const out: Array<{ path: string; text: string }> = [];
+  for (const dir of SCAN_DIRS) {
+    const abs = join(REPO_ROOT, dir);
+    if (!existsSync(abs)) continue;
+    for (const rel of readdirSync(abs, { recursive: true, encoding: "utf8" })) {
+      const path = `${dir}/${rel.split(sep).join("/")}`;
+      if (!path.endsWith(".ts") || path.includes("/__tests__/") || path.includes("/node_modules/")) continue;
+      out.push({ path, text: readFileSync(join(REPO_ROOT, path), "utf8") });
+    }
+  }
+  return out;
+}
+
+/** 返回违规描述；空数组 = 没有接上限流器。 */
+function rateLimiterWiring(path: string, text: string): string[] {
+  const hits: string[] = [];
+  if (path === "src/admission-control.ts") return hits; // 定义处
+  if (/new\s+ScopeRateLimiter\b/.test(text)) hits.push(`${path}: constructs ScopeRateLimiter`);
+  // `rateLimiter:` / `rateLimiter =` 赋值或对象字面量传参；`rateLimiter?:` 是可选字段声明，放行
+  if (/\brateLimiter\s*(?::|=(?!=))/.test(text)) hits.push(`${path}: sets rateLimiter`);
+  // 对象字面量简写 `{ store, rateLimiter }`
+  if (/[{,]\s*rateLimiter\s*[,}]/.test(text)) hits.push(`${path}: passes rateLimiter by shorthand`);
+  const calls = [...text.matchAll(/\bcheckAdmission\s*\(([^;]*?)\);/gs)].map((m) => m[1]);
+  for (const args of calls) {
+    if (path === "src/capture-engine.ts" && /deps\.rateLimiter\s*\?\?\s*undefined/.test(args)) continue;
+    if (path === "src/pivot-apply.ts" && /^[^,]+,[^,]+,[^,]+,\s*undefined\s*,/.test(args)) continue;
+    hits.push(`${path}: checkAdmission call not on the allowlist`);
+  }
+  return hits;
+}
+
+describe("rate limiter is not wired into production (source guard)", () => {
+  it("no production source constructs, passes or assigns a rate limiter", () => {
+    const files = productionSources();
+    // 扫描确实扫到了两个调用点，不是空跑
+    expect(files.map((f) => f.path)).toEqual(expect.arrayContaining(["src/capture-engine.ts", "src/pivot-apply.ts", "src/mcp-tools-core.ts"]));
+    expect(files.flatMap((f) => rateLimiterWiring(f.path, f.text))).toEqual([]);
+  });
+
+  it("the detector catches the ways it could be wired (calibration)", () => {
+    expect(rateLimiterWiring("src/x.ts", "const l = new ScopeRateLimiter();")).not.toEqual([]);
+    expect(rateLimiterWiring("src/x.ts", "persistMemory({ store, embedder, rateLimiter: shared }, input);")).not.toEqual([]);
+    expect(rateLimiterWiring("src/x.ts", "persistMemory({ store, rateLimiter }, input);")).not.toEqual([]);
+    expect(rateLimiterWiring("src/x.ts", "deps.rateLimiter = limiter;")).not.toEqual([]);
+    expect(rateLimiterWiring("src/x.ts", "checkAdmission(text, 0.5, scope, limiter);")).not.toEqual([]);
+    expect(rateLimiterWiring("src/pivot-apply.ts", "checkAdmission(text, imp, PIVOT_SCOPE, limiter, cfg);")).not.toEqual([]);
+    expect(rateLimiterWiring("src/pivot-apply.ts", "checkAdmission(text, imp, PIVOT_SCOPE, undefined, cfg);")).toEqual([]);
+    expect(rateLimiterWiring("src/capture-engine.ts", "  rateLimiter?: ScopeRateLimiter | null;")).toEqual([]);
   });
 });

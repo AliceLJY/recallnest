@@ -9,7 +9,10 @@
  *      其余字符（按 code point）每个算 1 个，所以「我是左撇子」= 10 过线，「hi」= 2 仍被拒。
  *   2. Noise filter — 噪声模式前置过滤
  *   3. Importance 下限 — 低 importance 拒绝
- *   4. Scope 写入频率限制 — 防 flood
+ *   4. Scope 写入频率限制 — 防 flood。**只在调用方显式注入 `ScopeRateLimiter` 时才生效，默认未启用**：
+ *      生产写入入口（MCP store_memory / batch_store / 其余写工具、HTTP、CLI、对话导入、
+ *      session 提炼、pivot-apply）都不传 rateLimiter，所以「每 scope 每分钟 50 条」目前不限任何东西。
+ *      `admission-control.test.ts` 有一条源码守卫钉住这一点；要接上属于改写入行为，另议。
  */
 
 import { isNoise } from "./noise-filter.js";
@@ -26,7 +29,10 @@ export interface AdmissionConfig {
   noiseFilterEnabled: boolean;
   /** Minimum importance to accept (default: 0.2) */
   minImportance: number;
-  /** Max writes per scope within the rate window (default: 50) */
+  /**
+   * Max writes per scope within the rate window (default: 50). Only enforced when the
+   * caller injects a ScopeRateLimiter — no production entry point does (see file header).
+   */
   maxWritesPerScope: number;
   /** Rate limit window in milliseconds (default: 60_000 = 1 minute) */
   rateLimitWindowMs: number;
@@ -163,7 +169,8 @@ export class ScopeRateLimiter {
  * @param text       - Memory text to evaluate
  * @param importance - Importance score (0–1)
  * @param scope      - Target scope
- * @param rateLimiter - Optional shared rate limiter instance
+ * @param rateLimiter - Optional shared rate limiter instance. Omitted → no rate limit,
+ *                      which is what every production caller does today.
  * @param config     - Optional config overrides
  */
 export function checkAdmission(
