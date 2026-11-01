@@ -60,6 +60,18 @@ export interface MemorySearchResult {
   score: number;
 }
 
+/**
+ * Eligibility conditions for `vectorSearch` / `bm25Search` that must apply before the result is cut
+ * to `limit` (2026-11 体检 #10). They never change how many rows are fetched — they only keep
+ * ineligible rows from taking one of the returned slots.
+ */
+export interface CandidateSearchFilter {
+  /** Pushed into the SQL WHERE (category is a column). */
+  category?: string;
+  /** Checked per row in the result loop, before the `limit` break. */
+  accept?: (entry: MemoryEntry) => boolean;
+}
+
 /** replaceWithArchivedVersion 的 plan 在锁内给出的：要新写的历史行，以及对原行的改动 */
 export interface ArchivedReplacePlan {
   history: MemoryEntry;
@@ -259,6 +271,11 @@ const TABLE_NAME = "memories";
 /** `scope NOT IN (...)` — exact scope names, never prefix families. */
 export function scopeExclusionClause(excludeScopes: string[]): string {
   return `(scope NOT IN (${excludeScopes.map((scope) => `'${escapeSqlLiteral(scope)}'`).join(", ")}))`;
+}
+
+/** `category = '...'` — category is a column, so a category filter belongs in the query, not after it. */
+export function categoryClause(category: string): string {
+  return `category = '${escapeSqlLiteral(category)}'`;
 }
 
 export function scopeWhereClause(scopeFilter: string[], mode: ScopeMatchMode = "family"): string {
@@ -713,11 +730,12 @@ export class MemoryStore implements MemoryStorePort {
     scopeFilter?: string[],
     scopeMatch: ScopeMatchMode = "family",
     excludeScopes?: string[],
+    filter?: CandidateSearchFilter,
   ): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
     const safeLimit = clampInt(limit, 1, 20);
-    const fetchLimit = Math.min(safeLimit * 10, 200); // Over-fetch for scope filtering
+    const fetchLimit = Math.min(safeLimit * 10, 200); // Over-fetch for scope / eligibility filtering
 
     let query = this.table!.vectorSearch(vector).distanceType('cosine').limit(fetchLimit);
 
@@ -728,6 +746,7 @@ export class MemoryStore implements MemoryStorePort {
     const where = [
       ...(scopeFilter && scopeFilter.length > 0 ? [`(${scopeWhereClause(scopeFilter, scopeMatch)})`] : []),
       ...(excludeScopes && excludeScopes.length > 0 ? [scopeExclusionClause(excludeScopes)] : []),
+      ...(filter?.category ? [categoryClause(filter.category)] : []),
     ];
     if (where.length > 0) {
       query = query.where(where.join(" AND "));
@@ -749,20 +768,23 @@ export class MemoryStore implements MemoryStorePort {
         continue;
       }
       if (excludeScopes?.includes(rowScope)) continue;
+      if (filter?.category && row.category !== filter.category) continue;
 
-      mapped.push({
-        entry: {
-          id: row.id as string,
-          text: row.text as string,
-          vector: row.vector as number[],
-          category: row.category as MemoryEntry["category"],
-          scope: rowScope,
-          importance: Number(row.importance),
-          timestamp: Number(row.timestamp),
-          metadata: (row.metadata as string) || "{}",
-        },
-        score,
-      });
+      const entry: MemoryEntry = {
+        id: row.id as string,
+        text: row.text as string,
+        vector: row.vector as number[],
+        category: row.category as MemoryEntry["category"],
+        scope: rowScope,
+        importance: Number(row.importance),
+        timestamp: Number(row.timestamp),
+        metadata: (row.metadata as string) || "{}",
+      };
+      // Eligibility is decided here, on the rows already over-fetched, so an ineligible row never
+      // takes one of the safeLimit slots (before this, the retriever dropped it after the cut).
+      if (filter?.accept && !filter.accept(entry)) continue;
+
+      mapped.push({ entry, score });
 
       if (mapped.length >= safeLimit) break;
     }
@@ -770,7 +792,13 @@ export class MemoryStore implements MemoryStorePort {
     return mapped;
   }
 
-  async bm25Search(query: string, limit = 5, scopeFilter?: string[], excludeScopes?: string[]): Promise<MemorySearchResult[]> {
+  async bm25Search(
+    query: string,
+    limit = 5,
+    scopeFilter?: string[],
+    excludeScopes?: string[],
+    filter?: CandidateSearchFilter,
+  ): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
     if (!this.ftsIndexCreated) {
@@ -787,6 +815,7 @@ export class MemoryStore implements MemoryStorePort {
       const where = [
         ...(scopeFilter && scopeFilter.length > 0 ? [`(${scopeWhereClause(scopeFilter)})`] : []),
         ...(excludeScopes && excludeScopes.length > 0 ? [scopeExclusionClause(excludeScopes)] : []),
+        ...(filter?.category ? [categoryClause(filter.category)] : []),
       ];
       if (where.length > 0) {
         searchQuery = searchQuery.where(where.join(" AND "));
@@ -803,25 +832,26 @@ export class MemoryStore implements MemoryStorePort {
           continue;
         }
         if (excludeScopes?.includes(rowScope)) continue;
+        if (filter?.category && row.category !== filter.category) continue;
 
         // LanceDB FTS _score is raw BM25 (unbounded). Normalize with sigmoid.
         // LanceDB may return BigInt for numeric columns; coerce safely.
         const rawScore = (row._score != null) ? Number(row._score) : 0;
         const normalizedScore = rawScore > 0 ? 1 / (1 + Math.exp(-rawScore / 5)) : 0.5;
 
-        mapped.push({
-          entry: {
-            id: row.id as string,
-            text: row.text as string,
-            vector: row.vector as number[],
-            category: row.category as MemoryEntry["category"],
-            scope: rowScope,
-            importance: Number(row.importance),
-            timestamp: Number(row.timestamp),
-            metadata: (row.metadata as string) || "{}",
-          },
-          score: normalizedScore,
-        });
+        const entry: MemoryEntry = {
+          id: row.id as string,
+          text: row.text as string,
+          vector: row.vector as number[],
+          category: row.category as MemoryEntry["category"],
+          scope: rowScope,
+          importance: Number(row.importance),
+          timestamp: Number(row.timestamp),
+          metadata: (row.metadata as string) || "{}",
+        };
+        if (filter?.accept && !filter.accept(entry)) continue;
+
+        mapped.push({ entry, score: normalizedScore });
       }
 
       return mapped;
