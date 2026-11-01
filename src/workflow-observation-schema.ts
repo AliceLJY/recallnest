@@ -58,7 +58,8 @@ export const WorkflowObservationRecordSchema = WorkflowObservationInputSchema.ex
 });
 
 export type WorkflowObservationOutcome = z.infer<typeof WorkflowObservationOutcomeSchema>;
-export type WorkflowObservationInput = z.infer<typeof WorkflowObservationInputSchema>;
+/** What callers hand to the schema (before defaults such as `recordedAt` are filled in). */
+export type WorkflowObservationInput = z.input<typeof WorkflowObservationInputSchema>;
 export type WorkflowObservationRecord = z.infer<typeof WorkflowObservationRecordSchema>;
 
 export interface WorkflowHealthWindow {

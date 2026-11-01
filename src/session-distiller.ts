@@ -22,6 +22,45 @@ export interface ConversationMessage {
   timestamp?: string;
 }
 
+/** One content block as the distill_session MCP schema accepts it (Anthropic-style messages). */
+export interface DistillContentBlock {
+  type: "text" | "tool_use" | "tool_result";
+  name?: string;
+  id?: string;
+  input?: Record<string, unknown>;
+  content?: string;
+  text?: string;
+  tool_use_id?: string;
+}
+
+/** A message as distill_session accepts it: content is a string or a list of blocks. */
+export interface DistillInputMessage {
+  role: ConversationMessage["role"];
+  content: string | DistillContentBlock[];
+}
+
+function flattenContentBlock(block: DistillContentBlock): string {
+  if (block.type === "tool_use") {
+    return `[tool_use${block.name ? `:${block.name}` : ""}] ${JSON.stringify(block.input ?? {})}`;
+  }
+  if (block.type === "tool_result") return block.content ?? block.text ?? "";
+  return block.text ?? "";
+}
+
+/**
+ * The MCP schema lets `content` be a list of blocks, but every layer below works on strings
+ * (`redactSecrets(m.content)` threw "out.replace is not a function" on a block list). Blocks are
+ * joined in order with newlines; string content passes through unchanged.
+ */
+export function normalizeDistillMessages(messages: readonly DistillInputMessage[]): ConversationMessage[] {
+  return messages.map((m) => ({
+    role: m.role,
+    content: typeof m.content === "string"
+      ? m.content
+      : m.content.map(flattenContentBlock).filter((t) => t.length > 0).join("\n"),
+  }));
+}
+
 export interface MicrocompactResult {
   tokens_freed: number;
   tools_cleared: number;
@@ -276,7 +315,8 @@ function trackDisposition(result: PersistResult, stored: StoredMemoryRecord): vo
 
 export async function distillSession(
   messages: ConversationMessage[],
-  deps: PersistDeps & { llm: LLMClient },
+  /** `llm` is null when none is configured; only the summary layer needs it. */
+  deps: PersistDeps & { llm: LLMClient | null },
   opts: {
     scope?: string;
     preserveRecent?: number;
@@ -297,7 +337,12 @@ export async function distillSession(
   const preserveRecent = opts.preserveRecent ?? 6;
   const cutoff = Math.max(0, compacted.length - preserveRecent);
   const oldMessages = compacted.slice(0, cutoff);
-  const summaryResult = oldMessages.length > 0
+  // Same cases fail as before (summary needed, no client); the error now says why instead of
+  // "Cannot read properties of null".
+  if (oldMessages.length > 0 && !deps.llm) {
+    throw new Error("distill_session needs an LLM client to summarize older messages, and none is configured");
+  }
+  const summaryResult = oldMessages.length > 0 && deps.llm
     ? await summarizeSession(oldMessages, deps.llm)
     : { text: "", dimensions: {} };
 

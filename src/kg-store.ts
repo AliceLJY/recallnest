@@ -12,7 +12,9 @@ import { loadLanceDB } from "./store.js";
 // Types
 // ============================================================================
 
-export interface KGTriple {
+// A type alias, not an interface: LanceDB takes rows as Record<string, unknown>, which only
+// object type aliases satisfy (interfaces have no implicit index signature).
+export type KGTriple = {
   /** Deterministic ID: sha256(scope + subject + predicate + object) */
   id: string;
   scope: string;
@@ -33,7 +35,7 @@ export interface KGTriple {
   first_seen: number;
   /** JSON array of contributing source memory ids, capped at SOURCE_IDS_CAP */
   source_memory_ids: string;
-}
+};
 
 /** Caller-facing input: counting fields are managed internally by the store. */
 export type KGTripleInput = Omit<KGTriple, "id" | "timestamp" | "mention_count" | "first_seen" | "source_memory_ids">;

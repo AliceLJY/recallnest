@@ -208,7 +208,7 @@ function fileSearch(query: string, scope: string, limit: number): Promise<FileHi
     const args = ["--json", "--max-count", "3", "--max-filesize", "2M", "-i", "--", query, ...targets];
     execFile(RG, args, { maxBuffer: 8 * 1024 * 1024, timeout: 20_000 }, (err, stdout) => {
       // ripgrep exits 1 when there is no match — not an error
-      if (err && (err as NodeJS.ErrnoException).code !== 1 && !stdout) return reject(err);
+      if (err && err.code !== 1 && !stdout) return reject(err);
       const hits: FileHit[] = [];
       for (const line of String(stdout).split("\n")) {
         if (!line.trim() || hits.length >= limit) continue;

@@ -491,6 +491,8 @@ export async function scanForPromotions(
   const cases = rawCases.filter(isActive);
   const patterns = rawPatterns.filter(isActive);
 
+  // Own reference: the result field is optional (older callers may omit it), this scan always fills it.
+  const antiPatterns: AntiPatternCandidate[] = [];
   const result: PromotionScanResult = {
     candidates: [],
     scannedCases: cases.length,
@@ -499,7 +501,7 @@ export async function scanForPromotions(
     vectorlessSkipped: 0,
     rejectedSingleSource: 0,
     abstainedUnknownSource: 0,
-    antiPatterns: [],
+    antiPatterns,
   };
 
   // 2. Cluster cases bucket-by-bucket (topicTag, untagged fallback)。
@@ -537,7 +539,7 @@ export async function scanForPromotions(
           result.rejectedSingleSource++;
           // P4:不晋升,但也不让它无声消失 —— 同一个坑重复本身就是要记的东西。
           // 仍然 continue,晋升判据分毫未动。
-          result.antiPatterns.push({
+          antiPatterns.push({
             source: "single_source_burst",
             trigger: extractName(cluster.seed.text),
             antiPattern: summarizeCluster(cluster.members),
