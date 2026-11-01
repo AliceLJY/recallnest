@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { DurableMemoryCategory } from "./memory-schema.js";
 import { inferPreferenceSlot } from "./preference-slots.js";
 
@@ -145,15 +147,21 @@ export function buildDistillationBoundary(
   };
 }
 
-export function normalizeCanonicalKey(value: string): string {
+const CANONICAL_KEY_MAX_LENGTH = 120;
+
+/** normalizeCanonicalKey 截断之前的结果；默认 key 要靠它判断有没有发生截断。 */
+function normalizeCanonicalKeyUntruncated(value: string): string {
   return value
     .trim()
     .toLowerCase()
     .replace(/['"`]/g, "")
     .replace(/[^a-z0-9\p{Script=Han}]+/gu, "-")
     .replace(/^-+|-+$/g, "")
-    .replace(/-{2,}/g, "-")
-    .slice(0, 120);
+    .replace(/-{2,}/g, "-");
+}
+
+export function normalizeCanonicalKey(value: string): string {
+  return normalizeCanonicalKeyUntruncated(value).slice(0, CANONICAL_KEY_MAX_LENGTH);
 }
 
 function collapseKeyText(value: string): string {
@@ -183,10 +191,27 @@ export function buildDefaultCanonicalKey(params: {
   }
 
   const base = collapseKeyText(params.title || params.text || "");
-  const normalizedBase = normalizeCanonicalKey(base);
-  return normalizedBase
-    ? `${params.category}:${normalizedBase}`
-    : `${params.category}:memory`;
+  const fullBase = normalizeCanonicalKeyUntruncated(base);
+  if (!base) return `${params.category}:memory`;
+
+  // 归一化后为空（西里尔、韩文、纯假名……）或发生了截断时，单靠归一化结果会让不同正文共用一个 key，
+  // latest-wins 下后写的把先写的原位改掉。这两种情形附上全文短哈希；其余情形与改前逐字相同，
+  // 现有生产行的 key 不变。
+  const hashSuffix = `-h${createHash("sha1").update(base).digest("hex").slice(0, 8)}`;
+  if (!fullBase) return `${params.category}:memory${hashSuffix}`;
+  if (fullBase.length <= CANONICAL_KEY_MAX_LENGTH) return `${params.category}:${fullBase}`;
+
+  // 截断时让整条 key（含类别前缀）不超过 120 字：冲突记录的 canonicalKey 上限是 120
+  // （conflict-schema.ts），冲突指纹与聚类键也先按 120 截，哈希放在 120 之外会被截掉。
+  // 按码点截，不留半个代理对。
+  const prefix = `${params.category}:`;
+  const bodyBudget = CANONICAL_KEY_MAX_LENGTH - prefix.length - hashSuffix.length;
+  let body = "";
+  for (const char of fullBase) {
+    if (body.length + char.length > bodyBudget) break;
+    body += char;
+  }
+  return `${prefix}${body.replace(/-+$/u, "")}${hashSuffix}`;
 }
 
 function truncateCanonicalKey(segments: string[]): string {
