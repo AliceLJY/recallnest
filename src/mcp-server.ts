@@ -32,7 +32,7 @@ import { runToolSafely } from "./error-taxonomy.js";
 import { registerCoreTools } from "./mcp-tools-core.js";
 import { registerAdvancedTools } from "./mcp-tools-advanced.js";
 import { registerGovernanceTools } from "./mcp-tools-governance.js";
-import type { ToolRegistryDeps } from "./mcp-tool-deps.js";
+import type { ToolHandler, ToolRegistryDeps, ToolSchema } from "./mcp-tool-deps.js";
 import { PACKAGE_VERSION } from "./version.js";
 
 // ============================================================================
@@ -161,13 +161,10 @@ const server = new McpServer({
 // Tool Registration Helper (tier-aware)
 // ============================================================================
 
-type ToolSchema = Parameters<typeof server.tool>[2];
-type ToolHandler = Parameters<typeof server.tool>[3];
-
 /** Map of all registered tool names to their descriptions (populated during registration). */
 const TOOL_DESCRIPTIONS = new Map<string, string>();
 
-function registerTool(name: string, description: string, schema: ToolSchema, handler: ToolHandler): void {
+function registerTool<S extends ToolSchema>(name: string, description: string, schema: S, handler: ToolHandler<S>): void {
   if (!shouldRegisterTool(name)) {
     // stdout is reserved for MCP JSON-RPC on stdio transports.
     console.error(`[MCP] Skipping ${name} (tier: ${TOOL_TIERS[name]})`);
@@ -186,7 +183,7 @@ function registerTool(name: string, description: string, schema: ToolSchema, han
       await ensureComponents();
       return (handler as (...a: unknown[]) => unknown)(...args);
     });
-  }) as ToolHandler;
+  }) as ToolHandler<S>;
   server.tool(name, description, schema, lazyHandler);
 }
 
