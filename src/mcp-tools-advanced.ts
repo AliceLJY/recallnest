@@ -980,7 +980,11 @@ registerTool(
     }
     if (result.persisted) {
       const p = result.persisted;
-      lines.push(`Persisted: ${p.memories_stored} stored, ${p.memories_deduped} deduped, ${p.memories_conflicted} conflicted`);
+      lines.push(`Persisted: ${p.memories_stored} stored, ${p.memories_deduped} deduped, ${p.memories_conflicted} conflicted${p.memories_failed > 0 ? `, ${p.memories_failed} failed` : ""}`);
+      for (const e of p.errors) lines.push(`Failed: ${e.dimension} — ${e.error}`);
+      if (p.scope_lock_timed_out) {
+        lines.push(`Note: another distill of this scope held its lock past the wait budget; this summary was persisted without it (possible near-duplicates).`);
+      }
     }
 
     return {
