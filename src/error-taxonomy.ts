@@ -31,6 +31,17 @@ export interface ErrorClassification {
 export function classifyError(err: unknown): ErrorClassification {
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
 
+  // 调用方给的 id 在库里找不到：forget_memory / promote_memory 抛「Memory <id> not found」，
+  // resolve_conflict 抛「Conflict <id> not found」。整句锚定，只认这两种由调用方 id 拼出的报错——
+  // 「LanceDB table not found」「Existing memory <id> not found」（冲突记录指向的旧记忆没了，
+  // 是库内不一致而不是调用方输错）都不在此列。排在最前，免得 id 里恰好有 timeout / index 之类的词被别的规则截走。
+  if (/^memory \S+ not found$/.test(msg)) {
+    return { reasonCode: "invalid_memory_ref", retryable: false, responsibility: "peer" };
+  }
+  if (/^conflict \S+ not found$/.test(msg)) {
+    return { reasonCode: "invalid_input", retryable: false, responsibility: "peer" };
+  }
+
   // transport：网络/连接层，可重试
   if (/econnreset|etimedout|enotfound|econnrefused|socket|network|fetch failed|timed out|timeout/.test(msg)) {
     return { reasonCode: "transport_error", retryable: true, responsibility: "transport" };
