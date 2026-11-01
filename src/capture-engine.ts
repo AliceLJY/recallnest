@@ -745,45 +745,7 @@ export async function writeDurableEntry(
 
   if (crossCategoryMatches.length > 0 && deps.conflictStore) {
     const latest = [...crossCategoryMatches].sort((a, b) => b.timestamp - a.timestamp)[0];
-    const fingerprint = buildConflictFingerprint({
-      canonicalKey: params.canonicalKey,
-      existingMemoryId: latest.id,
-      incomingText: params.text,
-      sourceMemoryId: params.promotedFrom,
-    });
-    const conflict = await ensureConflictCandidate(deps.conflictStore, {
-      canonicalKey: params.canonicalKey,
-      category: params.category,
-      fingerprint,
-      reason: "canonical_key_conflicts_with_existing_durable",
-      existing: {
-        memoryId: latest.id,
-        text: latest.text,
-        category: latest.category,
-        scope: latest.scope,
-        importance: latest.importance,
-        metadata: latest.metadata || "{}",
-        boundary: extractBoundaryMetadata(latest.metadata),
-        canonicalKey: extractCanonicalKey(latest.metadata) || params.canonicalKey,
-      },
-      incoming: {
-        text: params.text,
-        category: params.category,
-        scope: params.scope,
-        importance: params.importance,
-        metadata: params.metadata,
-        source: params.source,
-        ...(params.promotedFrom ? { sourceMemoryId: params.promotedFrom } : {}),
-        ...(params.sourceCategory ? { sourceCategory: params.sourceCategory } : {}),
-        ...(params.sourceBoundary ? { sourceBoundary: params.sourceBoundary } : {}),
-      },
-    });
-
-    return {
-      entry: latest,
-      disposition: "conflict",
-      conflictId: conflict.conflictId,
-    };
+    return await openCrossCategoryConflict(deps.conflictStore, params, latest);
   }
 
   if (exact) {
@@ -808,45 +770,7 @@ export async function writeDurableEntry(
       }
 
       if (deps.conflictStore) {
-        const fingerprint = buildConflictFingerprint({
-          canonicalKey: params.canonicalKey,
-          existingMemoryId: latest.id,
-          incomingText: params.text,
-          sourceMemoryId: params.promotedFrom,
-        });
-        const conflict = await ensureConflictCandidate(deps.conflictStore, {
-          canonicalKey: params.canonicalKey,
-          category: params.category,
-          fingerprint,
-          reason: "promotion_conflicts_with_existing_durable",
-          existing: {
-            memoryId: latest.id,
-            text: latest.text,
-            category: latest.category,
-            scope: latest.scope,
-            importance: latest.importance,
-            metadata: latest.metadata || "{}",
-            boundary: extractBoundaryMetadata(latest.metadata),
-            canonicalKey: extractCanonicalKey(latest.metadata) || params.canonicalKey,
-          },
-          incoming: {
-            text: params.text,
-            category: params.category,
-            scope: params.scope,
-            importance: params.importance,
-            metadata: params.metadata,
-            source: params.source,
-            sourceMemoryId: params.promotedFrom,
-            sourceCategory: params.sourceCategory,
-            sourceBoundary: params.sourceBoundary,
-          },
-        });
-
-        return {
-          entry: latest,
-          disposition: "conflict",
-          conflictId: conflict.conflictId,
-        };
+        return await openPromotionConflict(deps.conflictStore, params, latest);
       }
     }
 
@@ -881,6 +805,18 @@ export async function writeDurableEntry(
       isActiveMemory(row.metadata) && normalizeMemoryText(row.text) === normalizedIncomingText;
     if (rowAtTargetId && isLiveSameText(rowAtTargetId)) {
       return await sameText(rowAtTargetId);
+    }
+    // 窗口外的活跃行要过和窗口内一样的冲突判定（R1 Codex P1，2026-11-01）：改前这条路直接归档替换，
+    // 跨类别同 key、晋升到不同槽位的偏好都会绕过上面的 conflict 分支；同 scope 过滤之后，
+    // 「窗口内只剩别的 scope 的同 key 行」的写入也会走到这里，所以这条路不能再少一道闸。
+    // 同类别、同槽位、非晋升的异文照旧往下走原位替换（latest-wins 语义不变）。
+    if (rowAtTargetId && isActiveMemory(rowAtTargetId.metadata) && deps.conflictStore) {
+      if (rowAtTargetId.category !== params.category) {
+        return await openCrossCategoryConflict(deps.conflictStore, params, rowAtTargetId);
+      }
+      if (params.promotedFrom && conflictPolicy === "latest-wins" && !shouldAutoCollapsePromotionConflict(params, rowAtTargetId)) {
+        return await openPromotionConflict(deps.conflictStore, params, rowAtTargetId);
+      }
     }
     const atomic = atomicBeliefDeps(deps);
     if (rowAtTargetId && atomic) {
@@ -943,6 +879,92 @@ export async function writeDurableEntry(
     disposition: params.promotedFrom ? "promoted" : "stored",
     supersededPrevious,
   };
+}
+
+type DurableWriteResult = Awaited<ReturnType<typeof writeDurableEntry>>;
+
+/** 同 key 落在别的类别上：登记 canonical_key_conflicts_with_existing_durable，不动既有行。 */
+async function openCrossCategoryConflict(
+  conflictStore: ConflictStoreDeps,
+  params: DurableWriteInput,
+  latest: MemoryEntry,
+): Promise<DurableWriteResult> {
+  const fingerprint = buildConflictFingerprint({
+    canonicalKey: params.canonicalKey,
+    existingMemoryId: latest.id,
+    incomingText: params.text,
+    sourceMemoryId: params.promotedFrom,
+  });
+  const conflict = await ensureConflictCandidate(conflictStore, {
+    canonicalKey: params.canonicalKey,
+    category: params.category,
+    fingerprint,
+    reason: "canonical_key_conflicts_with_existing_durable",
+    existing: {
+      memoryId: latest.id,
+      text: latest.text,
+      category: latest.category,
+      scope: latest.scope,
+      importance: latest.importance,
+      metadata: latest.metadata || "{}",
+      boundary: extractBoundaryMetadata(latest.metadata),
+      canonicalKey: extractCanonicalKey(latest.metadata) || params.canonicalKey,
+    },
+    incoming: {
+      text: params.text,
+      category: params.category,
+      scope: params.scope,
+      importance: params.importance,
+      metadata: params.metadata,
+      source: params.source,
+      ...(params.promotedFrom ? { sourceMemoryId: params.promotedFrom } : {}),
+      ...(params.sourceCategory ? { sourceCategory: params.sourceCategory } : {}),
+      ...(params.sourceBoundary ? { sourceBoundary: params.sourceBoundary } : {}),
+    },
+  });
+  return { entry: latest, disposition: "conflict", conflictId: conflict.conflictId };
+}
+
+/** 晋升撞上同 key 的既有 durable 行、且不是同一槽位：登记 promotion_conflicts_with_existing_durable。 */
+async function openPromotionConflict(
+  conflictStore: ConflictStoreDeps,
+  params: DurableWriteInput,
+  latest: MemoryEntry,
+): Promise<DurableWriteResult> {
+  const fingerprint = buildConflictFingerprint({
+    canonicalKey: params.canonicalKey,
+    existingMemoryId: latest.id,
+    incomingText: params.text,
+    sourceMemoryId: params.promotedFrom,
+  });
+  const conflict = await ensureConflictCandidate(conflictStore, {
+    canonicalKey: params.canonicalKey,
+    category: params.category,
+    fingerprint,
+    reason: "promotion_conflicts_with_existing_durable",
+    existing: {
+      memoryId: latest.id,
+      text: latest.text,
+      category: latest.category,
+      scope: latest.scope,
+      importance: latest.importance,
+      metadata: latest.metadata || "{}",
+      boundary: extractBoundaryMetadata(latest.metadata),
+      canonicalKey: extractCanonicalKey(latest.metadata) || params.canonicalKey,
+    },
+    incoming: {
+      text: params.text,
+      category: params.category,
+      scope: params.scope,
+      importance: params.importance,
+      metadata: params.metadata,
+      source: params.source,
+      sourceMemoryId: params.promotedFrom,
+      sourceCategory: params.sourceCategory,
+      sourceBoundary: params.sourceBoundary,
+    },
+  });
+  return { entry: latest, disposition: "conflict", conflictId: conflict.conflictId };
 }
 
 async function ensureConflictCandidate(

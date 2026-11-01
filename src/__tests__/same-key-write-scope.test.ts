@@ -107,6 +107,26 @@ async function activeRowsWithKey(store: MemoryStore, scope: string, key: string)
     parseEvolution(row.metadata).status === "active");
 }
 
+/** 一条 cc:* 的 evidence 行，给 promoteMemory 当来源。 */
+async function seedEvidence(store: MemoryStore, text: string, session: string): Promise<MemoryEntry> {
+  return store.store({
+    text,
+    vector: [1, 2, 3],
+    category: "events",
+    scope: `cc:${session}`,
+    importance: 0.5,
+    metadata: JSON.stringify({
+      source: "cc",
+      boundary: {
+        layer: "evidence",
+        authority: "transcript-ingest",
+        conflictPolicy: "append-only",
+        originalCategory: "preferences",
+      },
+    }),
+  });
+}
+
 describe("① B scope 首写同 key：A 的行不动，B 新增一行", () => {
   it("entities / key laptop：B 返回 stored、行在 B；A 的行逐字段不变", async () => {
     const { store, deps } = makeDeps();
@@ -364,24 +384,6 @@ describe("两层过滤各自钉住", () => {
 });
 
 describe("promote_memory：写进调用方给的 scope，同 scope 照旧合并", () => {
-  async function seedEvidence(store: MemoryStore, text: string, session: string): Promise<MemoryEntry> {
-    return store.store({
-      text,
-      vector: [1, 2, 3],
-      category: "events",
-      scope: `cc:${session}`,
-      importance: 0.5,
-      metadata: JSON.stringify({
-        source: "cc",
-        boundary: {
-          layer: "evidence",
-          authority: "transcript-ingest",
-          conflictPolicy: "append-only",
-          originalCategory: "preferences",
-        },
-      }),
-    });
-  }
 
   it("同 key 同文：在 A 再晋升一次合并进 A 的行（promoted、同 id）；晋升到 B 则 B 新增一行、A 不动", async () => {
     const { store, deps } = makeDeps({ withConflictStore: true });
@@ -406,6 +408,68 @@ describe("promote_memory：写进调用方给的 scope，同 scope 照旧合并"
     expect(p3.id).toBe(deterministicId(B, normalizeCanonicalKey("user.reply.style")));
     expect(snapshot(await store.getById(p1.id))).toEqual(aAfterMerge);
     expect((await activeRowsWithKey(store, B, normalizeCanonicalKey("user.reply.style"))).length).toBe(1);
+  }, 60_000);
+});
+
+describe("本 scope 的旧行落在扫描窗口外、窗口内只有别的 scope 的同 key 行（R1 Codex P1）：按 id 兜底也要过冲突判定", () => {
+  /** 让 list() 看不见 A 的行：等价于 A 的行被 1000 条更新的行挤出扫描窗口，而 B 的同 key 行还在窗口内。 */
+  function blindListToScope(store: MemoryStore, hidden: string): void {
+    const original = store.list.bind(store);
+    (store as any).list = async (...args: Parameters<MemoryStore["list"]>) =>
+      (await original(...args)).filter((entry) => entry.scope !== hidden);
+  }
+
+  it("跨类别同 key：A 的 preferences 行在窗口外，向 A 写 entities 仍进冲突、A 不变", async () => {
+    const { store, deps } = makeDeps({ withConflictStore: true });
+    const a = await persistMemory(deps, {
+      text: "User prefers VS Code with the vim extension", category: "preferences", scope: A, source: "manual", canonicalKey: "editor",
+    });
+    await persistMemory(deps, {
+      text: "Default editor on the build box is Neovim", category: "entities", scope: B, source: "manual", canonicalKey: "editor",
+    });
+    const aBefore = snapshot(await store.getById(a.id));
+    blindListToScope(store, A);
+
+    const write = await persistMemory(deps, {
+      text: "Primary editor installed on the work machine is Neovim 0.10", category: "entities", scope: A, source: "manual", canonicalKey: "editor",
+    });
+    expect(write.disposition).toBe("conflict");
+    expect(write.conflictId).toBeDefined();
+    expect(snapshot(await store.getById(a.id))).toEqual(aBefore);
+    expect(await store.getById(a.id)).toMatchObject({ category: "preferences" });
+  }, 60_000);
+
+  it("晋升同 key、不同槽位的偏好：A 的行在窗口外仍进晋升冲突，不被替换", async () => {
+    const { store, deps } = makeDeps({ withConflictStore: true });
+    const p0 = await persistMemory(deps, {
+      text: "User prefers concise, direct replies.", category: "preferences", scope: A, source: "manual", canonicalKey: "user.reply.style",
+    });
+    await persistMemory(deps, {
+      text: "User prefers long, detailed replies.", category: "preferences", scope: B, source: "manual", canonicalKey: "user.reply.style",
+    });
+    const aBefore = snapshot(await store.getById(p0.id));
+    blindListToScope(store, A);
+
+    const evidence = await seedEvidence(store, "[用户] 回复可以展开讲，细一点。", "s-window");
+    const promoted = await promoteMemory(deps, {
+      memoryId: evidence.id, text: "User prefers long, detailed replies.", category: "preferences", scope: A, canonicalKey: "user.reply.style",
+    });
+    expect(promoted.disposition).toBe("conflict");
+    expect(snapshot(await store.getById(p0.id))).toEqual(aBefore);
+  }, 60_000);
+
+  it("对照：窗口外的同 scope 同类别异文修订照旧原位替换（updated 语义不变）", async () => {
+    const { store, deps } = makeDeps({ withConflictStore: true });
+    const a = await persistMemory(deps, {
+      text: "User works from the Guangzhou office", category: "profile", scope: A, source: "manual", canonicalKey: "office",
+    });
+    blindListToScope(store, A);
+    const write = await persistMemory(deps, {
+      text: "User works from the Singapore office", category: "profile", scope: A, source: "manual", canonicalKey: "office",
+    });
+    expect(write.id).toBe(a.id);
+    expect(write.disposition).toBe("stored");
+    expect((await store.getById(a.id))!.text).toBe("User works from the Singapore office");
   }, 60_000);
 });
 
