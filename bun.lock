@@ -5,7 +5,7 @@
     "": {
       "name": "recallnest",
       "dependencies": {
-        "@hono/node-server": "1.19.17",
+        "@hono/node-server": "2.1.5",
         "@lancedb/lancedb": "^0.26.0",
         "@modelcontextprotocol/sdk": "^1.31.0",
         "commander": "^12.0.0",
@@ -83,7 +83,7 @@
 
     "@esbuild/win32-x64": ["@esbuild/win32-x64@0.28.2", "", { "os": "win32", "cpu": "x64" }, "sha512-5ebpxr3nWMzrL/rnUI755Jkuee0bHL/Gq0WTF9lvcpv73wAp5eu8MfBUgWK9bhWvZjj7yX8etf/8tI8Ney695g=="],
 
-    "@hono/node-server": ["@hono/node-server@1.19.17", "", { "peerDependencies": { "hono": "^4" } }, "sha512-dSneS5qhiauZWGDCeK4o695Xd9nUNjviSZCMQrj10eetr8Uln1ucn6bbphOM6UynAMMtNIzZNSpL9vnASJwrPQ=="],
+    "@hono/node-server": ["@hono/node-server@2.1.5", "", { "peerDependencies": { "hono": "^4 || ^5.0.0-0" } }, "sha512-MgP/I06GdvsilDspMk/qmRzpk8LOUStP6jFAbSRi40W09DhoyUn+Mj7eyKICPqeYKybOjVFLVIAQzvu1bfIa7Q=="],
 
     "@lancedb/lancedb": ["@lancedb/lancedb@0.26.2", "", { "dependencies": { "reflect-metadata": "^0.2.2" }, "optionalDependencies": { "@lancedb/lancedb-darwin-arm64": "0.26.2", "@lancedb/lancedb-linux-arm64-gnu": "0.26.2", "@lancedb/lancedb-linux-arm64-musl": "0.26.2", "@lancedb/lancedb-linux-x64-gnu": "0.26.2", "@lancedb/lancedb-linux-x64-musl": "0.26.2", "@lancedb/lancedb-win32-arm64-msvc": "0.26.2", "@lancedb/lancedb-win32-x64-msvc": "0.26.2" }, "peerDependencies": { "apache-arrow": ">=15.0.0 <=18.1.0" }, "os": [ "linux", "win32", "darwin", ], "cpu": [ "x64", "arm64", ] }, "sha512-umk4WMCTwJntLquwvUbpqE+TXREolcQVL9MHcxr8EhRjsha88+ATJ4QuS/hpyiE1CG3R/XcgrMgJAGkziPC/gA=="],
 
