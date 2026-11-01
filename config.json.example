@@ -38,6 +38,7 @@
     "bm25Weight": 0.3,
     "recencyHalfLifeDays": 30,
     "timeDecayHalfLifeDays": 120,
+    "_comment_hardMinScore": "hardMinScore is only the floor for categories NOT in categoryMinScores. The built-in categoryMinScores covers all six categories (profile/preferences 0.25, entities 0.30, events 0.35, cases 0.40, patterns 0.45), so this 0.3 only reaches legacy categories (preference, fact, decision, entity, other). To change the floor for one of the six, set retrieval.categoryMinScores - it replaces the built-in map as a whole (list every category you want kept, or the rest drop to hardMinScore), and the writing / debug / fact-check profiles override it with their own scaled map.",
     "hardMinScore": 0.3
   },
   "scopeRelations": {
