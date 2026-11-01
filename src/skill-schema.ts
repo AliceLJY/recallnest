@@ -20,6 +20,8 @@
 
 import { z } from "zod";
 
+import { isoDateTimeSchema } from "./schema-utils.js";
+
 export const SkillImplementationTypeSchema = z.enum([
   "instruction_sequence",
 ]);
@@ -43,10 +45,10 @@ export type SkillInput = z.infer<typeof SkillInputSchema>;
 
 export const StoredSkillRecordSchema = SkillInputSchema.extend({
   id: z.string(),
-  storedAt: z.string().datetime(),
+  storedAt: isoDateTimeSchema(),
   successCount: z.number().default(0),
   failureCount: z.number().default(0),
-  lastRefinedAt: z.string().datetime().optional(),
+  lastRefinedAt: isoDateTimeSchema().optional(),
 });
 
 export type StoredSkillRecord = z.infer<typeof StoredSkillRecordSchema>;
