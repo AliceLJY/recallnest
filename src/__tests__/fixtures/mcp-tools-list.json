@@ -12,6 +12,8 @@
           "description": "Memory text to store"
         },
         "category": {
+          "default": "events",
+          "description": "Durable memory category",
           "type": "string",
           "enum": [
             "profile",
@@ -20,16 +22,14 @@
             "events",
             "cases",
             "patterns"
-          ],
-          "default": "events",
-          "description": "Durable memory category"
+          ]
         },
         "importance": {
+          "default": 0.7,
+          "description": "Importance score from 0 to 1",
           "type": "number",
           "minimum": 0,
-          "maximum": 1,
-          "default": 0.7,
-          "description": "Importance score from 0 to 1"
+          "maximum": 1
         },
         "scope": {
           "type": "string",
@@ -38,6 +38,8 @@
           "description": "Required scope such as project:recallnest or session:abc123"
         },
         "source": {
+          "default": "manual",
+          "description": "How this memory was captured",
           "type": "string",
           "enum": [
             "manual",
@@ -45,69 +47,68 @@
             "api",
             "session_distill",
             "conversation_import"
-          ],
-          "default": "manual",
-          "description": "How this memory was captured"
+          ]
         },
         "tags": {
+          "default": [],
+          "description": "Optional tags",
+          "maxItems": 8,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 40
-          },
-          "maxItems": 8,
-          "default": [],
-          "description": "Optional tags"
+          }
         },
         "canonicalKey": {
+          "description": "Optional stable key for merge/update semantics",
           "type": "string",
           "minLength": 1,
-          "maxLength": 120,
-          "description": "Optional stable key for merge/update semantics"
+          "maxLength": 120
         },
         "topicTag": {
+          "description": "Optional topic tag for intra-scope partitioning (e.g. 'auth', 'deploy', 'testing'). Auto-detected if omitted.",
           "type": "string",
           "minLength": 1,
-          "maxLength": 60,
-          "description": "Optional topic tag for intra-scope partitioning (e.g. 'auth', 'deploy', 'testing'). Auto-detected if omitted."
+          "maxLength": 60
         },
         "privacyTier": {
+          "default": "durable",
+          "description": "Privacy tier: ephemeral (auto-expire, no KG), private (persist, no KG), durable (default), shared (cross-scope)",
           "type": "string",
           "enum": [
             "ephemeral",
             "private",
             "durable",
             "shared"
-          ],
-          "default": "durable",
-          "description": "Privacy tier: ephemeral (auto-expire, no KG), private (persist, no KG), durable (default), shared (cross-scope)"
+          ]
         },
         "triggers": {
+          "description": "写入时预演触发器：这条记忆「她以后会怎么问起」的 2–5 句口语问法，各说一个角度、别互为变体、别复述正文。只参与召回、不进正文。scope 为 memory:pivot 时必填（§5.3）。例：[\"那个跑分要不要再跑一次\", \"别人的榜我们要不要也去排个名\"]",
+          "maxItems": 6,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 2,
             "maxLength": 200
-          },
-          "maxItems": 6,
-          "description": "写入时预演触发器：这条记忆「她以后会怎么问起」的 2–5 句口语问法，各说一个角度、别互为变体、别复述正文。只参与召回、不进正文。scope 为 memory:pivot 时必填（§5.3）。例：[\"那个跑分要不要再跑一次\", \"别人的榜我们要不要也去排个名\"]"
+          }
         },
         "validUntil": {
+          "description": "Optional expiration: ISO date string or ms timestamp. Memory will be deprioritized after this time.",
           "type": [
             "string",
             "number"
-          ],
-          "description": "Optional expiration: ISO date string or ms timestamp. Memory will be deprioritized after this time."
+          ]
         },
         "eventTime": {
+          "description": "Optional event time: when the event actually happened (ISO date or ms), distinct from storage time.",
           "type": [
             "string",
             "number"
-          ],
-          "description": "Optional event time: when the event actually happened (ISO date or ms), distinct from storage time."
+          ]
         },
         "confidence": {
+          "description": "Optional confidence override: number (0-1) or {score, reliability}. Auto-assigned from source if omitted.",
           "anyOf": [
             {
               "type": "number",
@@ -133,13 +134,14 @@
               },
               "required": [
                 "score"
-              ],
-              "additionalProperties": false
+              ]
             }
-          ],
-          "description": "Optional confidence override: number (0-1) or {score, reliability}. Auto-assigned from source if omitted."
+          ]
         },
         "dependsOn": {
+          "description": "Optional freshness dependencies (borrowed). Declare what this memory depends on so recall shows a cheap validity verdict (exact/compatible/uncertain/invalid). Items: {kind:'file'|'git-rev', ref, expected?}. file → ref=path, expected=mtime-ms string; git-rev → ref=repo path, expected=commit hash (short ok). expected may be an array: first=exact, rest=compatible set. Omit expected for existence-only checks.",
+          "minItems": 1,
+          "maxItems": 8,
           "type": "array",
           "items": {
             "type": "object",
@@ -164,14 +166,14 @@
                     "maxLength": 200
                   },
                   {
+                    "minItems": 1,
+                    "maxItems": 8,
                     "type": "array",
                     "items": {
                       "type": "string",
                       "minLength": 1,
                       "maxLength": 200
-                    },
-                    "minItems": 1,
-                    "maxItems": 8
+                    }
                   }
                 ]
               }
@@ -179,19 +181,14 @@
             "required": [
               "kind",
               "ref"
-            ],
-            "additionalProperties": false
-          },
-          "minItems": 1,
-          "maxItems": 8,
-          "description": "Optional freshness dependencies (borrowed). Declare what this memory depends on so recall shows a cheap validity verdict (exact/compatible/uncertain/invalid). Items: {kind:'file'|'git-rev', ref, expected?}. file → ref=path, expected=mtime-ms string; git-rev → ref=repo path, expected=commit hash (short ok). expected may be an array: first=exact, rest=compatible set. Omit expected for existence-only checks."
+            ]
+          }
         }
       },
       "required": [
         "text",
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -223,10 +220,10 @@
           "description": "Required scope"
         },
         "expiresInDays": {
+          "description": "Optional: auto-expire after N days",
           "type": "number",
           "minimum": 1,
-          "maximum": 365,
-          "description": "Optional: auto-expire after N days"
+          "maximum": 365
         }
       },
       "required": [
@@ -234,7 +231,6 @@
         "action",
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -254,10 +250,10 @@
           "description": "Current session identifier"
         },
         "scope": {
+          "description": "Optional shared scope; defaults to session:<sessionId>",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Optional shared scope; defaults to session:<sessionId>"
+          "maxLength": 160
         },
         "summary": {
           "type": "string",
@@ -266,83 +262,82 @@
           "description": "Compact summary of the current work state"
         },
         "task": {
+          "description": "Optional task label",
           "type": "string",
           "minLength": 1,
-          "maxLength": 240,
-          "description": "Optional task label"
+          "maxLength": 240
         },
         "decisions": {
+          "default": [],
+          "description": "Key decisions already made",
+          "maxItems": 6,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 200
-          },
-          "maxItems": 6,
-          "default": [],
-          "description": "Key decisions already made"
+          }
         },
         "openLoops": {
+          "default": [],
+          "description": "Unresolved questions or pending items",
+          "maxItems": 6,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 200
-          },
-          "maxItems": 6,
-          "default": [],
-          "description": "Unresolved questions or pending items"
+          }
         },
         "nextActions": {
+          "default": [],
+          "description": "Next actions to take",
+          "maxItems": 6,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 200
-          },
-          "maxItems": 6,
-          "default": [],
-          "description": "Next actions to take"
+          }
         },
         "entities": {
+          "default": [],
+          "description": "Relevant projects, tools, or people",
+          "maxItems": 8,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 120
-          },
-          "maxItems": 8,
-          "default": [],
-          "description": "Relevant projects, tools, or people"
+          }
         },
         "files": {
+          "default": [],
+          "description": "Relevant files or paths",
+          "maxItems": 12,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 220
-          },
-          "maxItems": 12,
-          "default": [],
-          "description": "Relevant files or paths"
+          }
         },
         "idempotencyKey": {
+          "description": "Optional stable request key; repeated saves with the same key replace the prior checkpoint",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Optional stable request key; repeated saves with the same key replace the prior checkpoint"
+          "maxLength": 160
         },
         "updatedAt": {
+          "description": "Optional override; defaults to now",
           "type": "string",
-          "format": "date-time",
-          "description": "Optional override; defaults to now"
+          "format": "date-time"
         }
       },
       "required": [
         "sessionId",
         "summary"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -356,19 +351,18 @@
       "type": "object",
       "properties": {
         "sessionId": {
+          "description": "Session identifier filter, e.g. 'abc123'",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Session identifier filter, e.g. 'abc123'"
+          "maxLength": 160
         },
         "scope": {
+          "description": "Shared scope filter, e.g. 'project:recallnest'",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Shared scope filter, e.g. 'project:recallnest'"
+          "maxLength": 160
         }
       },
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -382,57 +376,56 @@
       "type": "object",
       "properties": {
         "task": {
+          "description": "Optional current task or question to bias recall",
           "type": "string",
           "minLength": 1,
-          "maxLength": 500,
-          "description": "Optional current task or question to bias recall"
+          "maxLength": 500
         },
         "scope": {
+          "description": "Optional shared scope for project or terminal continuity",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Optional shared scope for project or terminal continuity"
+          "maxLength": 160
         },
         "sessionId": {
+          "description": "Optional session identifier to recover the latest checkpoint",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Optional session identifier to recover the latest checkpoint"
+          "maxLength": 160
         },
         "limitPerSection": {
+          "default": 3,
+          "description": "Max items per section",
           "type": "integer",
           "minimum": 1,
-          "maximum": 6,
-          "default": 3,
-          "description": "Max items per section"
+          "maximum": 6
         },
         "includeLatestCheckpoint": {
-          "type": "boolean",
           "default": true,
-          "description": "Whether to include the latest checkpoint summary"
+          "description": "Whether to include the latest checkpoint summary",
+          "type": "boolean"
         },
         "profile": {
+          "description": "Retrieval profile",
           "type": "string",
           "enum": [
             "default",
             "writing",
             "debug",
             "fact-check"
-          ],
-          "description": "Retrieval profile"
+          ]
         },
         "mode": {
+          "description": "Override recall mode: 'full' (default), 'light' (<300 tokens), 'summary' (checkpoint only), 'off'",
           "type": "string",
           "enum": [
             "full",
             "light",
             "summary",
             "off"
-          ],
-          "description": "Override recall mode: 'full' (default), 'light' (<300 tokens), 'summary' (checkpoint only), 'off'"
+          ]
         }
       },
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -450,33 +443,34 @@
           "description": "Search query — natural language or keywords"
         },
         "limit": {
+          "default": 5,
+          "description": "Max results to return",
           "type": "number",
           "minimum": 1,
-          "maximum": 20,
-          "default": 5,
-          "description": "Max results to return"
+          "maximum": 20
         },
         "scope": {
-          "type": "string",
-          "description": "Explicit scope; reuse Scope returned by resume_context. May be omitted when sessionId or configured environment supplies a scope, or allScopes=true explicitly requests cross-scope search. Omission alone does not mean global search."
+          "description": "Explicit scope; reuse Scope returned by resume_context. May be omitted when sessionId or configured environment supplies a scope, or allScopes=true explicitly requests cross-scope search. Omission alone does not mean global search.",
+          "type": "string"
         },
         "sessionId": {
+          "description": "Optional session identifier to infer session:<id> scope",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Optional session identifier to infer session:<id> scope"
+          "maxLength": 160
         },
         "allScopes": {
-          "type": "boolean",
           "default": false,
-          "description": "When true, explicitly allow cross-scope search"
+          "description": "When true, explicitly allow cross-scope search",
+          "type": "boolean"
         },
         "includeRelatedScopes": {
-          "type": "boolean",
           "default": false,
-          "description": "When true, also query configured related scopes from scopeRelations and show them in a separate sidecar section. Requires an explicit or inferred scoped search; never changes the main result ranking."
+          "description": "When true, also query configured related scopes from scopeRelations and show them in a separate sidecar section. Requires an explicit or inferred scoped search; never changes the main result ranking.",
+          "type": "boolean"
         },
         "category": {
+          "description": "Filter by memory category: profile (identity/background), preferences (habits/style), entities (projects/tools/people), events (past happenings), cases (problem-solution pairs), patterns (reusable workflows)",
           "type": "string",
           "enum": [
             "profile",
@@ -485,82 +479,80 @@
             "events",
             "cases",
             "patterns"
-          ],
-          "description": "Filter by memory category: profile (identity/background), preferences (habits/style), entities (projects/tools/people), events (past happenings), cases (problem-solution pairs), patterns (reusable workflows)"
+          ]
         },
         "profile": {
+          "description": "Retrieval profile",
           "type": "string",
           "enum": [
             "default",
             "writing",
             "debug",
             "fact-check"
-          ],
-          "description": "Retrieval profile"
+          ]
         },
         "render": {
+          "description": "Result rendering mode: verbatim (default, original order) or highlight (reorder by contextual relevance to query)",
+          "default": "verbatim",
           "type": "string",
           "enum": [
             "verbatim",
             "highlight"
-          ],
-          "default": "verbatim",
-          "description": "Result rendering mode: verbatim (default, original order) or highlight (reorder by contextual relevance to query)"
+          ]
         },
         "after": {
-          "type": "string",
-          "description": "Filter memories stored after this date (ISO format YYYY-MM-DD, or relative like '最近30天', 'last 7 days')"
+          "description": "Filter memories stored after this date (ISO format YYYY-MM-DD, or relative like '最近30天', 'last 7 days')",
+          "type": "string"
         },
         "before": {
-          "type": "string",
-          "description": "Filter memories stored before this date (ISO format YYYY-MM-DD, or relative)"
+          "description": "Filter memories stored before this date (ISO format YYYY-MM-DD, or relative)",
+          "type": "string"
         },
         "graph": {
-          "type": "boolean",
+          "description": "Enable KG graph traversal (PPR) for relationship-aware search. Use when query involves entity relationships (e.g. 'what tools does Alice use', 'Bob的朋友').",
           "default": false,
-          "description": "Enable KG graph traversal (PPR) for relationship-aware search. Use when query involves entity relationships (e.g. 'what tools does Alice use', 'Bob的朋友')."
+          "type": "boolean"
         },
         "includeArchived": {
-          "type": "boolean",
+          "description": "When true, also return archived/superseded/consolidated memories (default: only active)",
           "default": false,
-          "description": "When true, also return archived/superseded/consolidated memories (default: only active)"
+          "type": "boolean"
         },
         "detail_level": {
+          "description": "Result detail level: normal (default — the full text of each hit, in rank order. One entry is capped at 2400 chars. Full text is handed out until an 8k-token budget is used up; hits past that point get a query-aware snippet instead of being dropped, so a long list can run past 8k by one snippet per remaining hit, and each related-scope block has its own budget. Any shortened entry says how much of it is shown and gives the id for memory_drill_down), brief (ID+score+one-liner), full (table with 120-char snippets plus extra metadata), adaptive (full text only for hits scoring above the threshold, query-aware snippet for the rest, 8k-token budget)",
+          "default": "normal",
           "type": "string",
           "enum": [
             "brief",
             "normal",
             "full",
             "adaptive"
-          ],
-          "default": "normal",
-          "description": "Result detail level: normal (default — the full text of each hit, in rank order. One entry is capped at 2400 chars. Full text is handed out until an 8k-token budget is used up; hits past that point get a query-aware snippet instead of being dropped, so a long list can run past 8k by one snippet per remaining hit, and each related-scope block has its own budget. Any shortened entry says how much of it is shown and gives the id for memory_drill_down), brief (ID+score+one-liner), full (table with 120-char snippets plus extra metadata), adaptive (full text only for hits scoring above the threshold, query-aware snippet for the rest, 8k-token budget)"
+          ]
         },
         "topicTag": {
+          "description": "Filter by topic tag (e.g. 'auth', 'deploy', 'testing'). Only returns memories tagged with this topic.",
           "type": "string",
           "minLength": 1,
-          "maxLength": 60,
-          "description": "Filter by topic tag (e.g. 'auth', 'deploy', 'testing'). Only returns memories tagged with this topic."
+          "maxLength": 60
         },
         "reconstruct": {
-          "type": "boolean",
           "default": false,
-          "description": "Return LLM-synthesized reconstruction alongside raw results. Requires RECALLNEST_CONSTRUCTIVE_RETRIEVAL=true."
+          "description": "Return LLM-synthesized reconstruction alongside raw results. Requires RECALLNEST_CONSTRUCTIVE_RETRIEVAL=true.",
+          "type": "boolean"
         },
         "validAt": {
-          "type": "string",
-          "description": "Query memories valid at a specific point in time (ISO date, e.g. '2025-06-15'). Returns only memories whose validity window covers this date."
+          "description": "Query memories valid at a specific point in time (ISO date, e.g. '2025-06-15'). Returns only memories whose validity window covers this date.",
+          "type": "string"
         },
         "includeExpired": {
-          "type": "boolean",
+          "description": "When true, include expired memories in results (demoted 80%). Default: only active/non-expired.",
           "default": false,
-          "description": "When true, include expired memories in results (demoted 80%). Default: only active/non-expired."
+          "type": "boolean"
         }
       },
       "required": [
         "query"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -574,17 +566,16 @@
       "type": "object",
       "properties": {
         "tier": {
+          "description": "Which tier of tools to list. Returns tools at this tier and below.",
+          "default": "advanced",
           "type": "string",
           "enum": [
             "core",
             "advanced",
             "full"
-          ],
-          "default": "advanced",
-          "description": "Which tier of tools to list. Returns tools at this tier and below."
+          ]
         }
       },
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -610,39 +601,39 @@
           "description": "When this workflow should be used"
         },
         "steps": {
+          "minItems": 1,
+          "maxItems": 8,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 220
           },
-          "minItems": 1,
-          "maxItems": 8,
           "description": "Ordered workflow steps"
         },
         "outcome": {
+          "description": "Optional expected outcome",
           "type": "string",
           "minLength": 1,
-          "maxLength": 240,
-          "description": "Optional expected outcome"
+          "maxLength": 240
         },
         "tools": {
+          "default": [],
+          "description": "Optional tools, commands, or interfaces involved",
+          "maxItems": 6,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 60
-          },
-          "maxItems": 6,
-          "default": [],
-          "description": "Optional tools, commands, or interfaces involved"
+          }
         },
         "importance": {
+          "default": 0.82,
+          "description": "Importance score from 0 to 1",
           "type": "number",
           "minimum": 0,
-          "maximum": 1,
-          "default": 0.82,
-          "description": "Importance score from 0 to 1"
+          "maximum": 1
         },
         "scope": {
           "type": "string",
@@ -651,6 +642,8 @@
           "description": "Required scope such as project:recallnest or session:abc123"
         },
         "source": {
+          "default": "agent",
+          "description": "How this pattern was captured",
           "type": "string",
           "enum": [
             "manual",
@@ -658,26 +651,24 @@
             "api",
             "session_distill",
             "conversation_import"
-          ],
-          "default": "agent",
-          "description": "How this pattern was captured"
+          ]
         },
         "tags": {
+          "default": [],
+          "description": "Optional tags",
+          "maxItems": 8,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 40
-          },
-          "maxItems": 8,
-          "default": [],
-          "description": "Optional tags"
+          }
         },
         "canonicalKey": {
+          "description": "Optional stable key for merge/update semantics",
           "type": "string",
           "minLength": 1,
-          "maxLength": 120,
-          "description": "Optional stable key for merge/update semantics"
+          "maxLength": 120
         }
       },
       "required": [
@@ -686,7 +677,6 @@
         "steps",
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -712,6 +702,8 @@
           "description": "Required scope such as project:recallnest or session:abc123"
         },
         "source": {
+          "default": "agent",
+          "description": "How this memory was captured",
           "type": "string",
           "enum": [
             "manual",
@@ -719,16 +711,13 @@
             "api",
             "session_distill",
             "conversation_import"
-          ],
-          "default": "agent",
-          "description": "How this memory was captured"
+          ]
         }
       },
       "required": [
         "text",
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -754,45 +743,45 @@
           "description": "What problem happened"
         },
         "context": {
+          "description": "Optional context or preconditions",
           "type": "string",
           "minLength": 1,
-          "maxLength": 240,
-          "description": "Optional context or preconditions"
+          "maxLength": 240
         },
         "solutionSteps": {
+          "minItems": 1,
+          "maxItems": 8,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 220
           },
-          "minItems": 1,
-          "maxItems": 8,
           "description": "Ordered solution steps"
         },
         "outcome": {
+          "description": "Optional result or resolution",
           "type": "string",
           "minLength": 1,
-          "maxLength": 240,
-          "description": "Optional result or resolution"
+          "maxLength": 240
         },
         "tools": {
+          "default": [],
+          "description": "Optional tools, commands, or interfaces involved",
+          "maxItems": 6,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 60
-          },
-          "maxItems": 6,
-          "default": [],
-          "description": "Optional tools, commands, or interfaces involved"
+          }
         },
         "importance": {
+          "default": 0.84,
+          "description": "Importance score from 0 to 1",
           "type": "number",
           "minimum": 0,
-          "maximum": 1,
-          "default": 0.84,
-          "description": "Importance score from 0 to 1"
+          "maximum": 1
         },
         "scope": {
           "type": "string",
@@ -801,6 +790,8 @@
           "description": "Required scope such as project:recallnest or session:abc123"
         },
         "source": {
+          "default": "agent",
+          "description": "How this case was captured",
           "type": "string",
           "enum": [
             "manual",
@@ -808,28 +799,27 @@
             "api",
             "session_distill",
             "conversation_import"
-          ],
-          "default": "agent",
-          "description": "How this case was captured"
+          ]
         },
         "tags": {
+          "default": [],
+          "description": "Optional tags",
+          "maxItems": 8,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 40
-          },
-          "maxItems": 8,
-          "default": [],
-          "description": "Optional tags"
+          }
         },
         "canonicalKey": {
+          "description": "Optional stable key for merge/update semantics",
           "type": "string",
           "minLength": 1,
-          "maxLength": 120,
-          "description": "Optional stable key for merge/update semantics"
+          "maxLength": 120
         },
         "debugFraming": {
+          "description": "Optional break-loop 五维归因 (rootCause/whyPriorFixFailed/defense/systematicExtension/knowledgeFix)",
           "type": "object",
           "properties": {
             "rootCause": {
@@ -844,31 +834,29 @@
               "description": "根因归类：缺spec/跨层契约/改动传播失败/测试覆盖缺口/隐式假设"
             },
             "whyPriorFixFailed": {
+              "description": "为何之前没修对",
               "type": "string",
-              "maxLength": 300,
-              "description": "为何之前没修对"
+              "maxLength": 300
             },
             "defense": {
+              "description": "防御机制（强度：架构>编译期>运行期>测试>review>文档）",
               "type": "string",
-              "maxLength": 300,
-              "description": "防御机制（强度：架构>编译期>运行期>测试>review>文档）"
+              "maxLength": 300
             },
             "systematicExtension": {
+              "description": "系统性扩展：同类问题还在哪",
               "type": "string",
-              "maxLength": 300,
-              "description": "系统性扩展：同类问题还在哪"
+              "maxLength": 300
             },
             "knowledgeFix": {
+              "description": "知识固化：沉淀去向",
               "type": "string",
-              "maxLength": 300,
-              "description": "知识固化：沉淀去向"
+              "maxLength": 300
             }
           },
           "required": [
             "rootCause"
-          ],
-          "additionalProperties": false,
-          "description": "Optional break-loop 五维归因 (rootCause/whyPriorFixFailed/defense/systematicExtension/knowledgeFix)"
+          ]
         }
       },
       "required": [
@@ -877,7 +865,6 @@
         "solutionSteps",
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -897,12 +884,13 @@
           "description": "Existing evidence memory ID or unique prefix"
         },
         "text": {
+          "description": "Optional cleaned durable text; defaults to the source entry text",
           "type": "string",
           "minLength": 1,
-          "maxLength": 4000,
-          "description": "Optional cleaned durable text; defaults to the source entry text"
+          "maxLength": 4000
         },
         "category": {
+          "description": "Optional target durable category; defaults to the source evidence category or its originalCategory",
           "type": "string",
           "enum": [
             "profile",
@@ -911,15 +899,14 @@
             "events",
             "cases",
             "patterns"
-          ],
-          "description": "Optional target durable category; defaults to the source evidence category or its originalCategory"
+          ]
         },
         "importance": {
+          "default": 0.78,
+          "description": "Importance score from 0 to 1",
           "type": "number",
           "minimum": 0,
-          "maximum": 1,
-          "default": 0.78,
-          "description": "Importance score from 0 to 1"
+          "maximum": 1
         },
         "scope": {
           "type": "string",
@@ -928,6 +915,8 @@
           "description": "Required target scope such as project:recallnest or session:abc123"
         },
         "source": {
+          "default": "agent",
+          "description": "How this promotion was captured",
           "type": "string",
           "enum": [
             "manual",
@@ -935,33 +924,30 @@
             "api",
             "session_distill",
             "conversation_import"
-          ],
-          "default": "agent",
-          "description": "How this promotion was captured"
+          ]
         },
         "tags": {
+          "default": [],
+          "description": "Optional tags",
+          "maxItems": 8,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 40
-          },
-          "maxItems": 8,
-          "default": [],
-          "description": "Optional tags"
+          }
         },
         "canonicalKey": {
+          "description": "Optional stable key for merge/update semantics",
           "type": "string",
           "minLength": 1,
-          "maxLength": 120,
-          "description": "Optional stable key for merge/update semantics"
+          "maxLength": 120
         }
       },
       "required": [
         "memoryId",
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -979,28 +965,29 @@
           "description": "Search query to explain — natural language or keywords, e.g. 'auth migration'"
         },
         "limit": {
+          "default": 5,
+          "description": "Maximum number of matched results to analyze and explain (default: 5)",
           "type": "number",
           "minimum": 1,
-          "maximum": 20,
-          "default": 5,
-          "description": "Maximum number of matched results to analyze and explain (default: 5)"
+          "maximum": 20
         },
         "scope": {
-          "type": "string",
-          "description": "Restrict to a specific scope, e.g. 'project:myapp'. Omit to use default scope"
+          "description": "Restrict to a specific scope, e.g. 'project:myapp'. Omit to use default scope",
+          "type": "string"
         },
         "sessionId": {
+          "description": "Session identifier to infer session-scoped search, e.g. 'abc123'",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Session identifier to infer session-scoped search, e.g. 'abc123'"
+          "maxLength": 160
         },
         "allScopes": {
-          "type": "boolean",
           "default": false,
-          "description": "Set to true to search across all scopes instead of the default scope"
+          "description": "Set to true to search across all scopes instead of the default scope",
+          "type": "boolean"
         },
         "category": {
+          "description": "Filter results by memory category, e.g. 'preference', 'decision', 'fact'",
           "type": "string",
           "enum": [
             "profile",
@@ -1009,24 +996,22 @@
             "events",
             "cases",
             "patterns"
-          ],
-          "description": "Filter results by memory category, e.g. 'preference', 'decision', 'fact'"
+          ]
         },
         "profile": {
+          "description": "Retrieval profile that tunes ranking: 'debug' for technical, 'fact-check' for precision",
           "type": "string",
           "enum": [
             "default",
             "writing",
             "debug",
             "fact-check"
-          ],
-          "description": "Retrieval profile that tunes ranking: 'debug' for technical, 'fact-check' for precision"
+          ]
         }
       },
       "required": [
         "query"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1044,42 +1029,41 @@
           "description": "Natural language topic or task to distill, e.g. 'authentication migration decisions'"
         },
         "limit": {
+          "default": 8,
+          "description": "Maximum number of retrieved memories to include in the distillation (default: 8)",
           "type": "number",
           "minimum": 1,
-          "maximum": 20,
-          "default": 8,
-          "description": "Maximum number of retrieved memories to include in the distillation (default: 8)"
+          "maximum": 20
         },
         "scope": {
-          "type": "string",
-          "description": "Restrict search to a specific scope, e.g. 'project:myapp'. Omit to use the default scope"
+          "description": "Restrict search to a specific scope, e.g. 'project:myapp'. Omit to use the default scope",
+          "type": "string"
         },
         "sessionId": {
+          "description": "Session identifier to infer session-scoped search, e.g. 'abc123'",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Session identifier to infer session-scoped search, e.g. 'abc123'"
+          "maxLength": 160
         },
         "allScopes": {
-          "type": "boolean",
           "default": false,
-          "description": "Set to true to search across all scopes instead of the default scope"
+          "description": "Set to true to search across all scopes instead of the default scope",
+          "type": "boolean"
         },
         "profile": {
+          "description": "Retrieval profile that tunes ranking weights: 'writing' for narrative, 'debug' for technical, 'fact-check' for high-precision",
           "type": "string",
           "enum": [
             "default",
             "writing",
             "debug",
             "fact-check"
-          ],
-          "description": "Retrieval profile that tunes ranking weights: 'writing' for narrative, 'debug' for technical, 'fact-check' for high-precision"
+          ]
         }
       },
       "required": [
         "query"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1097,46 +1081,45 @@
           "description": "Natural language topic or task to brief, e.g. 'deployment pipeline architecture decisions'"
         },
         "limit": {
+          "default": 8,
+          "description": "Maximum number of source memories to include in the brief (default: 8)",
           "type": "number",
           "minimum": 1,
-          "maximum": 20,
-          "default": 8,
-          "description": "Maximum number of source memories to include in the brief (default: 8)"
+          "maximum": 20
         },
         "scope": {
-          "type": "string",
-          "description": "Restrict search to a specific scope, e.g. 'project:myapp'. Omit to use the default scope"
+          "description": "Restrict search to a specific scope, e.g. 'project:myapp'. Omit to use the default scope",
+          "type": "string"
         },
         "sessionId": {
+          "description": "Session identifier to infer session-scoped search, e.g. 'abc123'",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Session identifier to infer session-scoped search, e.g. 'abc123'"
+          "maxLength": 160
         },
         "allScopes": {
-          "type": "boolean",
           "default": false,
-          "description": "Set to true to search across all scopes instead of the default scope"
+          "description": "Set to true to search across all scopes instead of the default scope",
+          "type": "boolean"
         },
         "profile": {
+          "description": "Retrieval profile that tunes ranking weights: 'writing' for narrative, 'debug' for technical, 'fact-check' for high-precision",
           "type": "string",
           "enum": [
             "default",
             "writing",
             "debug",
             "fact-check"
-          ],
-          "description": "Retrieval profile that tunes ranking weights: 'writing' for narrative, 'debug' for technical, 'fact-check' for high-precision"
+          ]
         },
         "title": {
-          "type": "string",
-          "description": "Human-readable title for the brief asset, e.g. 'Q1 Auth Migration Summary'. Auto-generated if omitted"
+          "description": "Human-readable title for the brief asset, e.g. 'Q1 Auth Migration Summary'. Auto-generated if omitted",
+          "type": "string"
         }
       },
       "required": [
         "query"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1154,47 +1137,46 @@
           "description": "Memory ID or unique prefix from search/explain output, e.g. 'a1b2c3d4'"
         },
         "scope": {
-          "type": "string",
-          "description": "Explicit scope filter, e.g. 'project:recallnest'"
+          "description": "Explicit scope filter, e.g. 'project:recallnest'",
+          "type": "string"
         },
         "sessionId": {
+          "description": "Session identifier to infer session:<id> scope, e.g. 'abc123'",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Session identifier to infer session:<id> scope, e.g. 'abc123'"
+          "maxLength": 160
         },
         "allScopes": {
-          "type": "boolean",
           "default": false,
-          "description": "When true, allow cross-scope reads to find the memory"
+          "description": "When true, allow cross-scope reads to find the memory",
+          "type": "boolean"
         },
         "title": {
-          "type": "string",
-          "description": "Human-readable title for the pin, e.g. 'Auth migration decision'"
+          "description": "Human-readable title for the pin, e.g. 'Auth migration decision'",
+          "type": "string"
         },
         "summary": {
-          "type": "string",
-          "description": "Short summary override for the pinned asset"
+          "description": "Short summary override for the pinned asset",
+          "type": "string"
         },
         "query": {
-          "type": "string",
-          "description": "Original query that led to this pin, e.g. 'auth decisions'"
+          "description": "Original query that led to this pin, e.g. 'auth decisions'",
+          "type": "string"
         },
         "profile": {
+          "description": "Retrieval profile for ranking, e.g. 'debug'",
           "type": "string",
           "enum": [
             "default",
             "writing",
             "debug",
             "fact-check"
-          ],
-          "description": "Retrieval profile for ranking, e.g. 'debug'"
+          ]
         }
       },
       "required": [
         "memory_id"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1212,51 +1194,50 @@
           "description": "Topic or task to export, e.g. 'auth migration decisions'"
         },
         "limit": {
+          "default": 8,
+          "description": "Maximum number of source memories to include in the export (default: 8)",
           "type": "number",
           "minimum": 1,
-          "maximum": 20,
-          "default": 8,
-          "description": "Maximum number of source memories to include in the export (default: 8)"
+          "maximum": 20
         },
         "scope": {
-          "type": "string",
-          "description": "Restrict to a specific scope, e.g. 'project:recallnest'. Omit to use default scope"
+          "description": "Restrict to a specific scope, e.g. 'project:recallnest'. Omit to use default scope",
+          "type": "string"
         },
         "sessionId": {
+          "description": "Session identifier to infer session-scoped search, e.g. 'abc123'",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Session identifier to infer session-scoped search, e.g. 'abc123'"
+          "maxLength": 160
         },
         "allScopes": {
-          "type": "boolean",
           "default": false,
-          "description": "Set to true to search across all scopes instead of the default scope"
+          "description": "Set to true to search across all scopes instead of the default scope",
+          "type": "boolean"
         },
         "profile": {
+          "description": "Retrieval profile for ranking, e.g. 'writing'",
           "type": "string",
           "enum": [
             "default",
             "writing",
             "debug",
             "fact-check"
-          ],
-          "description": "Retrieval profile for ranking, e.g. 'writing'"
+          ]
         },
         "format": {
+          "default": "md",
+          "description": "Export format: 'md' for markdown, 'json' for structured JSON",
           "type": "string",
           "enum": [
             "md",
             "json"
-          ],
-          "default": "md",
-          "description": "Export format: 'md' for markdown, 'json' for structured JSON"
+          ]
         }
       },
       "required": [
         "query"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1270,14 +1251,13 @@
       "type": "object",
       "properties": {
         "limit": {
+          "default": 12,
+          "description": "Maximum number of assets to return, sorted most-recent-first (default: 12, max: 50)",
           "type": "number",
           "minimum": 1,
-          "maximum": 50,
-          "default": 12,
-          "description": "Maximum number of assets to return, sorted most-recent-first (default: 12, max: 50)"
+          "maximum": 50
         }
       },
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1297,27 +1277,26 @@
           "description": "Memory ID to forget (full UUID or 8+ hex prefix)"
         },
         "confirm": {
-          "type": "boolean",
           "default": false,
-          "description": "Required confirmation — must be true for durable-tier memories"
+          "description": "Required confirmation — must be true for durable-tier memories",
+          "type": "boolean"
         },
         "reason": {
+          "description": "Reason for forgetting (recorded in audit trail)",
           "type": "string",
           "minLength": 1,
-          "maxLength": 200,
-          "description": "Reason for forgetting (recorded in audit trail)"
+          "maxLength": 200
         },
         "scope": {
+          "description": "Optional scope filter for permission check",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Optional scope filter for permission check"
+          "maxLength": 160
         }
       },
       "required": [
         "memoryId"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1331,14 +1310,13 @@
       "type": "object",
       "properties": {
         "limit": {
+          "default": 10,
+          "description": "Maximum number of pinned assets to return, sorted most-recent-first (default: 10, max: 50)",
           "type": "number",
           "minimum": 1,
-          "maximum": 50,
-          "default": 10,
-          "description": "Maximum number of pinned assets to return, sorted most-recent-first (default: 10, max: 50)"
+          "maximum": 50
         }
       },
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1376,18 +1354,17 @@
       "type": "object",
       "properties": {
         "scope": {
+          "description": "Optional scope filter, e.g. 'project:recallnest'. Omit to lint all scopes",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Optional scope filter, e.g. 'project:recallnest'. Omit to lint all scopes"
+          "maxLength": 160
         },
         "verbose": {
-          "type": "boolean",
           "default": false,
-          "description": "Include all individual findings in output (default: summarized)"
+          "description": "Include all individual findings in output (default: summarized)",
+          "type": "boolean"
         }
       },
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1401,20 +1378,19 @@
       "type": "object",
       "properties": {
         "scope": {
+          "description": "Optional scope filter",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Optional scope filter"
+          "maxLength": 160
         },
         "maxNodes": {
+          "default": 200,
+          "description": "Maximum nodes to include (default 200)",
           "type": "integer",
           "minimum": 10,
-          "maximum": 500,
-          "default": 200,
-          "description": "Maximum nodes to include (default 200)"
+          "maximum": 500
         }
       },
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1428,23 +1404,22 @@
       "type": "object",
       "properties": {
         "scope": {
+          "description": "Scope to consolidate, e.g. 'project:myapp'. Matched exactly by default — a scope name is treated as itself, not as a prefix family. Omit to consolidate across all scopes",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Scope to consolidate, e.g. 'project:myapp'. Matched exactly by default — a scope name is treated as itself, not as a prefix family. Omit to consolidate across all scopes"
+          "maxLength": 160
         },
         "force": {
-          "type": "boolean",
           "default": false,
-          "description": "Set to true to force consolidation even if recent write count is below the automatic threshold"
+          "description": "Set to true to force consolidation even if recent write count is below the automatic threshold",
+          "type": "boolean"
         },
         "familyMatch": {
-          "type": "boolean",
           "default": false,
-          "description": "Set to true to also consolidate child scopes sharing this prefix (e.g. 'memory' would additionally pull in 'memory:pivot'). Off by default: merging sibling scopes into one clustering round mixes unrelated material."
+          "description": "Set to true to also consolidate child scopes sharing this prefix (e.g. 'memory' would additionally pull in 'memory:pivot'). Off by default: merging sibling scopes into one clustering round mixes unrelated material.",
+          "type": "boolean"
         }
       },
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1462,19 +1437,18 @@
           "description": "Memory ID or unique prefix (at least 8 hex chars), e.g. 'a1b2c3d4'"
         },
         "level": {
+          "default": "full",
+          "description": "Content depth: 'overview' (L1) or 'full' (L2, default)",
           "type": "string",
           "enum": [
             "overview",
             "full"
-          ],
-          "default": "full",
-          "description": "Content depth: 'overview' (L1) or 'full' (L2, default)"
+          ]
         }
       },
       "required": [
         "id"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1519,14 +1493,17 @@
           "description": "Agent-readable runbook content: markdown steps, natural language workflow, or structured procedure. RecallNest does NOT execute this — agents read it as context to follow."
         },
         "inputSchema": {
+          "description": "JSON Schema defining the skill's input parameters, e.g. {\"env\": {\"type\": \"string\"}}",
           "type": "object",
-          "additionalProperties": {},
-          "description": "JSON Schema defining the skill's input parameters, e.g. {\"env\": {\"type\": \"string\"}}"
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {}
         },
         "verification": {
+          "description": "Steps to verify the skill executed correctly, e.g. 'check deployment URL returns 200'",
           "type": "string",
-          "maxLength": 500,
-          "description": "Steps to verify the skill executed correctly, e.g. 'check deployment URL returns 200'"
+          "maxLength": 500
         },
         "scope": {
           "type": "string",
@@ -1535,24 +1512,24 @@
           "description": "Scope to store the skill under, e.g. 'project:recallnest'"
         },
         "source": {
+          "default": "agent",
+          "description": "How this skill was captured: 'manual' by user, 'agent' by AI, or 'api' programmatically",
           "type": "string",
           "enum": [
             "manual",
             "agent",
             "api"
-          ],
-          "default": "agent",
-          "description": "How this skill was captured: 'manual' by user, 'agent' by AI, or 'api' programmatically"
+          ]
         },
         "tags": {
+          "default": [],
+          "description": "Optional categorization tags, e.g. ['deployment', 'production']",
+          "maxItems": 6,
           "type": "array",
           "items": {
             "type": "string",
             "maxLength": 60
-          },
-          "maxItems": 6,
-          "default": [],
-          "description": "Optional categorization tags, e.g. ['deployment', 'production']"
+          }
         }
       },
       "required": [
@@ -1563,7 +1540,6 @@
         "implementation",
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1583,23 +1559,22 @@
           "description": "Natural language task description to match, e.g. 'deploy the app to production'"
         },
         "scope": {
+          "description": "Restrict to skills in a specific scope, e.g. 'project:myapp'. Omit to search all scopes",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Restrict to skills in a specific scope, e.g. 'project:myapp'. Omit to search all scopes"
+          "maxLength": 160
         },
         "limit": {
+          "default": 3,
+          "description": "Maximum number of matching skills to return, sorted by relevance (default: 3)",
           "type": "number",
           "minimum": 1,
-          "maximum": 10,
-          "default": 3,
-          "description": "Maximum number of matching skills to return, sorted by relevance (default: 3)"
+          "maximum": 10
         }
       },
       "required": [
         "query"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1613,6 +1588,8 @@
       "type": "object",
       "properties": {
         "memories": {
+          "minItems": 1,
+          "maxItems": 20,
           "type": "array",
           "items": {
             "type": "object",
@@ -1622,6 +1599,7 @@
                 "minLength": 1
               },
               "category": {
+                "default": "events",
                 "type": "string",
                 "enum": [
                   "profile",
@@ -1630,31 +1608,27 @@
                   "events",
                   "cases",
                   "patterns"
-                ],
-                "default": "events"
+                ]
               },
               "importance": {
+                "default": 0.7,
                 "type": "number",
                 "minimum": 0,
-                "maximum": 1,
-                "default": 0.7
+                "maximum": 1
               },
               "tags": {
+                "default": [],
+                "maxItems": 6,
                 "type": "array",
                 "items": {
                   "type": "string"
-                },
-                "maxItems": 6,
-                "default": []
+                }
               }
             },
             "required": [
               "text"
-            ],
-            "additionalProperties": false
-          },
-          "minItems": 1,
-          "maxItems": 20
+            ]
+          }
         },
         "scope": {
           "type": "string",
@@ -1662,20 +1636,19 @@
           "maxLength": 160
         },
         "source": {
+          "default": "agent",
           "type": "string",
           "enum": [
             "manual",
             "agent",
             "api"
-          ],
-          "default": "agent"
+          ]
         }
       },
       "required": [
         "memories",
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1701,6 +1674,8 @@
           "description": "Target scope for imported memories, e.g. 'project:myapp'"
         },
         "format": {
+          "default": "auto",
+          "description": "Conversation format. Use 'auto' to detect automatically. 'connector-v1' for standard connector output.",
           "type": "string",
           "enum": [
             "auto",
@@ -1710,16 +1685,13 @@
             "slack",
             "plaintext",
             "connector-v1"
-          ],
-          "default": "auto",
-          "description": "Conversation format. Use 'auto' to detect automatically. 'connector-v1' for standard connector output."
+          ]
         }
       },
       "required": [
         "content",
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1733,6 +1705,8 @@
       "type": "object",
       "properties": {
         "messages": {
+          "minItems": 1,
+          "maxItems": 500,
           "type": "array",
           "items": {
             "type": "object",
@@ -1771,6 +1745,9 @@
                         },
                         "input": {
                           "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
                           "additionalProperties": {}
                         },
                         "content": {
@@ -1785,8 +1762,7 @@
                       },
                       "required": [
                         "type"
-                      ],
-                      "additionalProperties": false
+                      ]
                     }
                   }
                 ]
@@ -1795,11 +1771,8 @@
             "required": [
               "role",
               "content"
-            ],
-            "additionalProperties": false
+            ]
           },
-          "minItems": 1,
-          "maxItems": 500,
           "description": "Conversation messages to distill"
         },
         "scope": {
@@ -1809,30 +1782,29 @@
           "description": "Memory scope for persisted knowledge, e.g. 'project:recallnest'"
         },
         "preserveRecent": {
+          "default": 6,
+          "description": "Keep the N most recent messages verbatim (default: 6)",
           "type": "number",
           "minimum": 0,
-          "maximum": 20,
-          "default": 6,
-          "description": "Keep the N most recent messages verbatim (default: 6)"
+          "maximum": 20
         },
         "keepRecentTools": {
+          "default": 5,
+          "description": "Keep the N most recent tool results during microcompact (default: 5)",
           "type": "number",
           "minimum": 0,
-          "maximum": 20,
-          "default": 5,
-          "description": "Keep the N most recent tool results during microcompact (default: 5)"
+          "maximum": 20
         },
         "persist": {
-          "type": "boolean",
           "default": true,
-          "description": "Whether to persist extracted knowledge to RecallNest (default: true)"
+          "description": "Whether to persist extracted knowledge to RecallNest (default: true)",
+          "type": "boolean"
         }
       },
       "required": [
         "messages",
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1852,15 +1824,15 @@
           "description": "Workflow primitive id, such as resume_context or checkpoint_session"
         },
         "outcome": {
+          "default": "success",
+          "description": "success | failure | corrected | missed",
           "type": "string",
           "enum": [
             "success",
             "failure",
             "corrected",
             "missed"
-          ],
-          "default": "success",
-          "description": "success | failure | corrected | missed"
+          ]
         },
         "summary": {
           "type": "string",
@@ -1869,80 +1841,79 @@
           "description": "Short description of what happened"
         },
         "scope": {
+          "description": "Optional scope such as project:recallnest",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Optional scope such as project:recallnest"
+          "maxLength": 160
         },
         "source": {
+          "default": "agent",
+          "description": "Source label such as agent, smoke, eval, or manual",
           "type": "string",
           "minLength": 1,
-          "maxLength": 40,
-          "default": "agent",
-          "description": "Source label such as agent, smoke, eval, or manual"
+          "maxLength": 40
         },
         "signal": {
+          "description": "Optional failure/correction signal tag",
           "type": "string",
           "minLength": 1,
-          "maxLength": 120,
-          "description": "Optional failure/correction signal tag"
+          "maxLength": 120
         },
         "task": {
+          "description": "Optional related task",
           "type": "string",
           "minLength": 1,
-          "maxLength": 240,
-          "description": "Optional related task"
+          "maxLength": 240
         },
         "tags": {
+          "default": [],
+          "description": "Optional tags",
+          "maxItems": 8,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 40
-          },
-          "maxItems": 8,
-          "default": [],
-          "description": "Optional tags"
+          }
         },
         "tools": {
+          "default": [],
+          "description": "Optional tools involved",
+          "maxItems": 6,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 60
-          },
-          "maxItems": 6,
-          "default": [],
-          "description": "Optional tools involved"
+          }
         },
         "skillId": {
+          "description": "Optional skill id to bump. When present and outcome is success, the skill's successCount increments; otherwise failureCount increments. Missing/corrupt skills are skipped silently (does not block observation write).",
           "type": "string",
           "minLength": 1,
-          "maxLength": 128,
-          "description": "Optional skill id to bump. When present and outcome is success, the skill's successCount increments; otherwise failureCount increments. Missing/corrupt skills are skipped silently (does not block observation write)."
+          "maxLength": 128
         },
         "idempotencyKey": {
+          "description": "Optional stable request key; repeated saves with the same key replace the prior observation",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Optional stable request key; repeated saves with the same key replace the prior observation"
+          "maxLength": 160
         },
         "recalledIds": {
+          "description": "Optional memory ids this task actually used. Omit to auto-fill from what this session retrieved in the last 30 minutes — that auto-fill is what makes (memory, outcome) value back-propagation possible.",
+          "maxItems": 64,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 128
-          },
-          "maxItems": 64,
-          "description": "Optional memory ids this task actually used. Omit to auto-fill from what this session retrieved in the last 30 minutes — that auto-fill is what makes (memory, outcome) value back-propagation possible."
+          }
         }
       },
       "required": [
         "workflowId",
         "summary"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1956,26 +1927,25 @@
       "type": "object",
       "properties": {
         "workflowId": {
+          "description": "Optional workflow primitive id",
           "type": "string",
           "minLength": 1,
-          "maxLength": 120,
-          "description": "Optional workflow primitive id"
+          "maxLength": 120
         },
         "scope": {
+          "description": "Optional scope filter",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Optional scope filter"
+          "maxLength": 160
         },
         "limit": {
+          "default": 10,
+          "description": "Dashboard result limit when workflowId is omitted",
           "type": "integer",
           "minimum": 1,
-          "maximum": 30,
-          "default": 10,
-          "description": "Dashboard result limit when workflowId is omitted"
+          "maximum": 30
         }
       },
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -1995,23 +1965,22 @@
           "description": "Workflow primitive id, e.g. 'resume_context'"
         },
         "scope": {
+          "description": "Scope filter, e.g. 'project:recallnest'",
           "type": "string",
           "minLength": 1,
-          "maxLength": 160,
-          "description": "Scope filter, e.g. 'project:recallnest'"
+          "maxLength": 160
         },
         "limit": {
+          "default": 5,
+          "description": "Max recent issue observations to include",
           "type": "integer",
           "minimum": 1,
-          "maximum": 20,
-          "default": 5,
-          "description": "Max recent issue observations to include"
+          "maximum": 20
         }
       },
       "required": [
         "workflowId"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -2025,22 +1994,23 @@
       "type": "object",
       "properties": {
         "conflictId": {
+          "description": "Conflict ID to inspect a single record, e.g. 'c1d2e3f4'",
           "type": "string",
           "minLength": 1,
-          "maxLength": 128,
-          "description": "Conflict ID to inspect a single record, e.g. 'c1d2e3f4'"
+          "maxLength": 128
         },
         "status": {
+          "description": "Optional status filter",
           "type": "string",
           "enum": [
             "open",
             "accepted-incoming",
             "kept-existing",
             "merged"
-          ],
-          "description": "Optional status filter"
+          ]
         },
         "attention": {
+          "description": "Optional lifecycle filter: fresh / aging / stale / escalated / resolved",
           "type": "string",
           "enum": [
             "fresh",
@@ -2048,33 +2018,31 @@
             "stale",
             "escalated",
             "resolved"
-          ],
-          "description": "Optional lifecycle filter: fresh / aging / stale / escalated / resolved"
+          ]
         },
         "canonicalKey": {
+          "description": "Optional canonical key filter",
           "type": "string",
           "minLength": 1,
-          "maxLength": 120,
-          "description": "Optional canonical key filter"
+          "maxLength": 120
         },
         "groupBy": {
+          "default": "record",
+          "description": "Whether to list individual conflicts or grouped clusters",
           "type": "string",
           "enum": [
             "record",
             "cluster"
-          ],
-          "default": "record",
-          "description": "Whether to list individual conflicts or grouped clusters"
+          ]
         },
         "limit": {
+          "default": 20,
+          "description": "Max conflicts to list",
           "type": "integer",
           "minimum": 1,
-          "maximum": 50,
-          "default": 20,
-          "description": "Max conflicts to list"
+          "maximum": 50
         }
       },
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -2103,23 +2071,22 @@
           "description": "How to resolve the conflict"
         },
         "mergedText": {
+          "description": "Optional merged text override when resolution is merge",
           "type": "string",
           "minLength": 1,
-          "maxLength": 2000,
-          "description": "Optional merged text override when resolution is merge"
+          "maxLength": 2000
         },
         "notes": {
+          "description": "Optional operator notes",
           "type": "string",
           "minLength": 1,
-          "maxLength": 320,
-          "description": "Optional operator notes"
+          "maxLength": 320
         }
       },
       "required": [
         "conflictId",
         "resolution"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -2133,37 +2100,36 @@
       "type": "object",
       "properties": {
         "status": {
+          "description": "Optional status filter",
           "type": "string",
           "enum": [
             "open",
             "accepted-incoming",
             "kept-existing",
             "merged"
-          ],
-          "description": "Optional status filter"
+          ]
         },
         "canonicalKey": {
+          "description": "Optional canonical key filter",
           "type": "string",
           "minLength": 1,
-          "maxLength": 120,
-          "description": "Optional canonical key filter"
+          "maxLength": 120
         },
         "limit": {
+          "default": 100,
+          "description": "How many conflict records to scan",
           "type": "integer",
           "minimum": 1,
-          "maximum": 500,
-          "default": 100,
-          "description": "How many conflict records to scan"
+          "maximum": 500
         },
         "top": {
+          "default": 5,
+          "description": "How many priority clusters to show",
           "type": "integer",
           "minimum": 1,
-          "maximum": 20,
-          "default": 5,
-          "description": "How many priority clusters to show"
+          "maximum": 20
         }
       },
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -2177,47 +2143,46 @@
       "type": "object",
       "properties": {
         "attention": {
+          "default": "stale",
+          "description": "Only consider stale or escalated conflicts",
           "type": "string",
           "enum": [
             "stale",
             "escalated"
-          ],
-          "default": "stale",
-          "description": "Only consider stale or escalated conflicts"
+          ]
         },
         "canonicalKey": {
+          "description": "Optional canonical key filter",
           "type": "string",
           "minLength": 1,
-          "maxLength": 120,
-          "description": "Optional canonical key filter"
+          "maxLength": 120
         },
         "limit": {
+          "default": 100,
+          "description": "How many open conflicts to scan",
           "type": "integer",
           "minimum": 1,
-          "maximum": 500,
-          "default": 100,
-          "description": "How many open conflicts to scan"
+          "maximum": 500
         },
         "top": {
+          "default": 10,
+          "description": "How many eligible conflicts to include",
           "type": "integer",
           "minimum": 1,
-          "maximum": 20,
-          "default": 10,
-          "description": "How many eligible conflicts to include"
+          "maximum": 20
         },
         "apply": {
-          "type": "boolean",
           "default": false,
-          "description": "When false, preview only. When true, persist escalation metadata."
+          "description": "When false, preview only. When true, persist escalation metadata.",
+          "type": "boolean"
         },
         "notes": {
+          "description": "Optional operator note when applying escalation",
           "type": "string",
           "minLength": 1,
-          "maxLength": 320,
-          "description": "Optional operator note when applying escalation"
+          "maxLength": 320
         }
       },
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -2243,12 +2208,11 @@
       "type": "object",
       "properties": {
         "apply": {
-          "type": "boolean",
           "default": false,
-          "description": "When false, preview only (no writes). When true, archive briefs and delete indexed rows."
+          "description": "When false, preview only (no writes). When true, archive briefs and delete indexed rows.",
+          "type": "boolean"
         }
       },
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -2268,36 +2232,35 @@
           "description": "Scope to consolidate (e.g. project:recallnest)"
         },
         "clusterThreshold": {
+          "default": 0.82,
+          "description": "Min similarity to form a cluster (default 0.82)",
           "type": "number",
           "minimum": 0.5,
-          "maximum": 1,
-          "default": 0.82,
-          "description": "Min similarity to form a cluster (default 0.82)"
+          "maximum": 1
         },
         "mergeThreshold": {
+          "default": 0.92,
+          "description": "Min similarity to merge/archive (default 0.92)",
           "type": "number",
           "minimum": 0.5,
-          "maximum": 1,
-          "default": 0.92,
-          "description": "Min similarity to merge/archive (default 0.92)"
+          "maximum": 1
         },
         "maxEntries": {
+          "default": 500,
+          "description": "Max entries to scan (default 500)",
           "type": "number",
           "minimum": 10,
-          "maximum": 2000,
-          "default": 500,
-          "description": "Max entries to scan (default 500)"
+          "maximum": 2000
         },
         "apply": {
-          "type": "boolean",
           "default": false,
-          "description": "When false, preview only (scan + report without archiving). When true, actually merge/archive."
+          "description": "When false, preview only (scan + report without archiving). When true, actually merge/archive.",
+          "type": "boolean"
         }
       },
       "required": [
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -2317,24 +2280,23 @@
           "description": "Project scope to scan for promotion candidates"
         },
         "minOccurrences": {
+          "default": 3,
+          "description": "Minimum similar cases to trigger a promotion suggestion",
           "type": "number",
           "minimum": 2,
-          "maximum": 20,
-          "default": 3,
-          "description": "Minimum similar cases to trigger a promotion suggestion"
+          "maximum": 20
         },
         "minDistinctSources": {
+          "default": 2,
+          "description": "How many DIFFERENT sources (episodes) a cluster must span. Counting similar entries is not the same as counting distinct experiences — the same pothole hit three times is one experience, not a rule. Set 1 to disable this check. Abstains (never rejects) when the entries carry no source pointer.",
           "type": "number",
           "minimum": 1,
-          "maximum": 10,
-          "default": 2,
-          "description": "How many DIFFERENT sources (episodes) a cluster must span. Counting similar entries is not the same as counting distinct experiences — the same pothole hit three times is one experience, not a rule. Set 1 to disable this check. Abstains (never rejects) when the entries carry no source pointer."
+          "maximum": 10
         }
       },
       "required": [
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -2358,32 +2320,31 @@
           "description": "add: upsert a rule; remove: delete by trigger; list: all rules (builtin + user); explain: show which rules match a query"
         },
         "trigger": {
+          "description": "Alias literal to match in queries, case-insensitive inclusion (required for add/remove)",
           "type": "string",
           "minLength": 1,
-          "maxLength": 60,
-          "description": "Alias literal to match in queries, case-insensitive inclusion (required for add/remove)"
+          "maxLength": 60
         },
         "expansions": {
+          "description": "Canonical tokens to append (required for add, max 8)",
+          "maxItems": 8,
           "type": "array",
           "items": {
             "type": "string",
             "minLength": 1,
             "maxLength": 60
-          },
-          "maxItems": 8,
-          "description": "Canonical tokens to append (required for add, max 8)"
+          }
         },
         "query": {
+          "description": "Query to explain (required for explain)",
           "type": "string",
           "minLength": 1,
-          "maxLength": 500,
-          "description": "Query to explain (required for explain)"
+          "maxLength": 500
         }
       },
       "required": [
         "action"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -2403,29 +2364,28 @@
           "description": "Scope to scan, e.g. cc:project:recallnest"
         },
         "dryRun": {
-          "type": "boolean",
           "default": true,
-          "description": "When true (default), only report candidates without writing"
+          "description": "When true (default), only report candidates without writing",
+          "type": "boolean"
         },
         "minOccurrences": {
+          "default": 3,
+          "description": "Min cluster members before promoting",
           "type": "integer",
           "minimum": 2,
-          "maximum": 20,
-          "default": 3,
-          "description": "Min cluster members before promoting"
+          "maximum": 20
         },
         "minImportance": {
+          "default": 0.6,
+          "description": "Min average cluster importance to promote",
           "type": "number",
           "minimum": 0,
-          "maximum": 1,
-          "default": 0.6,
-          "description": "Min average cluster importance to promote"
+          "maximum": 1
         }
       },
       "required": [
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
@@ -2445,29 +2405,28 @@
           "description": "Scope to scan, e.g. memory"
         },
         "dryRun": {
-          "type": "boolean",
           "default": true,
-          "description": "When true (default), only report candidates without writing"
+          "description": "When true (default), only report candidates without writing",
+          "type": "boolean"
         },
         "minDistinctEvidence": {
+          "default": 2,
+          "description": "Min distinct, still-active evidence memories behind the conclusion",
           "type": "integer",
           "minimum": 2,
-          "maximum": 20,
-          "default": 2,
-          "description": "Min distinct, still-active evidence memories behind the conclusion"
+          "maximum": 20
         },
         "minImportance": {
+          "default": 0.6,
+          "description": "Min importance of the synthesized conclusion itself",
           "type": "number",
           "minimum": 0,
-          "maximum": 1,
-          "default": 0.6,
-          "description": "Min importance of the synthesized conclusion itself"
+          "maximum": 1
         }
       },
       "required": [
         "scope"
       ],
-      "additionalProperties": false,
       "$schema": "http://json-schema.org/draft-07/schema#"
     },
     "execution": {
