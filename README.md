@@ -146,6 +146,13 @@ places where the obvious implementation was wrong — is in
 > Retriever: `retrieval.mode` defaults to `"vector"` (vector-only search). Setting it to `"hybrid"` in
 > `config.json` adds BM25 full-text search, merged with the vector results by weighted score fusion
 > (`vectorWeight` 0.7 / `bm25Weight` 0.3 by default).
+>
+> Score floors: each result must clear a per-category minimum. The six categories have their own floors in
+> `retrieval.categoryMinScores` (default: profile / preferences 0.25, entities 0.30, events 0.35, cases 0.40,
+> patterns 0.45). `retrieval.hardMinScore` is only the fallback for categories missing from that map — with the
+> default map that means legacy categories only — so changing it does not move the floor of the six. To change
+> one of them, set `categoryMinScores`; it replaces the default map as a whole, so list every category you want
+> to keep. The `writing` / `debug` / `fact-check` retrieval profiles override it with their own scaled map.
 
 ### Internal Design
 
