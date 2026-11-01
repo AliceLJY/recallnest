@@ -11,7 +11,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, statSync, type Dirent } from "node:fs";
 import { join, relative, basename, dirname } from "node:path";
 import type { ConnectorOutputV1, ConnectorRecord } from "./connector-types.js";
 
@@ -197,7 +197,7 @@ export function scanVault(
   const records: ConnectorRecord[] = [];
 
   function walk(dir: string): void {
-    let entries: ReturnType<typeof readdirSync>;
+    let entries: Dirent[];
     try {
       entries = readdirSync(dir, { withFileTypes: true });
     } catch {

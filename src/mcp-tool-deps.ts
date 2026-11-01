@@ -11,7 +11,8 @@
  * getters so tier handlers read the live value after ensureComponents() runs,
  * not the null they would capture at registration time.
  */
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ZodRawShape } from "zod";
 import { createComponentResolver, loadConfig } from "./runtime-config.js";
 import type { SessionCheckpointStore } from "./session-store.js";
 import type { ConflictCandidateStore } from "./conflict-store.js";
@@ -22,13 +23,26 @@ import type { AuditLogger } from "./audit-log.js";
 import type { ForgetPinArchive } from "./forget-engine.js";
 
 export type ToolTier = "core" | "advanced" | "governance";
-export type ToolSchema = Parameters<McpServer["tool"]>[2];
-export type ToolHandler = Parameters<McpServer["tool"]>[3];
+/**
+ * Input schema of one tool: a zod raw shape (`{ query: z.string(), ... }`).
+ *
+ * These used to be `Parameters<McpServer["tool"]>[2]` / `[3]`. `server.tool` is overloaded and
+ * `Parameters<>` resolves against the LAST overload, whose third parameter is the annotations
+ * object and whose fourth is an untyped callback — so every handler's destructured arguments were
+ * implicit `any` and a schema/handler mismatch never failed to compile. The handler type is now
+ * derived from the schema itself, so `registerTool(name, desc, { q: z.string() }, async ({ q }) => …)`
+ * infers `q: string`.
+ */
+export type ToolSchema = ZodRawShape;
+/** Handler whose first argument is the parsed output of schema `S` (same shape the SDK passes). */
+export type ToolHandler<S extends ToolSchema> = ToolCallback<S>;
+/** Tier-aware registration wrapper signature; generic so each call site infers its own args. */
+export type RegisterToolFn = <S extends ToolSchema>(name: string, description: string, schema: S, handler: ToolHandler<S>) => void;
 export type ComponentResolver = ReturnType<typeof createComponentResolver>;
 
 export interface ToolRegistryDeps {
   /** Tier-aware registration wrapper from mcp-server.ts (shouldRegisterTool gate + lazy component init). */
-  registerTool: (name: string, description: string, schema: ToolSchema, handler: ToolHandler) => void;
+  registerTool: RegisterToolFn;
   /** Memoized component resolver: getComponents(profileName?) => { store, embedder, retriever, llm, profile }. */
   getComponents: ComponentResolver;
   /** Loaded runtime config (used by resume_context for recall-mode resolution). */

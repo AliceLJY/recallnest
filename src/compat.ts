@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
  */
 export function metaDir(meta: ImportMeta): string {
   // Bun sets import.meta.dir natively
-  const dir = (meta as Record<string, unknown>).dir;
+  const dir: unknown = (meta as { dir?: unknown }).dir;
   if (typeof dir === "string") return dir;
   // Node.js fallback
   return dirname(fileURLToPath(meta.url));

@@ -1272,6 +1272,51 @@ describe("persistMemory — admission rejection reason passthrough", () => {
   });
 });
 
+// tsc strict (2026-11-01): StoredMemoryRecord requires privacyTier; the rejected record and the
+// promotion record were built without it, so callers reading `.privacyTier` got undefined.
+describe("records carry privacyTier (tsc strict)", () => {
+  it("a rejected record reports the tier the caller asked for", async () => {
+    const { deps } = createDeps();
+    const byDefault = await persistMemory(deps as any, {
+      text: "短",
+      category: "events",
+      scope: TEST_SCOPE,
+    });
+    expect(byDefault.disposition).toBe("rejected");
+    expect(byDefault.privacyTier).toBe("durable");
+
+    const explicit = await persistMemory(deps as any, {
+      text: "短",
+      category: "events",
+      scope: TEST_SCOPE,
+      privacyTier: "private",
+    });
+    expect(explicit.disposition).toBe("rejected");
+    expect(explicit.privacyTier).toBe("private");
+  });
+
+  it("a promotion record reports the tier of the row it wrote", async () => {
+    const { deps, storedEntries } = createDeps();
+    const source = await deps.store.store({
+      text: "[用户] 发布前先跑全量测试。\n\n[助手] 记下了，每次发布前跑 bun test。",
+      vector: [1, 2, 3],
+      category: "events",
+      scope: "cc:session-tier",
+      importance: 0.5,
+      metadata: JSON.stringify({ source: "cc" }),
+    });
+    const promoted = await promoteMemory(deps as any, {
+      memoryId: source.id,
+      text: "Run the full test suite before every release.",
+      category: "patterns",
+      scope: TEST_SCOPE,
+    });
+    expect(promoted.disposition).toBe("promoted");
+    expect(storedEntries).toHaveLength(2);
+    expect(promoted.privacyTier).toBe("durable");
+  });
+});
+
 describe("text length contract", () => {
   // persistMemory validates through StoreMemoryInputSchema, whose text field is
   // capped at 4000 chars. Pinned here because a lossy branch sits further down

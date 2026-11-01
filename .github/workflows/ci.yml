@@ -39,3 +39,8 @@ jobs:
         # form always exited 1 via a bun output-filename quirk, which is why `|| true`
         # was masking it — it was hiding a broken command, not real failures.)
         run: bun build src/cli.ts --target bun --outdir /tmp/ts-check
+
+      - name: TypeScript strict type-check
+        # bun build above only transpiles. This is the real check: tsconfig.json is strict and
+        # covers all of src/ except tests; it must stay at zero errors.
+        run: bunx tsc --noEmit -p tsconfig.json

@@ -85,5 +85,9 @@
     "type": "git",
     "url": "git+https://github.com/AliceLJY/recallnest.git"
   },
-  "homepage": "https://github.com/AliceLJY/recallnest"
+  "homepage": "https://github.com/AliceLJY/recallnest",
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "typescript": "5.6.3"
+  }
 }
