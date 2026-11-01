@@ -848,7 +848,7 @@ registerTool(
 
 registerTool(
   "batch_store",
-  "Store multiple memories in a single call with deduplication. Side effect: persists up to 20 entries. Use when you have several facts to store at once, more efficient than repeated store_memory calls.",
+  "Store multiple memories in a single call with deduplication. Side effect: persists up to 20 entries. Use when you have several facts to store at once, more efficient than repeated store_memory calls. Each text shorter than 10 units is rejected (each CJK character counts as 2, other characters as 1).",
   {
     memories: z.array(z.object({
       text: z.string().min(1),

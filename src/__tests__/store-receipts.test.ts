@@ -83,7 +83,7 @@ describe("persistMemory reports what actually landed", () => {
 
     const text = formatStoreMemoryReceipt(stored, { requestedTriggers: 2, scope: SCOPE });
     const lines = text.split("\n");
-    expect(lines[0]).toBe("Not stored: rejected (text_too_short)");
+    expect(lines[0]).toBe("Not stored: rejected (text_too_short: below the minimum length of 10 units; CJK characters count as 2, other characters as 1)");
     expect(text).not.toContain("Stored memory");
     expect(text).not.toContain("undefined");
     expect(text).not.toContain("Stored at:");
@@ -169,8 +169,8 @@ describe("persistMemory reports what actually landed", () => {
     const lines = formatBatchStoreReceipt(records).split("\n");
     expect(lines[0]).toBe("Stored 2 of 4 memories (2 new, 0 updated, 0 promoted, 0 deduped, 0 conflict, 2 rejected)");
     expect(lines.slice(1)).toEqual([
-      "- #2 rejected (text_too_short)",
-      "- #4 rejected (text_too_short)",
+      "- #2 rejected (text_too_short: below the minimum length of 10 units; CJK characters count as 2, other characters as 1)",
+      "- #4 rejected (text_too_short: below the minimum length of 10 units; CJK characters count as 2, other characters as 1)",
     ]);
   }, 30_000);
 });
@@ -222,7 +222,7 @@ describe("formatBatchStoreReceipt", () => {
       "Stored 2 of 5 memories (1 new, 1 updated, 0 promoted, 1 deduped, 1 conflict, 1 rejected)",
       "- #3 deduped: duplicate of existing memory dup-row",
       "- #4 conflict with memory owner-row (conflict ccccdddd)",
-      "- #5 rejected (noise_detected)",
+      "- #5 rejected (noise_detected: matched the noise filter (greeting, filler or boilerplate))",
     ]);
   });
 });
