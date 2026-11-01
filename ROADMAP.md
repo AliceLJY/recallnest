@@ -49,7 +49,7 @@ What matters first is this: opening another window should not erase stable conte
 - Session Distiller: 3-layer conversation compression to durable memory
 - Conversation import from Claude Code, Claude.ai, ChatGPT, Slack, and plaintext
 - Skill Memory: store, retrieve, and auto-promote executable skills
-- Admission Control: write-time gating with noise filter, importance floor, dedup, and rate limiting
+- Admission Control: write-time gating with noise filter, importance floor, and dedup (per-scope rate limiter is optional injection, not enabled by default)
 - Memory Lint: contradiction, duplicate, stale, and orphan detection with health score
 - Knowledge Graph: interactive D3.js visualization with cross-scope semantic bridges
 - Memory Dashboard: Web UI with stats, category distribution, growth trends, and health
@@ -148,7 +148,7 @@ Delivered:
 - ✅ explicit evidence promotion into durable memory
 - ✅ boundary guards for `evidence / durable / session`
 - ✅ conflict handling when new durable candidates disagree with existing canonical owners
-- ✅ admission control: noise filter, importance floor, dedup, rate limiting
+- ✅ admission control: noise filter, importance floor, dedup, rate limiting (optional injection; no production caller passes a limiter, so it is off by default)
 - ✅ conversation import from Claude Code, ChatGPT, Slack, plaintext
 - ✅ batch store: up to 20 memories per call with dedup
 - ✅ auto capture: zero-LLM heuristic extraction from text
@@ -192,7 +192,7 @@ Delivered:
 - ✅ health score formula: 100 - weighted penalties, clamped 0-100
 - ✅ promotion suggestions for memories that should become skills (`scan_skill_promotions`)
 - ✅ offline consolidation via `dream` (clustering, merging, pruning)
-- ✅ admission control: write-time noise filter, importance floor, dedup, rate limiting
+- ✅ admission control: write-time noise filter, importance floor, dedup, rate limiting (optional injection, off by default)
 - ✅ memory confidence meta-tags: structured scoring (direct/inferred/hearsay), source-based auto-assignment
 - ✅ interference detection + active forgetting gate: semantic clustering, RIF top-K demotion, write-time pre-warning
 

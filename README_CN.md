@@ -89,7 +89,7 @@ Hits    : 5
 | **记忆演化** | Supersede 链、衰减评分、LLM 重要性、聚合、归档 |
 | **显式升级** | Evidence → Durable Memory，带冲突守卫、合并决议、审计日志 |
 | **隐私分级** | 4 级（`ephemeral` / `private` / `durable` / `shared`）+ 级联遗忘 |
-| **准入控制** | 写入时门控：噪音过滤、重要性下限、去重、限流 |
+| **准入控制** | 写入时门控：噪音过滤、重要性下限、去重。按 scope 的写入限流是可选注入、**默认未启用**——生产写入入口都不传 rateLimiter |
 | **Memory Lint** | 矛盾、重复、过期、孤儿检测 + 健康评分 |
 | **离线整合** | `dream` 命令：聚类、合并、修剪积累的记忆 |
 
@@ -141,6 +141,12 @@ Hits    : 5
 >
 > Retriever 一格：`retrieval.mode` 默认是 `"vector"`（纯向量检索）；在 `config.json` 里改成 `"hybrid"`
 > 后，会加上 BM25 全文检索，并与向量结果做加权分数融合（默认 `vectorWeight` 0.7 / `bm25Weight` 0.3）。
+>
+> 分数下限：每条结果要过所在类别的下限。六个类别各自的下限在 `retrieval.categoryMinScores`（默认 profile /
+> preferences 0.25、entities 0.30、events 0.35、cases 0.40、patterns 0.45）。`retrieval.hardMinScore` 只管这张表里
+> 没有的类别——默认表下只剩旧版类别——所以改它动不了这六类的下限。要改某一类，设 `categoryMinScores`；它整张替换
+> 默认表、不逐键合并，没列出的类别会落到 `hardMinScore`，所以要保留的类别都得写上。`writing` / `debug` /
+> `fact-check` 三个检索档会用各自按比例缩放的整张表盖掉它。
 
 ### 内部设计
 

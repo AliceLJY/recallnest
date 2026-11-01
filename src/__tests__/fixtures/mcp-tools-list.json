@@ -1,0 +1,2436 @@
+[
+  {
+    "name": "store_memory",
+    "description": "Store a durable memory when the user shares a stable preference, identity fact, project entity, reusable pattern, or solved case that should survive future windows. Do not use this for transient task state; use it only for memory worth keeping. Text shorter than 10 units is rejected (each CJK character counts as 2, other characters as 1), so \"我是左撇子\" is accepted but \"hi\" is not.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000,
+          "description": "Memory text to store"
+        },
+        "category": {
+          "default": "events",
+          "description": "Durable memory category",
+          "type": "string",
+          "enum": [
+            "profile",
+            "preferences",
+            "entities",
+            "events",
+            "cases",
+            "patterns"
+          ]
+        },
+        "importance": {
+          "default": 0.7,
+          "description": "Importance score from 0 to 1",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Required scope such as project:recallnest or session:abc123"
+        },
+        "source": {
+          "default": "manual",
+          "description": "How this memory was captured",
+          "type": "string",
+          "enum": [
+            "manual",
+            "agent",
+            "api",
+            "session_distill",
+            "conversation_import"
+          ]
+        },
+        "tags": {
+          "default": [],
+          "description": "Optional tags",
+          "maxItems": 8,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40
+          }
+        },
+        "canonicalKey": {
+          "description": "Optional stable key for merge/update semantics",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "topicTag": {
+          "description": "Optional topic tag for intra-scope partitioning (e.g. 'auth', 'deploy', 'testing'). Auto-detected if omitted.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "privacyTier": {
+          "default": "durable",
+          "description": "Privacy tier: ephemeral (auto-expire, no KG), private (persist, no KG), durable (default), shared (cross-scope)",
+          "type": "string",
+          "enum": [
+            "ephemeral",
+            "private",
+            "durable",
+            "shared"
+          ]
+        },
+        "triggers": {
+          "description": "写入时预演触发器：这条记忆「她以后会怎么问起」的 2–5 句口语问法，各说一个角度、别互为变体、别复述正文。只参与召回、不进正文。scope 为 memory:pivot 时必填（§5.3）。例：[\"那个跑分要不要再跑一次\", \"别人的榜我们要不要也去排个名\"]",
+          "maxItems": 6,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 200
+          }
+        },
+        "validUntil": {
+          "description": "Optional expiration: ISO date string or ms timestamp. Memory will be deprioritized after this time.",
+          "type": [
+            "string",
+            "number"
+          ]
+        },
+        "eventTime": {
+          "description": "Optional event time: when the event actually happened (ISO date or ms), distinct from storage time.",
+          "type": [
+            "string",
+            "number"
+          ]
+        },
+        "confidence": {
+          "description": "Optional confidence override: number (0-1) or {score, reliability}. Auto-assigned from source if omitted.",
+          "anyOf": [
+            {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            {
+              "type": "object",
+              "properties": {
+                "score": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "reliability": {
+                  "type": "string",
+                  "enum": [
+                    "direct",
+                    "inferred",
+                    "hearsay"
+                  ]
+                }
+              },
+              "required": [
+                "score"
+              ]
+            }
+          ]
+        },
+        "dependsOn": {
+          "description": "Optional freshness dependencies (borrowed). Declare what this memory depends on so recall shows a cheap validity verdict (exact/compatible/uncertain/invalid). Items: {kind:'file'|'git-rev', ref, expected?}. file → ref=path, expected=mtime-ms string; git-rev → ref=repo path, expected=commit hash (short ok). expected may be an array: first=exact, rest=compatible set. Omit expected for existence-only checks.",
+          "minItems": 1,
+          "maxItems": 8,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "file",
+                  "git-rev"
+                ]
+              },
+              "ref": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500
+              },
+              "expected": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  {
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 200
+                    }
+                  }
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "ref"
+            ]
+          }
+        }
+      },
+      "required": [
+        "text",
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "set_reminder",
+    "description": "Set a prospective memory reminder that auto-triggers during future search_memory calls when the trigger keywords match. Side effect: stores a reminder entry. Use when you need a future nudge tied to a specific context.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "trigger": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Trigger condition — keywords that should activate this reminder"
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "What to remind about when the trigger fires"
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Required scope"
+        },
+        "expiresInDays": {
+          "description": "Optional: auto-expire after N days",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 365
+        }
+      },
+      "required": [
+        "trigger",
+        "action",
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "checkpoint_session",
+    "description": "Store a compact checkpoint of the current work state. Use this when a task spans windows or terminals and you need the next session to recover decisions, open loops, and next actions without polluting durable memory.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Current session identifier"
+        },
+        "scope": {
+          "description": "Optional shared scope; defaults to session:<sessionId>",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 600,
+          "description": "Compact summary of the current work state"
+        },
+        "task": {
+          "description": "Optional task label",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "decisions": {
+          "default": [],
+          "description": "Key decisions already made",
+          "maxItems": 6,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "openLoops": {
+          "default": [],
+          "description": "Unresolved questions or pending items",
+          "maxItems": 6,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "nextActions": {
+          "default": [],
+          "description": "Next actions to take",
+          "maxItems": 6,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "entities": {
+          "default": [],
+          "description": "Relevant projects, tools, or people",
+          "maxItems": 8,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          }
+        },
+        "files": {
+          "default": [],
+          "description": "Relevant files or paths",
+          "maxItems": 12,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 220
+          }
+        },
+        "idempotencyKey": {
+          "description": "Optional stable request key; repeated saves with the same key replace the prior checkpoint",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "updatedAt": {
+          "description": "Optional override; defaults to now",
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "sessionId",
+        "summary"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "latest_checkpoint",
+    "description": "Fetch the most recent saved checkpoint for a session or shared scope. Read-only. Use when you need to inspect current work state without running a full resume_context.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "description": "Session identifier filter, e.g. 'abc123'",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "scope": {
+          "description": "Shared scope filter, e.g. 'project:recallnest'",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "resume_context",
+    "description": "Compose startup context for a fresh window by combining durable memory, patterns, cases, and the latest checkpoint. Read-only. Use when entering a new session and you need to recover prior decisions, open loops, and next actions.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "task": {
+          "description": "Optional current task or question to bias recall",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "scope": {
+          "description": "Optional shared scope for project or terminal continuity",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "sessionId": {
+          "description": "Optional session identifier to recover the latest checkpoint",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "limitPerSection": {
+          "default": 3,
+          "description": "Max items per section",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6
+        },
+        "includeLatestCheckpoint": {
+          "default": true,
+          "description": "Whether to include the latest checkpoint summary",
+          "type": "boolean"
+        },
+        "profile": {
+          "description": "Retrieval profile",
+          "type": "string",
+          "enum": [
+            "default",
+            "writing",
+            "debug",
+            "fact-check"
+          ]
+        },
+        "mode": {
+          "description": "Override recall mode: 'full' (default), 'light' (<300 tokens), 'summary' (checkpoint only), 'off'",
+          "type": "string",
+          "enum": [
+            "full",
+            "light",
+            "summary",
+            "off"
+          ]
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "search_memory",
+    "description": "Search indexed memories by semantic relevance (vector search + reranking; BM25 keyword fusion runs only when retrieval.mode is \"hybrid\", and the default is vector-only) and return ranked results with optional temporal filtering. With the default mode there is no keyword channel, so exact identifiers such as commit hashes or variable names may not surface — use a raw-text search for those. The shown score is a fused ranking score (0-100%), NOT pure cosine similarity — read it as relative ranking within this result set, not as match confidence. Read-only, but may fire stored reminders as a side effect. Use proactively at the start of tasks, when debugging, writing, or when the user references past work.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Search query — natural language or keywords"
+        },
+        "limit": {
+          "default": 5,
+          "description": "Max results to return",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 20
+        },
+        "scope": {
+          "description": "Explicit scope; reuse Scope returned by resume_context. May be omitted when sessionId or configured environment supplies a scope, or allScopes=true explicitly requests cross-scope search. Omission alone does not mean global search.",
+          "type": "string"
+        },
+        "sessionId": {
+          "description": "Optional session identifier to infer session:<id> scope",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "allScopes": {
+          "default": false,
+          "description": "When true, explicitly allow cross-scope search",
+          "type": "boolean"
+        },
+        "includeRelatedScopes": {
+          "default": false,
+          "description": "When true, also query configured related scopes from scopeRelations and show them in a separate sidecar section. Requires an explicit or inferred scoped search; never changes the main result ranking.",
+          "type": "boolean"
+        },
+        "category": {
+          "description": "Filter by memory category: profile (identity/background), preferences (habits/style), entities (projects/tools/people), events (past happenings), cases (problem-solution pairs), patterns (reusable workflows)",
+          "type": "string",
+          "enum": [
+            "profile",
+            "preferences",
+            "entities",
+            "events",
+            "cases",
+            "patterns"
+          ]
+        },
+        "profile": {
+          "description": "Retrieval profile",
+          "type": "string",
+          "enum": [
+            "default",
+            "writing",
+            "debug",
+            "fact-check"
+          ]
+        },
+        "render": {
+          "description": "Result rendering mode: verbatim (default, original order) or highlight (reorder by contextual relevance to query)",
+          "default": "verbatim",
+          "type": "string",
+          "enum": [
+            "verbatim",
+            "highlight"
+          ]
+        },
+        "after": {
+          "description": "Filter memories stored after this date (ISO format YYYY-MM-DD, or relative like '最近30天', 'last 7 days')",
+          "type": "string"
+        },
+        "before": {
+          "description": "Filter memories stored before this date (ISO format YYYY-MM-DD, or relative)",
+          "type": "string"
+        },
+        "graph": {
+          "description": "Enable KG graph traversal (PPR) for relationship-aware search. Use when query involves entity relationships (e.g. 'what tools does Alice use', 'Bob的朋友').",
+          "default": false,
+          "type": "boolean"
+        },
+        "includeArchived": {
+          "description": "When true, also return archived/superseded/consolidated memories (default: only active)",
+          "default": false,
+          "type": "boolean"
+        },
+        "detail_level": {
+          "description": "Result detail level: normal (default — the full text of each hit, in rank order. One entry is capped at 2400 chars. Full text is handed out until an 8k-token budget is used up; hits past that point get a query-aware snippet instead of being dropped, so a long list can run past 8k by one snippet per remaining hit, and each related-scope block has its own budget. Any shortened entry says how much of it is shown and gives the id for memory_drill_down), brief (ID+score+one-liner), full (table with 120-char snippets plus extra metadata), adaptive (full text only for hits scoring above the threshold, query-aware snippet for the rest, 8k-token budget)",
+          "default": "normal",
+          "type": "string",
+          "enum": [
+            "brief",
+            "normal",
+            "full",
+            "adaptive"
+          ]
+        },
+        "topicTag": {
+          "description": "Filter by topic tag (e.g. 'auth', 'deploy', 'testing'). Only returns memories tagged with this topic.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "reconstruct": {
+          "default": false,
+          "description": "Return LLM-synthesized reconstruction alongside raw results. Requires RECALLNEST_CONSTRUCTIVE_RETRIEVAL=true.",
+          "type": "boolean"
+        },
+        "validAt": {
+          "description": "Query memories valid at a specific point in time (ISO date, e.g. '2025-06-15'). Returns only memories whose validity window covers this date.",
+          "type": "string"
+        },
+        "includeExpired": {
+          "description": "When true, include expired memories in results (demoted 80%). Default: only active/non-expired.",
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_tools",
+    "description": "List available RecallNest tools with one-line descriptions, filtered by tier. Read-only. Use when you need to discover advanced or governance tools beyond the core set.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "tier": {
+          "description": "Which tier of tools to list. Returns tools at this tier and below.",
+          "default": "advanced",
+          "type": "string",
+          "enum": [
+            "core",
+            "advanced",
+            "full"
+          ]
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "store_workflow_pattern",
+    "description": "Store a reusable workflow pattern as durable memory. Use this when you identify a repeatable process worth reusing across fresh windows, such as startup continuity, debugging routines, review flows, or handoff steps.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Short pattern title"
+        },
+        "trigger": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240,
+          "description": "When this workflow should be used"
+        },
+        "steps": {
+          "minItems": 1,
+          "maxItems": 8,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 220
+          },
+          "description": "Ordered workflow steps"
+        },
+        "outcome": {
+          "description": "Optional expected outcome",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "tools": {
+          "default": [],
+          "description": "Optional tools, commands, or interfaces involved",
+          "maxItems": 6,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 60
+          }
+        },
+        "importance": {
+          "default": 0.82,
+          "description": "Importance score from 0 to 1",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Required scope such as project:recallnest or session:abc123"
+        },
+        "source": {
+          "default": "agent",
+          "description": "How this pattern was captured",
+          "type": "string",
+          "enum": [
+            "manual",
+            "agent",
+            "api",
+            "session_distill",
+            "conversation_import"
+          ]
+        },
+        "tags": {
+          "default": [],
+          "description": "Optional tags",
+          "maxItems": 8,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40
+          }
+        },
+        "canonicalKey": {
+          "description": "Optional stable key for merge/update semantics",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        }
+      },
+      "required": [
+        "title",
+        "trigger",
+        "steps",
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "auto_capture",
+    "description": "Extract memory-worthy items from a conversation turn using lightweight heuristics (zero LLM calls). Detects preferences, identity facts, decisions, corrections, explicit memory instructions, and workflow patterns. Items that pass salience filtering are stored as durable memories. Use this when you want to analyze a block of conversation text and automatically capture any signals worth remembering.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8000,
+          "description": "Conversation text to analyze for memory-worthy signals"
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Required scope such as project:recallnest or session:abc123"
+        },
+        "source": {
+          "default": "agent",
+          "description": "How this memory was captured",
+          "type": "string",
+          "enum": [
+            "manual",
+            "agent",
+            "api",
+            "session_distill",
+            "conversation_import"
+          ]
+        }
+      },
+      "required": [
+        "text",
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "store_case",
+    "description": "Store a reusable case as durable memory. Use this when you identify a concrete problem-and-solution pair worth reusing across future windows, such as a debugging fix, continuity cleanup, migration lesson, or implementation recovery.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Short case title"
+        },
+        "problem": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 320,
+          "description": "What problem happened"
+        },
+        "context": {
+          "description": "Optional context or preconditions",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "solutionSteps": {
+          "minItems": 1,
+          "maxItems": 8,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 220
+          },
+          "description": "Ordered solution steps"
+        },
+        "outcome": {
+          "description": "Optional result or resolution",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "tools": {
+          "default": [],
+          "description": "Optional tools, commands, or interfaces involved",
+          "maxItems": 6,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 60
+          }
+        },
+        "importance": {
+          "default": 0.84,
+          "description": "Importance score from 0 to 1",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Required scope such as project:recallnest or session:abc123"
+        },
+        "source": {
+          "default": "agent",
+          "description": "How this case was captured",
+          "type": "string",
+          "enum": [
+            "manual",
+            "agent",
+            "api",
+            "session_distill",
+            "conversation_import"
+          ]
+        },
+        "tags": {
+          "default": [],
+          "description": "Optional tags",
+          "maxItems": 8,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40
+          }
+        },
+        "canonicalKey": {
+          "description": "Optional stable key for merge/update semantics",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "debugFraming": {
+          "description": "Optional break-loop 五维归因 (rootCause/whyPriorFixFailed/defense/systematicExtension/knowledgeFix)",
+          "type": "object",
+          "properties": {
+            "rootCause": {
+              "type": "string",
+              "enum": [
+                "missing_spec",
+                "cross_layer_contract",
+                "change_propagation",
+                "test_coverage_gap",
+                "implicit_assumption"
+              ],
+              "description": "根因归类：缺spec/跨层契约/改动传播失败/测试覆盖缺口/隐式假设"
+            },
+            "whyPriorFixFailed": {
+              "description": "为何之前没修对",
+              "type": "string",
+              "maxLength": 300
+            },
+            "defense": {
+              "description": "防御机制（强度：架构>编译期>运行期>测试>review>文档）",
+              "type": "string",
+              "maxLength": 300
+            },
+            "systematicExtension": {
+              "description": "系统性扩展：同类问题还在哪",
+              "type": "string",
+              "maxLength": 300
+            },
+            "knowledgeFix": {
+              "description": "知识固化：沉淀去向",
+              "type": "string",
+              "maxLength": 300
+            }
+          },
+          "required": [
+            "rootCause"
+          ]
+        }
+      },
+      "required": [
+        "title",
+        "problem",
+        "solutionSteps",
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "promote_memory",
+    "description": "Promote an evidence memory into durable memory with an authority upgrade. Side effect: creates a new durable entry linked to the source evidence. Use when a transcript snippet or imported artifact contains a fact worth keeping across windows.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "memoryId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Existing evidence memory ID or unique prefix"
+        },
+        "text": {
+          "description": "Optional cleaned durable text; defaults to the source entry text",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "category": {
+          "description": "Optional target durable category; defaults to the source evidence category or its originalCategory",
+          "type": "string",
+          "enum": [
+            "profile",
+            "preferences",
+            "entities",
+            "events",
+            "cases",
+            "patterns"
+          ]
+        },
+        "importance": {
+          "default": 0.78,
+          "description": "Importance score from 0 to 1",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Required target scope such as project:recallnest or session:abc123"
+        },
+        "source": {
+          "default": "agent",
+          "description": "How this promotion was captured",
+          "type": "string",
+          "enum": [
+            "manual",
+            "agent",
+            "api",
+            "session_distill",
+            "conversation_import"
+          ]
+        },
+        "tags": {
+          "default": [],
+          "description": "Optional tags",
+          "maxItems": 8,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40
+          }
+        },
+        "canonicalKey": {
+          "description": "Optional stable key for merge/update semantics",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        }
+      },
+      "required": [
+        "memoryId",
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "explain_memory",
+    "description": "Explain why memories matched a query: retrieval path, freshness, scope, and matched terms. Read-only. Use when search results seem unexpected and you need to debug ranking or scope filtering.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Search query to explain — natural language or keywords, e.g. 'auth migration'"
+        },
+        "limit": {
+          "default": 5,
+          "description": "Maximum number of matched results to analyze and explain (default: 5)",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 20
+        },
+        "scope": {
+          "description": "Restrict to a specific scope, e.g. 'project:myapp'. Omit to use default scope",
+          "type": "string"
+        },
+        "sessionId": {
+          "description": "Session identifier to infer session-scoped search, e.g. 'abc123'",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "allScopes": {
+          "default": false,
+          "description": "Set to true to search across all scopes instead of the default scope",
+          "type": "boolean"
+        },
+        "category": {
+          "description": "Filter results by memory category, e.g. 'preference', 'decision', 'fact'",
+          "type": "string",
+          "enum": [
+            "profile",
+            "preferences",
+            "entities",
+            "events",
+            "cases",
+            "patterns"
+          ]
+        },
+        "profile": {
+          "description": "Retrieval profile that tunes ranking: 'debug' for technical, 'fact-check' for precision",
+          "type": "string",
+          "enum": [
+            "default",
+            "writing",
+            "debug",
+            "fact-check"
+          ]
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "distill_memory",
+    "description": "Distill retrieved memories into a compact briefing with source map, key takeaways, and reusable evidence. Use this when you need a synthesized summary of stored knowledge on a topic rather than raw search results. Returns a structured briefing with citations. Read-only — does not modify stored memories.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Natural language topic or task to distill, e.g. 'authentication migration decisions'"
+        },
+        "limit": {
+          "default": 8,
+          "description": "Maximum number of retrieved memories to include in the distillation (default: 8)",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 20
+        },
+        "scope": {
+          "description": "Restrict search to a specific scope, e.g. 'project:myapp'. Omit to use the default scope",
+          "type": "string"
+        },
+        "sessionId": {
+          "description": "Session identifier to infer session-scoped search, e.g. 'abc123'",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "allScopes": {
+          "default": false,
+          "description": "Set to true to search across all scopes instead of the default scope",
+          "type": "boolean"
+        },
+        "profile": {
+          "description": "Retrieval profile that tunes ranking weights: 'writing' for narrative, 'debug' for technical, 'fact-check' for high-precision",
+          "type": "string",
+          "enum": [
+            "default",
+            "writing",
+            "debug",
+            "fact-check"
+          ]
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "brief_memory",
+    "description": "Create a structured memory brief by retrieving and summarizing relevant memories, then persist it as a reusable asset indexed for future recall. Use this when you want to consolidate scattered knowledge on a topic into a single retrievable document. Side effect: writes a new brief asset to disk and indexes it in the vector store for future search.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Natural language topic or task to brief, e.g. 'deployment pipeline architecture decisions'"
+        },
+        "limit": {
+          "default": 8,
+          "description": "Maximum number of source memories to include in the brief (default: 8)",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 20
+        },
+        "scope": {
+          "description": "Restrict search to a specific scope, e.g. 'project:myapp'. Omit to use the default scope",
+          "type": "string"
+        },
+        "sessionId": {
+          "description": "Session identifier to infer session-scoped search, e.g. 'abc123'",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "allScopes": {
+          "default": false,
+          "description": "Set to true to search across all scopes instead of the default scope",
+          "type": "boolean"
+        },
+        "profile": {
+          "description": "Retrieval profile that tunes ranking weights: 'writing' for narrative, 'debug' for technical, 'fact-check' for high-precision",
+          "type": "string",
+          "enum": [
+            "default",
+            "writing",
+            "debug",
+            "fact-check"
+          ]
+        },
+        "title": {
+          "description": "Human-readable title for the brief asset, e.g. 'Q1 Auth Migration Summary'. Auto-generated if omitted",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "pin_memory",
+    "description": "Pin a retrieved memory as a high-importance reusable asset on disk. Side effect: boosts importance to 0.95, writes pin asset file, and indexes it. Use when a search result is critical and should be surfaced in future recalls.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "memory_id": {
+          "type": "string",
+          "description": "Memory ID or unique prefix from search/explain output, e.g. 'a1b2c3d4'"
+        },
+        "scope": {
+          "description": "Explicit scope filter, e.g. 'project:recallnest'",
+          "type": "string"
+        },
+        "sessionId": {
+          "description": "Session identifier to infer session:<id> scope, e.g. 'abc123'",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "allScopes": {
+          "default": false,
+          "description": "When true, allow cross-scope reads to find the memory",
+          "type": "boolean"
+        },
+        "title": {
+          "description": "Human-readable title for the pin, e.g. 'Auth migration decision'",
+          "type": "string"
+        },
+        "summary": {
+          "description": "Short summary override for the pinned asset",
+          "type": "string"
+        },
+        "query": {
+          "description": "Original query that led to this pin, e.g. 'auth decisions'",
+          "type": "string"
+        },
+        "profile": {
+          "description": "Retrieval profile for ranking, e.g. 'debug'",
+          "type": "string",
+          "enum": [
+            "default",
+            "writing",
+            "debug",
+            "fact-check"
+          ]
+        }
+      },
+      "required": [
+        "memory_id"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "export_memory",
+    "description": "Export a distilled memory briefing to a markdown or JSON file on disk. Side effect: writes an export artifact file. Use when you need an offline-readable snapshot of knowledge on a topic.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Topic or task to export, e.g. 'auth migration decisions'"
+        },
+        "limit": {
+          "default": 8,
+          "description": "Maximum number of source memories to include in the export (default: 8)",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 20
+        },
+        "scope": {
+          "description": "Restrict to a specific scope, e.g. 'project:recallnest'. Omit to use default scope",
+          "type": "string"
+        },
+        "sessionId": {
+          "description": "Session identifier to infer session-scoped search, e.g. 'abc123'",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "allScopes": {
+          "default": false,
+          "description": "Set to true to search across all scopes instead of the default scope",
+          "type": "boolean"
+        },
+        "profile": {
+          "description": "Retrieval profile for ranking, e.g. 'writing'",
+          "type": "string",
+          "enum": [
+            "default",
+            "writing",
+            "debug",
+            "fact-check"
+          ]
+        },
+        "format": {
+          "default": "md",
+          "description": "Export format: 'md' for markdown, 'json' for structured JSON",
+          "type": "string",
+          "enum": [
+            "md",
+            "json"
+          ]
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_assets",
+    "description": "List recent structured memory assets (pinned memories and distilled briefs) sorted by creation date. Read-only. Use when you need an inventory of persisted knowledge artifacts — for example, before creating a new brief to avoid duplicates. Returns asset type, title, scope, creation date, and file path for each entry.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "default": 12,
+          "description": "Maximum number of assets to return, sorted most-recent-first (default: 12, max: 50)",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 50
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "forget_memory",
+    "description": "Permanently forget a memory: delete the primary entry, remove its KG triples and trigger rows, remove pins made from it (the file is archived, its indexed copy deleted), demote related memories, read back to confirm, and log an audit trail. Requires confirm=true for durable-tier memories. Use when the user explicitly requests a memory be forgotten, or to clean up sensitive/incorrect data.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "memoryId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Memory ID to forget (full UUID or 8+ hex prefix)"
+        },
+        "confirm": {
+          "default": false,
+          "description": "Required confirmation — must be true for durable-tier memories",
+          "type": "boolean"
+        },
+        "reason": {
+          "description": "Reason for forgetting (recorded in audit trail)",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "scope": {
+          "description": "Optional scope filter for permission check",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        }
+      },
+      "required": [
+        "memoryId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_pins",
+    "description": "List pinned memory assets sorted by creation date, showing title, scope, importance score, and file path. Read-only. Use when you need to review high-value memories that were explicitly pinned via pin_memory, or to check if a topic already has a pinned reference before creating a new one.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "default": 10,
+          "description": "Maximum number of pinned assets to return, sorted most-recent-first (default: 10, max: 50)",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 50
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "memory_stats",
+    "description": "Show aggregate statistics of the memory database: total entries, counts by source and category. Read-only. Use when you need an overview of memory store health or size.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "data_checkup",
+    "description": "Run health checks on the memory database: vector dimensions, orphans, tier distribution, and conflict backlog. Read-only. Use when diagnosing data quality issues or before a consolidation run.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "memory_lint",
+    "description": "Run memory quality lint checks: contradictions, duplicates, stale entries, and orphans. Read-only. Returns a health score (0-100) and actionable findings. Use for periodic memory hygiene or before consolidation.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "description": "Optional scope filter, e.g. 'project:recallnest'. Omit to lint all scopes",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "verbose": {
+          "default": false,
+          "description": "Include all individual findings in output (default: summarized)",
+          "type": "boolean"
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "export_graph",
+    "description": "Export memories as an interactive HTML knowledge graph. Creates a self-contained HTML file with a force-directed visualization. Open in any browser. Use when the user wants to visualize their memory network.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "description": "Optional scope filter",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "maxNodes": {
+          "default": 200,
+          "description": "Maximum nodes to include (default 200)",
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 500
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "dream",
+    "description": "Run a full memory consolidation cycle (Orient, Gather, Consolidate, Prune). Side effect: may archive low-value entries and generate insight memories. Use when memory count is high and you need periodic maintenance.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "description": "Scope to consolidate, e.g. 'project:myapp'. Matched exactly by default — a scope name is treated as itself, not as a prefix family. Omit to consolidate across all scopes",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "force": {
+          "default": false,
+          "description": "Set to true to force consolidation even if recent write count is below the automatic threshold",
+          "type": "boolean"
+        },
+        "familyMatch": {
+          "default": false,
+          "description": "Set to true to also consolidate child scopes sharing this prefix (e.g. 'memory' would additionally pull in 'memory:pivot'). Off by default: merging sibling scopes into one clustering round mixes unrelated material.",
+          "type": "boolean"
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "memory_drill_down",
+    "description": "Retrieve the full or overview-level content of a single memory entry. Read-only. Use when search returned compact summaries and you need the complete text or L1 overview.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Memory ID or unique prefix (at least 8 hex chars), e.g. 'a1b2c3d4'"
+        },
+        "level": {
+          "default": "full",
+          "description": "Content depth: 'overview' (L1) or 'full' (L2, default)",
+          "type": "string",
+          "enum": [
+            "overview",
+            "full"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "store_skill",
+    "description": "Store an agent-readable skill runbook with trigger conditions, instruction content, and verification steps. Side effect: persists a new skill entry and indexes it. Use when you identify a reusable procedure worth surfacing across sessions. NOTE: RecallNest does NOT execute skills — `implementation` is a runbook agents read as context, not a script we run. (v2.5 收缩，2026-05-27)",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Unique skill identifier, e.g. 'deploy_production' or 'run_migrations'"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "Natural language description of what the skill does (used for semantic retrieval matching)"
+        },
+        "triggerPattern": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "Natural language pattern describing when to suggest this skill, e.g. 'user asks to deploy to production'"
+        },
+        "implementationType": {
+          "type": "string",
+          "enum": [
+            "instruction_sequence"
+          ],
+          "description": "Skill runbook type. Currently only 'instruction_sequence' is supported — RecallNest stores runbooks for agents to read, does not execute them. (v2.5 schema 收缩，2026-05-27)"
+        },
+        "implementation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 5000,
+          "description": "Agent-readable runbook content: markdown steps, natural language workflow, or structured procedure. RecallNest does NOT execute this — agents read it as context to follow."
+        },
+        "inputSchema": {
+          "description": "JSON Schema defining the skill's input parameters, e.g. {\"env\": {\"type\": \"string\"}}",
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {}
+        },
+        "verification": {
+          "description": "Steps to verify the skill executed correctly, e.g. 'check deployment URL returns 200'",
+          "type": "string",
+          "maxLength": 500
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Scope to store the skill under, e.g. 'project:recallnest'"
+        },
+        "source": {
+          "default": "agent",
+          "description": "How this skill was captured: 'manual' by user, 'agent' by AI, or 'api' programmatically",
+          "type": "string",
+          "enum": [
+            "manual",
+            "agent",
+            "api"
+          ]
+        },
+        "tags": {
+          "default": [],
+          "description": "Optional categorization tags, e.g. ['deployment', 'production']",
+          "maxItems": 6,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 60
+          }
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "triggerPattern",
+        "implementationType",
+        "implementation",
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "retrieve_skill",
+    "description": "Retrieve agent-readable runbooks matching a task description by semantic similarity. Read-only. RecallNest returns stored instructions; it does not execute them.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "description": "Natural language task description to match, e.g. 'deploy the app to production'"
+        },
+        "scope": {
+          "description": "Restrict to skills in a specific scope, e.g. 'project:myapp'. Omit to search all scopes",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "limit": {
+          "default": 3,
+          "description": "Maximum number of matching skills to return, sorted by relevance (default: 3)",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 10
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "batch_store",
+    "description": "Store multiple memories in a single call with deduplication. Side effect: persists up to 20 entries. Use when you have several facts to store at once, more efficient than repeated store_memory calls. Each text shorter than 10 units is rejected (each CJK character counts as 2, other characters as 1).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "memories": {
+          "minItems": 1,
+          "maxItems": 20,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "minLength": 1
+              },
+              "category": {
+                "default": "events",
+                "type": "string",
+                "enum": [
+                  "profile",
+                  "preferences",
+                  "entities",
+                  "events",
+                  "cases",
+                  "patterns"
+                ]
+              },
+              "importance": {
+                "default": 0.7,
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              "tags": {
+                "default": [],
+                "maxItems": 6,
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "text"
+            ]
+          }
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "source": {
+          "default": "agent",
+          "type": "string",
+          "enum": [
+            "manual",
+            "agent",
+            "api"
+          ]
+        }
+      },
+      "required": [
+        "memories",
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "import_conversations",
+    "description": "Import a conversation file (Claude Code JSONL, Claude.ai JSON, ChatGPT JSON, Slack JSON, plaintext, or connector-v1 JSON) into memory. Auto-detects format or use explicit format parameter. Messages are normalized and stored via the standard persistMemory pipeline. For connector-v1 format, use the standard ConnectorOutputV1 schema (see docs/connector-spec.md).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500000,
+          "description": "Raw file content to import"
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Target scope for imported memories, e.g. 'project:myapp'"
+        },
+        "format": {
+          "default": "auto",
+          "description": "Conversation format. Use 'auto' to detect automatically. 'connector-v1' for standard connector output.",
+          "type": "string",
+          "enum": [
+            "auto",
+            "claude-code",
+            "claude-ai",
+            "chatgpt",
+            "slack",
+            "plaintext",
+            "connector-v1"
+          ]
+        }
+      },
+      "required": [
+        "content",
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "distill_session",
+    "description": "Distill a conversation session into structured knowledge and persist to long-term memory. Three layers: (1) microcompact clears old tool results at zero cost, (2) LLM summarizes into 9 dimensions, (3) extracts durable knowledge into RecallNest. Use when a session is ending or context is getting large. Side effect: persists extracted memories.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "messages": {
+          "minItems": 1,
+          "maxItems": 500,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "role": {
+                "type": "string",
+                "enum": [
+                  "user",
+                  "assistant",
+                  "system"
+                ]
+              },
+              "content": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "text",
+                            "tool_use",
+                            "tool_result"
+                          ]
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "id": {
+                          "type": "string"
+                        },
+                        "input": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "content": {
+                          "type": "string"
+                        },
+                        "text": {
+                          "type": "string"
+                        },
+                        "tool_use_id": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "type"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "required": [
+              "role",
+              "content"
+            ]
+          },
+          "description": "Conversation messages to distill"
+        },
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Memory scope for persisted knowledge, e.g. 'project:recallnest'"
+        },
+        "preserveRecent": {
+          "default": 6,
+          "description": "Keep the N most recent messages verbatim (default: 6)",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 20
+        },
+        "keepRecentTools": {
+          "default": 5,
+          "description": "Keep the N most recent tool results during microcompact (default: 5)",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 20
+        },
+        "persist": {
+          "default": true,
+          "description": "Whether to persist extracted knowledge to RecallNest (default: true)",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "messages",
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "workflow_observe",
+    "description": "Store an append-only workflow observation for self-evolution. Use this to record whether a continuity primitive or reusable workflow succeeded, failed, was corrected by the user, or was missed entirely. Optionally pass `skillId` to also bump that skill's successCount/failureCount — the canonical way to close the skill feedback loop.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workflowId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Workflow primitive id, such as resume_context or checkpoint_session"
+        },
+        "outcome": {
+          "default": "success",
+          "description": "success | failure | corrected | missed",
+          "type": "string",
+          "enum": [
+            "success",
+            "failure",
+            "corrected",
+            "missed"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400,
+          "description": "Short description of what happened"
+        },
+        "scope": {
+          "description": "Optional scope such as project:recallnest",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "source": {
+          "default": "agent",
+          "description": "Source label such as agent, smoke, eval, or manual",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "signal": {
+          "description": "Optional failure/correction signal tag",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "task": {
+          "description": "Optional related task",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "tags": {
+          "default": [],
+          "description": "Optional tags",
+          "maxItems": 8,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40
+          }
+        },
+        "tools": {
+          "default": [],
+          "description": "Optional tools involved",
+          "maxItems": 6,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 60
+          }
+        },
+        "skillId": {
+          "description": "Optional skill id to bump. When present and outcome is success, the skill's successCount increments; otherwise failureCount increments. Missing/corrupt skills are skipped silently (does not block observation write).",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "idempotencyKey": {
+          "description": "Optional stable request key; repeated saves with the same key replace the prior observation",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "recalledIds": {
+          "description": "Optional memory ids this task actually used. Omit to auto-fill from what this session retrieved in the last 30 minutes — that auto-fill is what makes (memory, outcome) value back-propagation possible.",
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        }
+      },
+      "required": [
+        "workflowId",
+        "summary"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "workflow_health",
+    "description": "Inspect workflow observation health: 7d/30d report for one workflow or dashboard of degraded workflows. Read-only. Use when checking if continuity primitives are succeeding or degrading.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workflowId": {
+          "description": "Optional workflow primitive id",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "scope": {
+          "description": "Optional scope filter",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "limit": {
+          "default": 10,
+          "description": "Dashboard result limit when workflowId is omitted",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 30
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "workflow_evidence",
+    "description": "Generate an evidence pack for a workflow primitive with recent issues, top signals, and suggested actions. Read-only. Use when investigating why a workflow is degraded and you need concrete failure examples.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workflowId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Workflow primitive id, e.g. 'resume_context'"
+        },
+        "scope": {
+          "description": "Scope filter, e.g. 'project:recallnest'",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "limit": {
+          "default": 5,
+          "description": "Max recent issue observations to include",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20
+        }
+      },
+      "required": [
+        "workflowId"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_conflicts",
+    "description": "List or inspect conflict candidates where promoted evidence disagrees with existing durable memory. Read-only. Use when reviewing pending conflicts before resolution.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "conflictId": {
+          "description": "Conflict ID to inspect a single record, e.g. 'c1d2e3f4'",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "status": {
+          "description": "Optional status filter",
+          "type": "string",
+          "enum": [
+            "open",
+            "accepted-incoming",
+            "kept-existing",
+            "merged"
+          ]
+        },
+        "attention": {
+          "description": "Optional lifecycle filter: fresh / aging / stale / escalated / resolved",
+          "type": "string",
+          "enum": [
+            "fresh",
+            "aging",
+            "stale",
+            "escalated",
+            "resolved"
+          ]
+        },
+        "canonicalKey": {
+          "description": "Optional canonical key filter",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "groupBy": {
+          "default": "record",
+          "description": "Whether to list individual conflicts or grouped clusters",
+          "type": "string",
+          "enum": [
+            "record",
+            "cluster"
+          ]
+        },
+        "limit": {
+          "default": 20,
+          "description": "Max conflicts to list",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "resolve_conflict",
+    "description": "Resolve a conflict candidate by keeping existing, accepting incoming, or merging texts. Side effect: updates conflict status and may modify durable memory. Use when list_conflicts shows open conflicts that need a decision.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "conflictId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Conflict ID to resolve"
+        },
+        "resolution": {
+          "type": "string",
+          "enum": [
+            "accept_incoming",
+            "keep_existing",
+            "merge"
+          ],
+          "description": "How to resolve the conflict"
+        },
+        "mergedText": {
+          "description": "Optional merged text override when resolution is merge",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "notes": {
+          "description": "Optional operator notes",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 320
+        }
+      },
+      "required": [
+        "conflictId",
+        "resolution"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "audit_conflicts",
+    "description": "Generate a conflict audit summary showing priority clusters by staleness and escalation level. Read-only. Use when triaging which conflict clusters to resolve first.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "description": "Optional status filter",
+          "type": "string",
+          "enum": [
+            "open",
+            "accepted-incoming",
+            "kept-existing",
+            "merged"
+          ]
+        },
+        "canonicalKey": {
+          "description": "Optional canonical key filter",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "limit": {
+          "default": 100,
+          "description": "How many conflict records to scan",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        },
+        "top": {
+          "default": 5,
+          "description": "How many priority clusters to show",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "escalate_conflicts",
+    "description": "Preview or apply conflict aging policy to mark stale conflicts for operator review. Side effect: when apply=true, persists escalation metadata. Use when conflicts have aged past their attention threshold.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "attention": {
+          "default": "stale",
+          "description": "Only consider stale or escalated conflicts",
+          "type": "string",
+          "enum": [
+            "stale",
+            "escalated"
+          ]
+        },
+        "canonicalKey": {
+          "description": "Optional canonical key filter",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "limit": {
+          "default": 100,
+          "description": "How many open conflicts to scan",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        },
+        "top": {
+          "default": 10,
+          "description": "How many eligible conflicts to include",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20
+        },
+        "apply": {
+          "default": false,
+          "description": "When false, preview only. When true, persist escalation metadata.",
+          "type": "boolean"
+        },
+        "notes": {
+          "description": "Optional operator note when applying escalation",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 320
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_dirty_briefs",
+    "description": "List memory briefs generated before current cleanup rules that may need re-indexing. Read-only. Use when auditing brief quality or before running clean_dirty_briefs.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "clean_dirty_briefs",
+    "description": "Archive dirty briefs and remove their indexed asset entries. Side effect: when apply=true, moves briefs to archive and deletes index rows. Use when list_dirty_briefs shows stale briefs that need cleanup.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "apply": {
+          "default": false,
+          "description": "When false, preview only (no writes). When true, archive briefs and delete indexed rows.",
+          "type": "boolean"
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "consolidate_memories",
+    "description": "Run semantic consolidation: cluster similar memories, merge near-duplicates, and detect contradictions. Side effect: when apply=true, archives merged entries. Use when a scope has grown large and needs deduplication.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Scope to consolidate (e.g. project:recallnest)"
+        },
+        "clusterThreshold": {
+          "default": 0.82,
+          "description": "Min similarity to form a cluster (default 0.82)",
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 1
+        },
+        "mergeThreshold": {
+          "default": 0.92,
+          "description": "Min similarity to merge/archive (default 0.92)",
+          "type": "number",
+          "minimum": 0.5,
+          "maximum": 1
+        },
+        "maxEntries": {
+          "default": 500,
+          "description": "Max entries to scan (default 500)",
+          "type": "number",
+          "minimum": 10,
+          "maximum": 2000
+        },
+        "apply": {
+          "default": false,
+          "description": "When false, preview only (scan + report without archiving). When true, actually merge/archive.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "scan_skill_promotions",
+    "description": "Scan cases and patterns in a scope for potential promotion to reusable skills. Read-only. Use when you want to discover recurring procedures that deserve formalization as skills.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Project scope to scan for promotion candidates"
+        },
+        "minOccurrences": {
+          "default": 3,
+          "description": "Minimum similar cases to trigger a promotion suggestion",
+          "type": "number",
+          "minimum": 2,
+          "maximum": 20
+        },
+        "minDistinctSources": {
+          "default": 2,
+          "description": "How many DIFFERENT sources (episodes) a cluster must span. Counting similar entries is not the same as counting distinct experiences — the same pothole hit three times is one experience, not a rule. Set 1 to disable this check. Abstains (never rejects) when the entries carry no source pointer.",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 10
+        }
+      },
+      "required": [
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "manage_alias",
+    "description": "Manage user-level query alias rules (data/alias-map.json). Matching aliases append canonical tokens to the query in the BM25 channel only ('我的桥' → '+telegram-ai-bridge') — they deliberately do NOT alter the vector embedding, so casual aliases cannot cause semantic drift. Actions: add/remove/list, plus explain to debug which rules (builtin full-channel + user BM25-only) fire for a query. Use when a colloquial entity name fails to recall its canonical project/tool.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "add",
+            "remove",
+            "list",
+            "explain"
+          ],
+          "description": "add: upsert a rule; remove: delete by trigger; list: all rules (builtin + user); explain: show which rules match a query"
+        },
+        "trigger": {
+          "description": "Alias literal to match in queries, case-insensitive inclusion (required for add/remove)",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "expansions": {
+          "description": "Canonical tokens to append (required for add, max 8)",
+          "maxItems": 8,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 60
+          }
+        },
+        "query": {
+          "description": "Query to explain (required for explain)",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "promote_scan",
+    "description": "Scan transcript-downgraded evidence (profile/preferences sunk to events) and auto-promote recurring high-importance facts back to durable memory. Default dry-run (no writes); when dryRun=false it creates durable entries (dedup is idempotent). Use to backfill sparse durable profile/preferences from accumulated transcript evidence.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Scope to scan, e.g. cc:project:recallnest"
+        },
+        "dryRun": {
+          "default": true,
+          "description": "When true (default), only report candidates without writing",
+          "type": "boolean"
+        },
+        "minOccurrences": {
+          "default": 3,
+          "description": "Min cluster members before promoting",
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 20
+        },
+        "minImportance": {
+          "default": 0.6,
+          "description": "Min average cluster importance to promote",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "required": [
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "promote_synthesis",
+    "description": "Scan dream-synthesized conclusions (cluster insights and cross-memory patterns, which are written on the evidence layer and therefore excluded from stable memory) and promote the well-supported ones into a durable copy. Eligibility comes from the conclusion's own validated evidence set, not from repetition. Default dry-run (no writes); when dryRun=false it writes durable entries through the same promote path as promote_memory, so canonicalKey dedup makes re-runs a revision rather than a duplicate. The synthesized row itself is never modified.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "scope": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Scope to scan, e.g. memory"
+        },
+        "dryRun": {
+          "default": true,
+          "description": "When true (default), only report candidates without writing",
+          "type": "boolean"
+        },
+        "minDistinctEvidence": {
+          "default": 2,
+          "description": "Min distinct, still-active evidence memories behind the conclusion",
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 20
+        },
+        "minImportance": {
+          "default": 0.6,
+          "description": "Min importance of the synthesized conclusion itself",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "required": [
+        "scope"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  }
+]

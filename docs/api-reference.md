@@ -231,7 +231,7 @@ If the same `canonicalKey` is already occupied by a different durable category, 
 |---|---|---|
 | `deduped` | The content already exists; no new row was written | the existing memory |
 | `conflict` | Canonical key owned by another category; parked in the conflict store | the existing owner |
-| `rejected` | Turned away by admission control; `rejectionReason` says why (`text_too_short`, `noise_detected`, `importance_too_low`, `rate_limited`) | a placeholder, no row exists |
+| `rejected` | Turned away by admission control; `rejectionReason` says why (`text_too_short`, `noise_detected`, `importance_too_low`, `rate_limited`; `rate_limited` only appears when a caller injects a rate limiter, which no production entry point does) | a placeholder, no row exists |
 
 For slot-aware preferences, RecallNest now derives structured keys instead of collapsing everything into a broader same-topic key. Examples:
 

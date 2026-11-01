@@ -96,7 +96,7 @@ places where the obvious implementation was wrong — is in
 | **Memory Evolution** | Supersede chains, decay scoring, LLM importance, consolidation, archival |
 | **Smart Promotion** | Evidence → durable memory with conflict guards, merge resolution, and audit trail |
 | **Privacy Tiers** | 4-tier (`ephemeral` / `private` / `durable` / `shared`) with cascade forgetting |
-| **Admission Control** | Write-time gating: noise filter, importance floor, dedup, rate limiting |
+| **Admission Control** | Write-time gating: noise filter, importance floor, dedup. A per-scope rate limiter exists but is optional injection and **not enabled by default** — no production write path passes one |
 | **Memory Lint** | Contradiction, duplicate, stale, and orphan detection with health score |
 | **Offline Consolidation** | `dream` command: clustering, merging, pruning of accumulated memories |
 
@@ -146,6 +146,13 @@ places where the obvious implementation was wrong — is in
 > Retriever: `retrieval.mode` defaults to `"vector"` (vector-only search). Setting it to `"hybrid"` in
 > `config.json` adds BM25 full-text search, merged with the vector results by weighted score fusion
 > (`vectorWeight` 0.7 / `bm25Weight` 0.3 by default).
+>
+> Score floors: each result must clear a per-category minimum. The six categories have their own floors in
+> `retrieval.categoryMinScores` (default: profile / preferences 0.25, entities 0.30, events 0.35, cases 0.40,
+> patterns 0.45). `retrieval.hardMinScore` is only the fallback for categories missing from that map — with the
+> default map that means legacy categories only — so changing it does not move the floor of the six. To change
+> one of them, set `categoryMinScores`; it replaces the default map as a whole, so list every category you want
+> to keep. The `writing` / `debug` / `fact-check` retrieval profiles override it with their own scaled map.
 
 ### Internal Design
 

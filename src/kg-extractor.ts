@@ -9,6 +9,7 @@ import type { KGStore } from "./kg-store.js";
 import { logInfo, logWarn } from "./stderr-log.js";
 import { detectLang, getKgPromptHook } from "./language-hook.js";
 import * as envConfig from "./env-config.js";
+import { MIN_MEMORY_TEXT_UNITS, weightedTextLength } from "./text-length.js";
 
 // ============================================================================
 // Types
@@ -172,7 +173,9 @@ export class KGExtractor {
    * Extract raw triples from text via LLM. Does not persist.
    */
   async extract(text: string): Promise<RawTriple[]> {
-    if (!text || text.length < 10) return [];
+    // 与写入准入同一口径（text-length.ts）：能存进来的短中文事实（「我对花生过敏」）要能抽关系，
+    // 否则修订时 purgeForMemory 先清掉旧关系、这里又直接返回空，图谱里这条记忆的关系就归零了。
+    if (!text || weightedTextLength(text) < MIN_MEMORY_TEXT_UNITS) return [];
 
     const lang = detectLang(text);
     const babelPrompt = getKgPromptHook(lang);

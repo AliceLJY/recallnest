@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { boundedStringSchema, identifierSchema, normalizedStringListSchema, optionalBoundedStringSchema } from "./schema-utils.js";
+import { boundedStringSchema, identifierSchema, isoDateTimeSchema, normalizedStringListSchema, optionalBoundedStringSchema } from "./schema-utils.js";
 
 export const RetrievalProfileSchema = z.enum(["default", "writing", "debug", "fact-check"]);
 
@@ -15,7 +15,7 @@ export const SessionCheckpointInputSchema = z.object({
   entities: normalizedStringListSchema("entities", 8, 120),
   files: normalizedStringListSchema("files", 12, 220),
   idempotencyKey: optionalBoundedStringSchema(160),
-  updatedAt: z.string().datetime().default(() => new Date().toISOString()),
+  updatedAt: isoDateTimeSchema().default(() => new Date().toISOString()),
 });
 
 export const SessionCheckpointRecordSchema = SessionCheckpointInputSchema.extend({
@@ -36,7 +36,7 @@ export const ResumeCheckpointSummarySchema = z.object({
   sessionId: identifierSchema("sessionId"),
   resolvedScope: optionalBoundedStringSchema(160),
   summary: boundedStringSchema("summary", 600),
-  updatedAt: z.string().datetime(),
+  updatedAt: isoDateTimeSchema(),
 });
 
 export const ResumeResponseModeSchema = z.enum(["default", "recall-only"]);
@@ -89,7 +89,7 @@ export const ResumeContextResponseSchema = z.object({
     period: z.string().max(120),
     items: z.array(z.string().max(240)).max(5),
   })).max(10).optional(),
-  generatedAt: z.string().datetime(),
+  generatedAt: isoDateTimeSchema(),
 });
 
 export type SessionCheckpointInput = z.infer<typeof SessionCheckpointInputSchema>;
