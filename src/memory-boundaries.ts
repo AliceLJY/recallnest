@@ -191,35 +191,55 @@ export function buildDefaultCanonicalKey(params: {
   }
 
   const base = collapseKeyText(params.title || params.text || "");
-  const fullBase = normalizeCanonicalKeyUntruncated(base);
   if (!base) return `${params.category}:memory`;
+  const fullBase = normalizeCanonicalKeyUntruncated(base);
 
   // 归一化后为空（西里尔、韩文、纯假名……）或发生了截断时，单靠归一化结果会让不同正文共用一个 key，
   // latest-wins 下后写的把先写的原位改掉。这两种情形附上全文短哈希；其余情形与改前逐字相同，
-  // 现有生产行的 key 不变。
-  const hashSuffix = `-h${createHash("sha1").update(base).digest("hex").slice(0, 8)}`;
-  if (!fullBase) return `${params.category}:memory${hashSuffix}`;
-  if (fullBase.length <= CANONICAL_KEY_MAX_LENGTH) return `${params.category}:${fullBase}`;
-
-  // 截断时让整条 key（含类别前缀）不超过 120 字：冲突记录的 canonicalKey 上限是 120
-  // （conflict-schema.ts），冲突指纹与聚类键也先按 120 截，哈希放在 120 之外会被截掉。
-  // 按码点截，不留半个代理对。
-  const prefix = `${params.category}:`;
-  const bodyBudget = CANONICAL_KEY_MAX_LENGTH - prefix.length - hashSuffix.length;
-  let body = "";
-  for (const char of fullBase) {
-    if (body.length + char.length > bodyBudget) break;
-    body += char;
+  // 现有生产行的 key 不变。哈希输入与 capture-engine 的全文判等同一口径（先小写）：
+  // 为空时用小写、去直引号的原文（保留非拉丁字符），截断时用归一化后的全文。
+  if (!fullBase) {
+    return appendKeyHash(`${params.category}:memory`, base.toLowerCase().replace(/['"`]/g, ""));
   }
-  return `${prefix}${body.replace(/-+$/u, "")}${hashSuffix}`;
+  // 正文本身恰好以「-h + 16 位 hex」结尾时也附哈希，带这种结尾的 key 只可能出自哈希分支，
+  // 否则普通正文「memory-h<hex>」会和为空分支产出的 key 同形。
+  if (fullBase.length > CANONICAL_KEY_MAX_LENGTH || KEY_HASH_TAIL.test(fullBase)) {
+    return appendKeyHash(`${params.category}:${fullBase}`, fullBase);
+  }
+  return `${params.category}:${fullBase}`;
+}
+
+/** 哈希后缀的形状：`-h` + 16 位 hex（sha256 前 64 bit）。 */
+const KEY_HASH_TAIL = /-h[0-9a-f]{16}$/u;
+
+function keyHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+/**
+ * 截到整条 key（含类别前缀）加上哈希后缀不超过 120 字，再附 `-h<16 hex>`：冲突记录的 canonicalKey
+ * 上限是 120（conflict-schema.ts），冲突指纹与聚类键也先按 120 截，哈希放在 120 之外会被截掉。
+ * 按码点截，不留半个代理对；截完去掉结尾的 `-` / `:`。
+ */
+function appendKeyHash(head: string, hashInput: string): string {
+  const suffix = `-h${keyHash(hashInput)}`;
+  const budget = CANONICAL_KEY_MAX_LENGTH - suffix.length;
+  let kept = "";
+  for (const char of head) {
+    if (kept.length + char.length > budget) break;
+    kept += char;
+  }
+  return `${kept.replace(/[:\-]+$/u, "")}${suffix}`;
 }
 
 function truncateCanonicalKey(segments: string[]): string {
-  return segments
-    .filter(Boolean)
-    .join(":")
-    .slice(0, 120)
-    .replace(/[:\-]+$/u, "");
+  const joined = segments.filter(Boolean).join(":");
+  const stripped = joined.replace(/[:\-]+$/u, "");
+  // 槽位 key 超长（或恰好以哈希后缀的形状结尾）时同样附哈希；未超长的槽位 key 与改前一字不变。
+  if (joined.length > CANONICAL_KEY_MAX_LENGTH || KEY_HASH_TAIL.test(stripped)) {
+    return appendKeyHash(joined, joined);
+  }
+  return stripped;
 }
 
 export function resolveIngestBoundary(params: {

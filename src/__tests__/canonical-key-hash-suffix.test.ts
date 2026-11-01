@@ -17,8 +17,29 @@ import { MemoryStore } from "../store.js";
  * 改后只在这两种情形附全文短哈希；其余情形与改前逐字相同（现有生产行的 key 不能变）。
  */
 
-function sha8(text: string): string {
-  return createHash("sha1").update(text).digest("hex").slice(0, 8);
+/** 生产用的哈希段：sha256 前 16 位 hex。 */
+function h16(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
+function h8(algorithm: "sha1" | "sha256", text: string): string {
+  return createHash(algorithm).update(text).digest("hex").slice(0, 8);
+}
+
+/** 为空分支的哈希输入：小写、去直引号的原文（与 capture-engine 全文判等同一口径）。 */
+function emptyInput(text: string): string {
+  return text.replace(/\s+/g, " ").trim().toLowerCase().replace(/['"`]/g, "");
+}
+
+/** 截断分支的哈希输入：归一化后的全文（与 normalizeCanonicalKey 截断前相同）。 */
+function fullBaseOf(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/['"`]/g, "")
+    .replace(/[^a-z0-9\p{Script=Han}]+/gu, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-");
 }
 
 function key(category: DurableMemoryCategory, text: string, title?: string): string {
@@ -61,28 +82,28 @@ describe("归一化后为空：附全文短哈希", () => {
   it("西里尔一对得到两个不同的 key，各带自己全文的哈希", () => {
     const ivan = "Иван — мой коллега по работе";
     const petr = "Пётр — мой брат";
-    expect(key("entities", ivan)).toBe(`entities:memory-h${sha8(ivan)}`);
-    expect(key("entities", petr)).toBe(`entities:memory-h${sha8(petr)}`);
+    expect(key("entities", ivan)).toBe(`entities:memory-h${h16(emptyInput(ivan))}`);
+    expect(key("entities", petr)).toBe(`entities:memory-h${h16(emptyInput(petr))}`);
     expect(key("entities", ivan)).not.toBe(key("entities", petr));
   });
 
   it("韩文", () => {
     const text = "서울에 살고 있습니다";
-    expect(key("profile", text)).toBe(`profile:memory-h${sha8(text)}`);
+    expect(key("profile", text)).toBe(`profile:memory-h${h16(emptyInput(text))}`);
   });
 
   it("纯假名", () => {
     const text = "ひらがなだけのメモ";
-    expect(key("profile", text)).toBe(`profile:memory-h${sha8(text)}`);
+    expect(key("profile", text)).toBe(`profile:memory-h${h16(emptyInput(text))}`);
   });
 
   it("只有标点也算为空；哈希按折叠空白后的原文算，首尾与连续空白不影响", () => {
-    expect(key("entities", "!!! ???")).toBe(`entities:memory-h${sha8("!!! ???")}`);
+    expect(key("entities", "!!! ???")).toBe(`entities:memory-h${h16("!!! ???")}`);
     expect(key("entities", "  !!!   ???  ")).toBe(key("entities", "!!! ???"));
   });
 
   it("有 title 时按 title 算（与改前取 base 的规则一致）", () => {
-    expect(key("entities", "body", "Иван")).toBe(`entities:memory-h${sha8("Иван")}`);
+    expect(key("entities", "body", "Иван")).toBe(`entities:memory-h${h16("иван")}`);
   });
 });
 
@@ -92,35 +113,131 @@ describe("归一化后超过 120 字：截断并附全文短哈希", () => {
 
   it("前 120 字相同的一对得到两个不同的 key", () => {
     expect(key("entities", a)).not.toBe(key("entities", b));
-    expect(key("entities", a).endsWith(`-h${sha8(a)}`)).toBe(true);
-    expect(key("entities", b).endsWith(`-h${sha8(b)}`)).toBe(true);
+    expect(key("entities", a).endsWith(`-h${h16(fullBaseOf(a))}`)).toBe(true);
+    expect(key("entities", b).endsWith(`-h${h16(fullBaseOf(b))}`)).toBe(true);
   });
 
   it("整条 key 不超过 120 字（冲突记录的 canonicalKey 上限），开头仍是正文的前缀", () => {
     for (const category of ["profile", "preferences", "entities", "events", "cases", "patterns"] as const) {
       const k = key(category, a);
       expect(k.length).toBeLessThanOrEqual(120);
-      const body = k.slice(`${category}:`.length, -"-h00000000".length);
+      const body = k.slice(`${category}:`.length, -"-h0000000000000000".length);
       expect(body.length).toBeGreaterThan(80);
+      expect(k.length).toBe(120);
       expect("alice-is-the-maintainer-of-the-recallnest-memory-service-and-she-reviews-every-pull-request-touching-the-core-write-path".startsWith(body)).toBe(true);
     }
   });
 
   it("121 字触发、120 字不触发", () => {
     expect(key("entities", "a".repeat(120))).toBe(`entities:${"a".repeat(120)}`);
-    expect(key("entities", "a".repeat(121)).endsWith(`-h${sha8("a".repeat(121))}`)).toBe(true);
+    expect(key("entities", "a".repeat(121)).endsWith(`-h${h16("a".repeat(121))}`)).toBe(true);
   });
 
   it("截断处不留半个代理对", () => {
     const astral = "𠀀".repeat(130); // 扩展 B 汉字，每个 2 个 UTF-16 单元
     const k = key("entities", astral);
-    expect(k.endsWith(`-h${sha8(astral)}`)).toBe(true);
+    expect(k.endsWith(`-h${h16(astral)}`)).toBe(true);
     expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(k)).toBe(false);
     expect(k.length).toBeLessThanOrEqual(120);
   });
 });
 
+describe("哈希段 16 位 hex（sha256 前 64 bit）：8 位下撞车的对不再撞", () => {
+  it("评审构造的西里尔一对：旧方案（sha1 原文前 8 位）同为 3a66b8c3，现在 key 不同", () => {
+    const x = "Иван бдщф";
+    const y = "Иван гтзз";
+    expect(h8("sha1", x)).toBe("3a66b8c3");
+    expect(h8("sha1", y)).toBe("3a66b8c3");
+    expect(key("entities", x)).not.toBe(key("entities", y));
+  });
+
+  it("在现行哈希输入上 sha256 前 8 位相撞的西里尔一对，16 位下 key 不同", () => {
+    const x = "иван ойоб";
+    const y = "иван дячб";
+    expect(h8("sha256", emptyInput(x))).toBe(h8("sha256", emptyInput(y)));
+    expect(key("entities", x)).toBe(`entities:memory-h${h16(emptyInput(x))}`);
+    expect(key("entities", x)).not.toBe(key("entities", y));
+  });
+
+  it("前缀相同、尾号不同的长英文：旧方案 sha1 前 8 位相撞的一对，现在 key 不同", () => {
+    const x = `${LONG_PREFIX} 00079847`;
+    const y = `${LONG_PREFIX} 00096619`;
+    expect(h8("sha1", x)).toBe(h8("sha1", y));
+    expect(key("entities", x)).not.toBe(key("entities", y));
+  });
+
+  it("前缀相同、尾号不同的长英文：在现行哈希输入上 sha256 前 8 位相撞的一对，16 位下 key 不同", () => {
+    const x = `${LONG_PREFIX} 00032053`;
+    const y = `${LONG_PREFIX} 00048400`;
+    expect(h8("sha256", fullBaseOf(x))).toBe(h8("sha256", fullBaseOf(y)));
+    expect(key("entities", x)).not.toBe(key("entities", y));
+  });
+});
+
+describe("哈希后缀与普通正文隔离", () => {
+  it("普通正文「memory-h<16 hex>」与一条西里尔文本不再同 key", () => {
+    const cyrillic = "Иван — мой коллега по работе";
+    const hashKey = key("entities", cyrillic);
+    const lookalike = hashKey.slice("entities:".length); // memory-h<16 hex>
+    expect(lookalike).toMatch(/^memory-h[0-9a-f]{16}$/);
+    const plain = key("entities", lookalike);
+    expect(plain).not.toBe(hashKey);
+    // 它自己附上的是自身全文的哈希
+    expect(plain).toBe(`entities:${lookalike}-h${h16(lookalike)}`);
+  });
+
+  it("只有恰好 16 位 hex 才算哈希形状：15 位、17 位、非 hex 不加", () => {
+    expect(key("entities", "note-h0123456789abcde")).toBe("entities:note-h0123456789abcde");
+    expect(key("entities", "note-h0123456789abcdef0")).toBe("entities:note-h0123456789abcdef0");
+    expect(key("entities", "note-h0123456789abcdeg")).toBe("entities:note-h0123456789abcdeg");
+    expect(key("entities", "note-h0123456789abcdef")).toBe(
+      `entities:note-h0123456789abcdef-h${h16("note-h0123456789abcdef")}`,
+    );
+  });
+});
+
+describe("哈希输入与全文判等同一口径（先小写）", () => {
+  it("「A」×121 与「a」×121 同 key", () => {
+    expect(key("entities", "A".repeat(121))).toBe(key("entities", "a".repeat(121)));
+  });
+
+  it("前面多一个直引号的 121 个 a 与 121 个 a 同 key", () => {
+    expect(key("entities", `"${"a".repeat(121)}`)).toBe(key("entities", "a".repeat(121)));
+  });
+
+  it("为空分支：大小写不同的同一段西里尔同 key，两段不同的西里尔仍不同", () => {
+    expect(key("entities", "ИВАН")).toBe(key("entities", "иван"));
+    expect(key("entities", "Иван")).not.toBe(key("entities", "Пётр"));
+  });
+});
+
+describe("偏好槽位 key 超长时同样附哈希", () => {
+  const brand = "品".repeat(24);
+  const item = "鸡".repeat(72);
+  const jia = `我喜欢吃${brand}的${item}甲甲甲甲甲甲甲甲`;
+  const yi = `我喜欢吃${brand}的${item}乙乙乙乙乙乙乙乙`;
+
+  it("brand 24 字 + item 80 字、只差末 8 字的两条偏好得到不同 key，且不超过 120 字", () => {
+    const a = key("preferences", jia);
+    const b = key("preferences", yi);
+    expect(a.startsWith(`preferences:brand-item:${brand}:鸡`)).toBe(true);
+    expect(a).not.toBe(b);
+    expect(a.length).toBeLessThanOrEqual(120);
+    expect(b.length).toBeLessThanOrEqual(120);
+    expect(a).toMatch(/-h[0-9a-f]{16}$/);
+  });
+
+  it("未超长的槽位 key 一字不变", () => {
+    expect(key("preferences", "我喜欢吃麦当劳的麦辣鸡翅")).toBe("preferences:brand-item:麦当劳:麦辣鸡翅");
+    expect(key("preferences", "User prefers concise, direct replies.")).toBe("preferences:reply-style:concise:direct");
+    expect(key("preferences", "Uses Bun over Node.")).toBe("preferences:tool-choice:bun:over:node");
+    expect(key("preferences", "I use Figma for design")).toBe("preferences:implicit-usage:figma");
+  });
+});
+
 describe("真实临时 LanceDB：同 scope 先后写，前一条不再被原位改写成后一条", () => {
+  // 文件里第一次开 LanceDB 要加载原生模块，冷启动时偶尔超过默认的 5 秒
+  const LANCEDB_TIMEOUT_MS = 20_000;
   const tmpDirs: string[] = [];
   let originalDataDir: string | undefined;
 
@@ -183,7 +300,7 @@ describe("真实临时 LanceDB：同 scope 先后写，前一条不再被原位�
     const first = await store.getById(a.id);
     expect(first).not.toBeNull();
     expect(first!.text).toBe("Иван — мой коллега по работе");
-  });
+  }, LANCEDB_TIMEOUT_MS);
 
   it("长公共前缀英文一对：两条都是 stored，第一条原文还在原 id 上", async () => {
     const one = `${LONG_PREFIX} — and also owns the nightly dream consolidation job`;
@@ -193,5 +310,5 @@ describe("真实临时 LanceDB：同 scope 先后写，前一条不再被原位�
     expect(b.disposition).toBe("stored");
     const first = await store.getById(a.id);
     expect(first!.text).toBe(one);
-  });
+  }, LANCEDB_TIMEOUT_MS);
 });
