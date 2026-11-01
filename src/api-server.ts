@@ -9,7 +9,7 @@
 import { createComponentResolver, loadConfig, loadDotEnv, resolveDataDir } from "./runtime-config.js";
 import { HTTP_WRITE_IDLE_TIMEOUT_S } from "./store-write-budget.js";
 import { DurableMemoryCategorySchema } from "./memory-schema.js";
-import { persistCaseMemory, persistMemory, persistMemoryBatch, persistWorkflowPattern, promoteMemory } from "./capture-engine.js";
+import { persistCaseMemory, persistMemory, persistMemoryBatch, persistWorkflowPattern, promoteMemory, type PersistMemoryDeps } from "./capture-engine.js";
 import { buildSessionCheckpointResult } from "./session-engine.js";
 import {
   buildCaptureHttpResponse,
@@ -273,12 +273,26 @@ async function handleStore(request: Request): Promise<Response> {
   }
 }
 
-/** POST /v1/capture — store multiple structured memories in one request */
-async function handleCapture(request: Request): Promise<Response> {
+/** What handleCapture writes with; injectable so a test can point it at a temp store and audit file. */
+export type CaptureHandlerDeps = Pick<PersistMemoryDeps, "store" | "embedder" | "conflictStore" | "auditLogger">;
+
+function defaultCaptureDeps(): CaptureHandlerDeps {
+  const { store, embedder } = getComponents();
+  return { store, embedder, conflictStore, auditLogger };
+}
+
+/**
+ * POST /v1/capture — store multiple structured memories in one request.
+ * Each written memory gets an audit.jsonl line, the same as /v1/store and MCP capture.
+ */
+export async function handleCapture(
+  request: Request,
+  resolveDeps: () => CaptureHandlerDeps = defaultCaptureDeps,
+): Promise<Response> {
   const body = await readJson(request);
   try {
-    const { store, embedder } = getComponents();
-    const stored = await persistMemoryBatch({ store, embedder, conflictStore }, body);
+    const { store, embedder, conflictStore: conflicts, auditLogger: audit } = resolveDeps();
+    const stored = await persistMemoryBatch({ store, embedder, conflictStore: conflicts, auditLogger: audit }, body);
     const response = buildCaptureHttpResponse(stored);
     return jsonResponse(response.body, response.status);
   } catch (err) {
