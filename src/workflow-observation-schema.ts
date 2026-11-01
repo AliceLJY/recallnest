@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { boundedStringSchema, identifierSchema, normalizedStringListSchema, optionalBoundedStringSchema } from "./schema-utils.js";
+import { boundedStringSchema, identifierSchema, isoDateTimeSchema, normalizedStringListSchema, optionalBoundedStringSchema } from "./schema-utils.js";
 import { RECALLED_IDS_CAP } from "./recall-ledger.js";
 
 export const WORKFLOW_OBSERVATION_OUTCOMES = [
@@ -43,7 +43,7 @@ export const WorkflowObservationInputSchema = z.object({
   task: optionalBoundedStringSchema(240),
   tags: normalizedStringListSchema("tags", 8, 40),
   tools: normalizedStringListSchema("tools", 6, 60),
-  recordedAt: z.string().datetime().default(() => new Date().toISOString()),
+  recordedAt: isoDateTimeSchema().default(() => new Date().toISOString()),
   skillId: optionalBoundedStringSchema(128),
   idempotencyKey: optionalBoundedStringSchema(160),
   /** P0 join key（会话级）：上报这条 observation 的读者身份，对应 memory metadata 的 readerIds。 */

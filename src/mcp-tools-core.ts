@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isoDateTimeSchema } from "./schema-utils.js";
 import { persistMemory } from "./capture-engine.js";
 import { formatStoreMemoryReceipt } from "./store-receipts.js";
 import { composeLightResumeContext, composeResumeContext } from "./context-composer.js";
@@ -186,7 +187,7 @@ registerTool(
     entities: z.array(z.string().min(1).max(120)).max(8).default([]).describe("Relevant projects, tools, or people"),
     files: z.array(z.string().min(1).max(220)).max(12).default([]).describe("Relevant files or paths"),
     idempotencyKey: z.string().min(1).max(160).optional().describe("Optional stable request key; repeated saves with the same key replace the prior checkpoint"),
-    updatedAt: z.string().datetime().optional().describe("Optional override; defaults to now"),
+    updatedAt: isoDateTimeSchema().optional().describe("Optional override; defaults to now"),
   },
   async ({ sessionId, scope, summary, task, decisions, openLoops, nextActions, entities, files, idempotencyKey, updatedAt }) => {
     const result = buildSessionCheckpointResult({
