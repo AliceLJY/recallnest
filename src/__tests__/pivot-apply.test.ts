@@ -360,6 +360,25 @@ describe("persistPivotCandidate", () => {
   });
 });
 
+describe("pivot-apply minimum length uses the same measure as checkAdmission (PR #51 P2)", () => {
+  it("a short CJK fact admission accepts is stored, not thrown out as a ZodError", async () => {
+    const { deps, storedEntries } = createDeps();
+    const outcome = await persistPivotCandidate(deps as never, makeCandidate({ text: "我是左撇子" }));
+    expect(outcome.disposition).toBe("stored");
+    expect(storedEntries.map((e) => e.text)).toEqual(["我是左撇子"]);
+  });
+
+  it("the schema keeps the floor and stays a zod check: \"hi\" and four CJK characters fail to parse", () => {
+    for (const text of ["hi", "我爱吃辣"]) {
+      const parsed = PivotCandidateInputSchema.safeParse(makeCandidate({ text }));
+      expect(parsed.success, text).toBe(false);
+      if (!parsed.success) expect(parsed.error.issues[0].path).toEqual(["text"]);
+    }
+    expect(PivotCandidateInputSchema.safeParse(makeCandidate({ text: "我是左撇子" })).success).toBe(true);
+    expect(PivotEvidenceCandidateInputSchema.safeParse(makeCandidate({ ...evidenceProvenance(), text: "我是左撇子" })).success).toBe(true);
+  });
+});
+
 describe("persistPivotBatch", () => {
   it("writes a clean batch fully and reports written = total", async () => {
     const { deps } = createDeps();

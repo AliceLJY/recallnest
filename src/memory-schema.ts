@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { boundedStringSchema, identifierSchema, normalizedStringListSchema, optionalBoundedStringSchema } from "./schema-utils.js";
+import { boundedStringSchema, identifierSchema, isoDateTimeSchema, normalizedStringListSchema, optionalBoundedStringSchema } from "./schema-utils.js";
 import * as envConfig from "./env-config.js";
 
 export const DURABLE_MEMORY_CATEGORIES = [
@@ -148,7 +148,7 @@ export const RejectionReasonSchema = z.enum(["text_too_short", "noise_detected",
 export const StoredMemoryRecordSchema = StoreMemoryInputSchema.extend({
   id: identifierSchema("id", 128),
   resolvedScope: identifierSchema("resolvedScope", 160),
-  storedAt: z.string().datetime(),
+  storedAt: isoDateTimeSchema(),
   disposition: WriteDispositionSchema.default("stored"),
   conflictId: identifierSchema("conflictId", 128).optional(),
   rejectionReason: RejectionReasonSchema.optional(),
@@ -245,7 +245,7 @@ export const StoredWorkflowPatternRecordSchema = WorkflowPatternInputSchema.exte
   text: MemoryTextSchema,
   id: identifierSchema("id", 128),
   resolvedScope: identifierSchema("resolvedScope", 160),
-  storedAt: z.string().datetime(),
+  storedAt: isoDateTimeSchema(),
   disposition: WriteDispositionSchema.default("stored"),
   conflictId: identifierSchema("conflictId", 128).optional(),
 });
@@ -255,7 +255,7 @@ export const StoredCaseMemoryRecordSchema = CaseMemoryInputSchema.extend({
   text: MemoryTextSchema,
   id: identifierSchema("id", 128),
   resolvedScope: identifierSchema("resolvedScope", 160),
-  storedAt: z.string().datetime(),
+  storedAt: isoDateTimeSchema(),
   disposition: WriteDispositionSchema.default("stored"),
   conflictId: identifierSchema("conflictId", 128).optional(),
 });
@@ -263,7 +263,7 @@ export const StoredCaseMemoryRecordSchema = CaseMemoryInputSchema.extend({
 export const StoredPromotedMemoryRecordSchema = StoreMemoryInputSchema.extend({
   id: identifierSchema("id", 128),
   resolvedScope: identifierSchema("resolvedScope", 160),
-  storedAt: z.string().datetime(),
+  storedAt: isoDateTimeSchema(),
   disposition: WriteDispositionSchema.default("promoted"),
   sourceMemoryId: identifierSchema("sourceMemoryId", 128),
   sourceCategory: MemoryCategorySchema,

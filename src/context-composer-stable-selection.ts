@@ -3,6 +3,7 @@ import { buildProjectScopeCueTerms, normalizeScopedValue } from "./context-compo
 import { bestSummaryText, cleanText, dedupeText, stripConversationMarkers } from "./context-composer-text.js";
 import type { RetrievalResult } from "./retriever.js";
 import { getConfidence } from "./confidence-tracker.js";
+import { weightedTextLength } from "./text-length.js";
 import {
   GENERIC_ENTITY_TASK_TERMS,
   GENERIC_SCOPE_TERMS,
@@ -17,6 +18,9 @@ import {
 } from "./term-registry.js";
 
 export type StableCategory = "profile" | "preferences" | "entities";
+
+/** 稳定上下文候选的最短长度，按 weightedTextLength 计（ASCII 与改动前的 UTF-16 计数相同）。 */
+export const STABLE_MIN_WEIGHTED_LENGTH = 8;
 
 const STABLE_CATEGORY_LABELS: Record<StableCategory, string> = {
   profile: "Profile",
@@ -39,7 +43,9 @@ function isStableCandidateUseful(category: StableCategory, result: RetrievalResu
 
   const stripped = stripConversationMarkers(result.entry.text);
   const normalized = normalizeText(stripped);
-  if (!normalized || normalized.length < 8) return false;
+  // 与写入准入同一口径（text-length.ts：汉字 / 假名 / 谚文算 2）。阈值仍是 8：纯 ASCII 文本与改动前逐字相同，
+  // 「我是左撇子」(10)、「我对花生过敏」(12) 这类能存进来的短中文事实不再被挡在稳定上下文之外。
+  if (!normalized || weightedTextLength(normalized) < STABLE_MIN_WEIGHTED_LENGTH) return false;
   if (looksLikeStableInstruction(normalized)) return false;
   if (containsLowSignalStableTerm(normalized)) return false;
   if (!isDurableStableScope(result.entry.scope) && stripped.length > 180) return false;

@@ -20,7 +20,7 @@ import { matchesScopeFilter } from "./scope-policy.js";
 import type { TriggerStore, TriggerHit } from "./trigger-store.js";
 import { extractBoundaryMetadata, isDurableMemoryScope, isTranscriptScope, resolveExcludedScopes } from "./memory-boundaries.js";
 import type { TraceCollector } from "./retrieval-trace.js";
-import { extractTopicTag } from "./topic-tag.js";
+import { candidateAcceptor, matchesPoolCriteria, hasPoolCriteria, type CandidatePoolCriteria } from "./candidate-filter.js";
 import { filterInterference } from "./rif.js";
 import { FrequencyTracker } from "./frequency-tracker.js";
 import { applyConfidenceWeight } from "./confidence-tracker.js";
@@ -95,6 +95,17 @@ export interface RetrievalConfig {
    * Hard cutoff after rerank: discard results below this score.
    * Applied after all scoring stages (rerank, recency, importance, length norm).
    * Higher = fewer but more relevant results. (default: 0.35)
+   *
+   * Scope: this is only the floor for categories that are NOT keys of the
+   * active category map (`categoryMinScores`, or DEFAULT_CATEGORY_MIN_SCORES
+   * when unset). The default map lists all six durable categories, so in
+   * practice hardMinScore only reaches legacy categories (preference / fact /
+   * decision / entity / other). Changing it does not move the floor of
+   * profile / preferences / entities / events / cases / patterns — set
+   * `categoryMinScores` for that. This is intended, not a bug: the 2026-08-22
+   * shadow run attributed only 13.5% of drops to hard_min (vs 79.4% for
+   * applyLayerAdmission) and rejected widening admission; pinned by
+   * `retriever-category-min-score.test.ts`.
    */
   hardMinScore: number;
   /**
@@ -135,6 +146,11 @@ export interface RetrievalConfig {
    * Per-category score thresholds. When a result's category matches a key,
    * that threshold is used instead of hardMinScore. Categories not listed
    * fall back to hardMinScore. (default: see DEFAULT_CATEGORY_MIN_SCORES)
+   *
+   * A configured map REPLACES the default map as a whole (no per-key merge):
+   * a partial map sends every unlisted category to hardMinScore. The
+   * writing / debug / fact-check profiles set their own complete map
+   * (retrieval-profiles.ts), which overrides a value set in config.json.
    */
   categoryMinScores?: Record<string, number>;
   /** Enable Retrieval Interference Filter (RIF) — demotes near-duplicate weak results. Default: false. */
@@ -193,8 +209,16 @@ export interface RetrievalContext {
   graph?: boolean;
   /** Override config-level multiHop for this single retrieval call. */
   multiHop?: boolean;
-  /** MP-1: Filter results by topicTag stored in metadata. */
+  /**
+   * MP-1: Filter results by topicTag stored in metadata. Applied to the candidate pool before it is
+   * truncated (store loop + before finalizeResults), not to the already-cut result list.
+   */
   topicTag?: string;
+  /**
+   * Explicit stored-time window (search_memory `after` / `before`, see explicitTimeRange), matched
+   * against `timestamp`. Applied at the same points as topicTag.
+   */
+  timeRange?: TemporalConstraint;
   /** Request constructive retrieval reconstruction */
   reconstruct?: boolean;
   /** F3: Query memories valid at a specific point in time (ms timestamp). */
@@ -616,6 +640,17 @@ function extractEntitiesFromResults(results: RetrievalResult[]): string[] {
     .map(([entity]) => entity);
 }
 
+function poolCriteriaOf(context: Pick<RetrievalContext, "topicTag" | "timeRange">): CandidatePoolCriteria {
+  return {
+    ...(context.topicTag ? { topicTag: context.topicTag } : {}),
+    ...(context.timeRange ? { timeRange: context.timeRange } : {}),
+  };
+}
+
+function filterPool<T extends MemorySearchResult>(results: T[], pool: CandidatePoolCriteria): T[] {
+  return hasPoolCriteria(pool) ? results.filter(r => matchesPoolCriteria(r.entry, pool)) : results;
+}
+
 function parseMetadata(raw?: string): Record<string, unknown> {
   try {
     return JSON.parse(raw || "{}") as Record<string, unknown>;
@@ -883,6 +918,7 @@ export class MemoryRetriever {
     const safeLimit = clampInt(limit, 1, 20);
     const excluded = resolveExcludedScopes(context);
     const excludeScopes = excluded.length > 0 ? excluded : undefined;
+    const pool = poolCriteriaOf(context);
 
     // Adaptive retrieval: skip trivial queries to save embedding API calls — auto-recall only;
     // explicit queries skip just empty / whitespace (see shouldSkipRetrievalFor).
@@ -911,19 +947,19 @@ export class MemoryRetriever {
 
     // For vector-only mode, use legacy behavior
     if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
-      results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, undefined, excludeScopes, exactToken);
+      results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, undefined, excludeScopes, exactToken, pool);
     } else {
       // Hybrid retrieval with vector + BM25 weighted score fusion (+ optional PPR graph)
-      results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, graph, undefined, excludeScopes);
+      results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, graph, undefined, excludeScopes, pool);
     }
 
     // 0-hit fallback: minScore filter 把所有候选过滤光时，放宽阈值（=0）重试一次。
     // 只在原 path 0 hit 触发；正常召回不受影响。
     if (results.length === 0) {
       if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
-        results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, 0, excludeScopes, exactToken);
+        results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, 0, excludeScopes, exactToken, pool);
       } else {
-        results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, graph, 0, excludeScopes);
+        results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, graph, 0, excludeScopes, pool);
       }
     }
 
@@ -941,13 +977,10 @@ export class MemoryRetriever {
       results = await this.multiHopExpand(results, context);
     }
 
-    // MP-1: Topic Tag post-filter — only keep results matching the requested topicTag
-    if (context.topicTag && results.length > 0) {
-      const tag = context.topicTag.toLowerCase();
-      results = results.filter(r => {
-        const entryTag = extractTopicTag(r.entry.metadata);
-        return entryTag?.toLowerCase() === tag;
-      });
+    // MP-1 topicTag / explicit time window: the real filtering happens on the candidate pool (store
+    // loop + before finalizeResults). This last pass is only a guard for anything merged in afterwards.
+    if (hasPoolCriteria(pool) && results.length > 0) {
+      results = results.filter(r => matchesPoolCriteria(r.entry, pool));
     }
 
     // F3: Temporal validity filter — expired memories excluded by default
@@ -1081,10 +1114,11 @@ export class MemoryRetriever {
     category?: string,
     includeArchived?: boolean,
     excludeScopes?: string[],
+    pool: CandidatePoolCriteria = {},
   ): Promise<RetrievalResult[]> {
     if (!this.store.hasFtsSupport) return [];
     const ftsQuery = tokenizeFts(expandQuery(query), detectLang(query));
-    const bm25 = await this.runBM25Search(ftsQuery, Math.max(limit, 5), scopeFilter, category, includeArchived, excludeScopes);
+    const bm25 = await this.runBM25Search(ftsQuery, Math.max(limit, 5), scopeFilter, category, includeArchived, excludeScopes, pool);
     const candidates = bm25
       .filter(b => !vectorPoolIds.has(b.entry.id))
       // 默认排掉 superseded/archived/consolidated，免得 3 个名额被 finalize 必然丢掉的条目占掉
@@ -1146,6 +1180,7 @@ export class MemoryRetriever {
         context.graph,
         undefined,
         resolveExcludedScopes(context).length > 0 ? resolveExcludedScopes(context) : undefined,
+        poolCriteriaOf(context),
       ).catch(() => [] as RetrievalResult[]),
     );
     const followUpResults = await Promise.all(followUpPromises);
@@ -1248,6 +1283,7 @@ export class MemoryRetriever {
     minScoreOverride?: number,
     excludeScopes?: string[],
     exactTokenSupplement = false,
+    pool: CandidatePoolCriteria = {},
   ): Promise<RetrievalResult[]> {
     // Temporal reasoning for vector-only mode
     const temporal = parseTemporalQuery(query);
@@ -1268,10 +1304,15 @@ export class MemoryRetriever {
     // plus a few more local scoring passes, no extra API; P1.2's vector-only savings come from
     // skipping hybrid BM25/fusion/rerank, not from fetch size.
     const fetchLimit = Math.max(limit, this.config.candidatePoolSize ?? limit);
-    const results = await this.store.vectorSearch(queryVector, fetchLimit, vectorMinScore, scopeFilter, undefined, excludeScopes);
+    // category goes into the SQL, archived / evolution status / topicTag / time window are checked in the
+    // store loop before its limit cut — so the ≤ 20 rows that come back are eligible ones (体检 #10).
+    const results = await this.store.vectorSearch(
+      queryVector, fetchLimit, vectorMinScore, scopeFilter, undefined, excludeScopes,
+      { category, accept: candidateAcceptor({ includeArchived, ...pool }) },
+    );
     trace?.endStage(results.length, results.map(r => r.score));
 
-    // Filter by category if specified
+    // Filter by category if specified (kept: duck-typed stores ignore the filter argument)
     const afterCategory = category
       ? results.filter(r => r.entry.category === category)
       : results;
@@ -1299,7 +1340,7 @@ export class MemoryRetriever {
       trace?.startStage("exact_token_bm25", 0);
       const supplements = await this.collectExactTokenSupplements(
         query, queryVector, new Set(results.map(r => r.entry.id)), limit,
-        scopeFilter, category, includeArchived, excludeScopes,
+        scopeFilter, category, includeArchived, excludeScopes, pool,
       );
       const inWindow = temporal.constraint
         ? supplements.filter(r => matchesTemporalConstraint(r.entry.timestamp, temporal.constraint!))
@@ -1314,7 +1355,11 @@ export class MemoryRetriever {
     // T-Mem triggers：联想入口在这里并入候选（相似度那一步之后、打分链之前）
     const withTriggers = await this.applyTriggerRecall(anchorBoosted, queryVector, searchQuery, scopeFilter, category, includeArchived, trace);
 
-    const scored = this.applySharedScoring(withTriggers, query, trace);
+    // topicTag / time window on the whole pool (vector rows, exact-token BM25 supplements, trigger hosts)
+    // before finalize cuts to limit
+    const eligible = filterPool(withTriggers, pool);
+
+    const scored = this.applySharedScoring(eligible, query, trace);
 
     // Session suppression: temporarily penalize "do not disturb" memories (vector-only path)
     const afterSuppression = this.applySessionSuppression(scored);
@@ -1338,6 +1383,7 @@ export class MemoryRetriever {
     graph?: boolean,
     minScoreOverride?: number,
     excludeScopes?: string[],
+    pool: CandidatePoolCriteria = {},
   ): Promise<RetrievalResult[]> {
     // Adaptive pool: widen candidate pool for aggregation queries ("how many", "all the")
     const multiplier = (this.config.adaptivePoolMultiplier ?? 1) > 1 && isAggregationQuery(query)
@@ -1367,8 +1413,8 @@ export class MemoryRetriever {
 
     trace?.startStage("vector_search", 0);
     const [vectorResults, bm25Results, pprResults] = await Promise.all([
-      this.runVectorSearch(queryVector, candidatePoolSize, scopeFilter, category, includeArchived, excludeScopes),
-      this.runBM25Search(ftsQuery, candidatePoolSize, scopeFilter, category, includeArchived, excludeScopes),
+      this.runVectorSearch(queryVector, candidatePoolSize, scopeFilter, category, includeArchived, excludeScopes, pool),
+      this.runBM25Search(ftsQuery, candidatePoolSize, scopeFilter, category, includeArchived, excludeScopes, pool),
       pprPromise,
     ]);
     trace?.endStage(vectorResults.length, vectorResults.map(r => r.score));
@@ -1401,7 +1447,10 @@ export class MemoryRetriever {
     trace?.endStage(anchorBoosted.length, anchorBoosted.map(r => r.score));
 
     // T-Mem triggers：联想入口并入候选，在 min_score / rerank 之前
-    const withTriggers = await this.applyTriggerRecall(anchorBoosted, queryVector, searchQuery, scopeFilter, category, includeArchived, trace);
+    const withTriggers = filterPool(
+      await this.applyTriggerRecall(anchorBoosted, queryVector, searchQuery, scopeFilter, category, includeArchived, trace),
+      pool,
+    );
 
     // Apply minimum score threshold
     trace?.startStage("min_score_filter", withTriggers.length);
@@ -1680,10 +1729,14 @@ export class MemoryRetriever {
     category?: string,
     includeArchived?: boolean,
     excludeScopes?: string[],
+    pool: CandidatePoolCriteria = {},
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
     let results: MemorySearchResult[];
     try {
-      results = await this.store.vectorSearch(queryVector, limit, 0.1, scopeFilter, undefined, excludeScopes);
+      results = await this.store.vectorSearch(
+        queryVector, limit, 0.1, scopeFilter, undefined, excludeScopes,
+        { category, accept: candidateAcceptor({ includeArchived, ...pool }) },
+      );
     } catch (err) {
       // Fail-open: log warning and continue with empty results (backport from v1.0.30)
       logWarn("vectorSearch failed, continuing with empty results:", err);
@@ -1713,8 +1766,12 @@ export class MemoryRetriever {
     category?: string,
     includeArchived?: boolean,
     excludeScopes?: string[],
+    pool: CandidatePoolCriteria = {},
   ): Promise<Array<MemorySearchResult & { rank: number }>> {
-    const results = await this.store.bm25Search(query, limit, scopeFilter, excludeScopes);
+    const results = await this.store.bm25Search(
+      query, limit, scopeFilter, excludeScopes,
+      { category, accept: candidateAcceptor({ includeArchived, ...pool }) },
+    );
 
     // Filter by category if specified
     const afterCategory = category

@@ -13,6 +13,7 @@ import { join, resolve } from "node:path";
 
 import { STORE_WRITE_LOCK_OPTS, STORE_WRITE_LONG_LOCK_OPTS } from "../store.js";
 import { HTTP_WRITE_IDLE_TIMEOUT_S, STORE_WRITE_NESTED_WAIT_MS } from "../store-write-budget.js";
+import { DISTILL_PERSIST_LOCK_OPTS } from "../session-distiller.js";
 
 const SRC_DIR = resolve(import.meta.dir, "..");
 const STORE_SRC = readFileSync(join(SRC_DIR, "store.ts"), "utf-8");
@@ -111,7 +112,8 @@ describe("lock waits around store-write", () => {
         if (/onBusy:\s*"skip"/.test(call.args)) continue;
         total++;
         const justified = /\/\/ lock-wait: no store-write inside/.test(call.lineAbove);
-        if (!justified && !/STORE_WRITE_NESTED_WAIT_MS/.test(call.args)) offenders.push(`${f}: ${call.args.slice(0, 80)}`);
+        // DISTILL_PERSIST_LOCK_OPTS (session-distiller.ts) is a multiple of the nested budget; checked below.
+        if (!justified && !/STORE_WRITE_NESTED_WAIT_MS|DISTILL_PERSIST_LOCK_OPTS/.test(call.args)) offenders.push(`${f}: ${call.args.slice(0, 80)}`);
       }
     }
     expect(offenders).toEqual([]);
@@ -125,6 +127,9 @@ describe("lock waits around store-write", () => {
     for (const call of mirrorCalls) expect(call.args).toMatch(/waitTimeoutMs:\s*(2 \* )?STORE_WRITE_NESTED_WAIT_MS/);
     const distiller = readFileSync(join(SRC_DIR, "session-distiller.ts"), "utf-8");
     const [distill] = callsOf(distiller, "withWriteLock(", "withWriteLock".length).filter((c) => c.args.includes("distill-"));
-    expect(distill!.args).toMatch(/waitTimeoutMs:\s*STORE_WRITE_NESTED_WAIT_MS/);
+    // The distill lock covers one nested store-write per summary dimension, so it waits a multiple
+    // of the nested budget (DISTILL_PERSIST_LOCK_OPTS), never less than one.
+    expect(distill!.args).toMatch(/waitTimeoutMs:\s*opts\.lockWaitTimeoutMs \?\? DISTILL_PERSIST_LOCK_OPTS\.waitTimeoutMs/);
+    expect(DISTILL_PERSIST_LOCK_OPTS.waitTimeoutMs).toBeGreaterThanOrEqual(STORE_WRITE_NESTED_WAIT_MS);
   });
 });

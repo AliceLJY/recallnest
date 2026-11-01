@@ -6,7 +6,10 @@
 
 import type * as LanceDB from "@lancedb/lancedb";
 import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 import { loadLanceDB } from "./store.js";
+import { readConsistencyInterval as envReadConsistencyInterval } from "./env-config.js";
+import { withWriteLock as withCrossProcessLock } from "./distill-lock.js";
 
 // ============================================================================
 // Types
@@ -43,6 +46,14 @@ export type KGTripleInput = Omit<KGTriple, "id" | "timestamp" | "mention_count" 
 export interface KGStoreConfig {
   /** Reuse the same LanceDB connection path as MemoryStore */
   dbPath: string;
+  /**
+   * LanceDB readConsistencyInterval (seconds), same source as MemoryStore / TriggerStore:
+   * explicit value wins, else RECALLNEST_READ_CONSISTENCY_INTERVAL (default 0 = check for other
+   * processes' commits on every read). Without it a long-lived handle never sees their writes.
+   */
+  readConsistencyInterval?: number;
+  /** Cross-process write lock directory; defaults to distill-lock's (<dataDir>/locks). Tests point it at a temp dir. */
+  lockDir?: string;
 }
 
 export interface NeighborhoodResult {
@@ -57,6 +68,11 @@ export interface NeighborhoodResult {
 // ============================================================================
 
 const KG_TABLE_NAME = "kg_triples";
+
+/** Cross-process write lock for one database's kg_triples table (keyed by its resolved path). */
+export function kgWriteLockKey(dbPath: string): string {
+  return `kg-write:${resolve(dbPath)}`;
+}
 
 /** Deterministic triple ID for dedup */
 export function tripleId(scope: string, subject: string, predicate: string, object: string): string {
@@ -97,15 +113,34 @@ export class KGStore {
   private initPromise: Promise<void> | null = null;
   /** In-process write serialization: concurrent workers (e.g. backfill
    * --concurrency) would otherwise race read-modify-write AND collide on
-   * LanceDB optimistic commits. Cross-process races stay best-effort. */
+   * LanceDB optimistic commits. Each link also holds the cross-process lock
+   * (withSharedLock), so another process's KGStore cannot interleave either. */
   private writeChain: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly config: KGStoreConfig) {}
 
   private withWriteLock<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.writeChain.then(fn, fn);
+    const locked = (): Promise<T> => this.withSharedLock(fn);
+    const run = this.writeChain.then(locked, locked);
     this.writeChain = run.catch(() => {});
     return run;
+  }
+
+  /**
+   * Hold the cross-process kg-write lock for a read-modify-write, after moving the table handle to
+   * the latest version: the handle may still be on a version from before the wait, and the reads
+   * inside (existing rows, their source lists) must see what another process just committed.
+   */
+  private withSharedLock<T>(fn: () => Promise<T>): Promise<T> {
+    // lock-wait: no store-write inside — fn only touches the kg_triples table.
+    return withCrossProcessLock(kgWriteLockKey(this.config.dbPath), async () => {
+      await this.table!.checkoutLatest();
+      return fn();
+    }, {
+      maxHoldMs: 30_000,
+      waitTimeoutMs: 30_000,
+      ...(this.config.lockDir ? { lockDir: this.config.lockDir } : {}),
+    });
   }
 
   // --------------------------------------------------------------------------
@@ -125,7 +160,10 @@ export class KGStore {
 
   private async doInitialize(): Promise<void> {
     const lancedb = await loadLanceDB();
-    const db = await lancedb.connect(this.config.dbPath);
+    const db = await lancedb.connect(this.config.dbPath, {
+      readConsistencyInterval:
+        this.config.readConsistencyInterval ?? envReadConsistencyInterval(),
+    });
 
     let table: LanceDB.Table;
     try {
@@ -462,38 +500,42 @@ export class KGStore {
     await this.ensureInitialized();
     const safe = escapeSql(sourceMemoryId);
 
-    // LIKE on the JSON array is an exact match thanks to the quotes:
-    // '%"mem-1"%' never matches "mem-12". source_memory_id covers legacy rows.
-    const rows = await this.table!.query()
-      .where(`source_memory_id = '${safe}' OR source_memory_ids LIKE '%"${safe}"%'`)
-      .limit(100000)
-      .toArray();
-    if (rows.length === 0) return;
-
-    const toDelete: string[] = [];
-    const toUpdate: KGTriple[] = [];
-    for (const row of rows) {
-      const t = rowToTriple(row);
-      const ids = parseSourceIds(t.source_memory_ids, t.source_memory_id);
-      if (!ids.includes(sourceMemoryId)) continue; // LIKE prefilter false positive — exact check in JS
-      const remaining = ids.filter((s) => s !== sourceMemoryId);
-      if (remaining.length === 0) {
-        toDelete.push(t.id);
-      } else {
-        toUpdate.push({
-          ...t,
-          // count never drops below the remaining evidence count (cap-era divergence guard)
-          mention_count: Math.max(t.mention_count - 1, remaining.length),
-          source_memory_id: remaining[0],
-          source_memory_ids: JSON.stringify(remaining),
-          source_text: t.source_memory_id === sourceMemoryId ? "" : t.source_text,
-        });
-      }
-    }
-
+    // The read, the per-row decision and the write are one critical section: decided on a
+    // stale read, a row another source was just added to would be deleted outright, and a
+    // row this source was just added to would be left behind.
     await this.withWriteLock(async () => {
+      // LIKE on the JSON array is an exact match thanks to the quotes:
+      // '%"mem-1"%' never matches "mem-12". source_memory_id covers legacy rows.
+      const rows = await this.table!.query()
+        .where(`source_memory_id = '${safe}' OR source_memory_ids LIKE '%"${safe}"%'`)
+        .limit(100000)
+        .toArray();
+      if (rows.length === 0) return;
+
+      const toDelete: string[] = [];
+      const toUpdate: KGTriple[] = [];
+      for (const row of rows) {
+        const t = rowToTriple(row);
+        const ids = parseSourceIds(t.source_memory_ids, t.source_memory_id);
+        if (!ids.includes(sourceMemoryId)) continue; // LIKE prefilter false positive — exact check in JS
+        const remaining = ids.filter((s) => s !== sourceMemoryId);
+        if (remaining.length === 0) {
+          toDelete.push(t.id);
+        } else {
+          toUpdate.push({
+            ...t,
+            // count never drops below the remaining evidence count (cap-era divergence guard)
+            mention_count: Math.max(t.mention_count - 1, remaining.length),
+            source_memory_id: remaining[0],
+            source_memory_ids: JSON.stringify(remaining),
+            source_text: t.source_memory_id === sourceMemoryId ? "" : t.source_text,
+          });
+        }
+      }
+
       if (toUpdate.length > 0) {
-        await this.table!.mergeInsert("id").whenMatchedUpdateAll().whenNotMatchedInsertAll().execute(toUpdate);
+        // Update only: a row deleted meanwhile by a path that skips this lock is not re-inserted.
+        await this.table!.mergeInsert("id").whenMatchedUpdateAll().execute(toUpdate);
       }
       if (toDelete.length > 0) {
         const idList = toDelete.map((id) => `'${escapeSql(id)}'`).join(", ");

@@ -259,12 +259,37 @@ async function handleAutoRecall(request: Request): Promise<Response> {
   }
 }
 
+/**
+ * What handleStore writes with; injectable so a test can point it at a temp store and trigger table.
+ * Carries the trigger side table and the query-side batch embedder, the same two that MCP
+ * store_memory passes, so triggers sent over HTTP land in `memory_triggers` right away instead
+ * of only in `metadata.triggers` (which needed `triggers-backfill --rebuild` to reach recall).
+ */
+export type StoreHandlerDeps = Pick<
+  PersistMemoryDeps,
+  "store" | "embedder" | "conflictStore" | "auditLogger" | "triggerStore" | "embedQueryBatch"
+>;
+
+function defaultStoreDeps(): StoreHandlerDeps {
+  const { store, embedder, triggerStore } = getComponents();
+  return {
+    store,
+    embedder,
+    conflictStore,
+    auditLogger,
+    triggerStore,
+    embedQueryBatch: (texts: string[]) => embedder.embedBatchQuery(texts),
+  };
+}
+
 /** POST /v1/store — store a new memory */
-async function handleStore(request: Request): Promise<Response> {
+export async function handleStore(
+  request: Request,
+  resolveDeps: () => StoreHandlerDeps = defaultStoreDeps,
+): Promise<Response> {
   const body = await readJson(request);
   try {
-    const { store, embedder } = getComponents();
-    const stored = await persistMemory({ store, embedder, conflictStore, auditLogger }, body);
+    const stored = await persistMemory(resolveDeps(), body);
     const response = buildStoreHttpResponse(stored);
     return jsonResponse(response.body, response.status);
   } catch (err) {
