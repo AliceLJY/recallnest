@@ -96,7 +96,7 @@ places where the obvious implementation was wrong — is in
 | **Memory Evolution** | Supersede chains, decay scoring, LLM importance, consolidation, archival |
 | **Smart Promotion** | Evidence → durable memory with conflict guards, merge resolution, and audit trail |
 | **Privacy Tiers** | 4-tier (`ephemeral` / `private` / `durable` / `shared`) with cascade forgetting |
-| **Admission Control** | Write-time gating: noise filter, importance floor, dedup, rate limiting |
+| **Admission Control** | Write-time gating: noise filter, importance floor, dedup. A per-scope rate limiter exists but is optional injection and **not enabled by default** — no production write path passes one |
 | **Memory Lint** | Contradiction, duplicate, stale, and orphan detection with health score |
 | **Offline Consolidation** | `dream` command: clustering, merging, pruning of accumulated memories |
 
