@@ -721,7 +721,7 @@ describe("promoteMemory", () => {
       text: "User prefers concise, direct replies.",
       vector: [4, 5, 6],
       category: "preferences",
-      scope: "memory:agent",
+      scope: TEST_SCOPE, // 与晋升目标同 scope：同 key 只在本 scope 内判冲突
       importance: 0.9,
       metadata: JSON.stringify({
         source: "agent",
@@ -1115,7 +1115,7 @@ describe("promoteMemory", () => {
       text: "User prefers concise, direct replies.",
       vector: [4, 5, 6],
       category: "preferences",
-      scope: "memory:agent",
+      scope: TEST_SCOPE, // 与晋升目标同 scope：同 key 只在本 scope 内判冲突
       importance: 0.9,
       metadata: JSON.stringify({
         source: "agent",
@@ -1171,7 +1171,7 @@ describe("promoteMemory", () => {
       text: "User prefers concise, direct replies.",
       vector: [4, 5, 6],
       category: "preferences",
-      scope: "memory:agent",
+      scope: "memory:acceptance", // 与晋升目标同 scope：同 key 只在本 scope 内判冲突
       importance: 0.9,
       metadata: JSON.stringify({
         source: "agent",
