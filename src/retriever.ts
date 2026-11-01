@@ -783,6 +783,20 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return norm === 0 ? 0 : dotProduct / norm;
 }
 
+/**
+ * exact-token BM25 补偿条目的向量分，与 store.vectorSearch 同口径（cosine 距离 d = 1 − cos，分数 1 / (1 + d)），
+ * 这样它与 vector 候选在同一个尺度上比。行里的向量可能是 Arrow / Float32Array，先转成数组；
+ * 缺失或维度不对时记 0（只剩 BM25 那一份权重）。
+ */
+function exactTokenVectorScore(queryVector: number[], rowVector: unknown): number {
+  if (rowVector == null || typeof (rowVector as Iterable<number>)[Symbol.iterator] !== "function") return 0;
+  const vec = Array.from(rowVector as Iterable<number>);
+  if (vec.length === 0 || vec.length !== queryVector.length) return 0;
+  const cos = cosineSimilarity(queryVector, vec);
+  if (!Number.isFinite(cos)) return 0;
+  return 1 / (1 + (1 - cos));
+}
+
 // ============================================================================
 // Memory Retriever
 // ============================================================================
@@ -882,20 +896,23 @@ export class MemoryRetriever {
     const query = expandQueryWithAliases(rawQuery);
 
     let results: RetrievalResult[];
+    // P1.2+：query 含精确 token（大写常量/commit hash/文件名/snake_case）时，vector 路径用 BM25 补候选。
+    // 判定看原 query（别名追加的规范词不算），与改动前一致。
+    const exactToken = hasExactToken(rawQuery);
 
     // 分派前必须先让 store 完成惰性初始化，否则下面读到的 hasFtsSupport 是初始化前的
     // false，hybrid 模式的**首次**检索会静默落回 vector 路径（同一实例第二次才正常）。
     // 该缺陷自 c10607a 初始版本就在，长期未暴露有两个原因：生产 mode 一直是 "vector"，
     // 第一个条件短路、根本读不到第二个；而 eval 的 createFreshEvalComponentsFactory 每
     // case 新建组件，每个 case 都停在"首次"，于是 eval 从未测到过 hybrid 路径。
-    // 注：supplementExactTokenWithBm25 那里的顺序依赖是被意识到的（见其注释"hasFtsSupport
-    // 在 vectorOnly 触发 store init 后为真"），漏的只是这个分派点。
+    // 注：exact-token BM25 补偿（collectExactTokenSupplements）在 vectorOnly 里读 hasFtsSupport，
+    // 同样依赖这里先完成初始化。
     // `?.` 是必需的：测试大量使用鸭子类型的 fake store，它们没有 ready()。
     await this.store.ready?.();
 
     // For vector-only mode, use legacy behavior
     if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
-      results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, undefined, excludeScopes);
+      results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, undefined, excludeScopes, exactToken);
     } else {
       // Hybrid retrieval with vector + BM25 weighted score fusion (+ optional PPR graph)
       results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, graph, undefined, excludeScopes);
@@ -905,7 +922,7 @@ export class MemoryRetriever {
     // 只在原 path 0 hit 触发；正常召回不受影响。
     if (results.length === 0) {
       if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
-        results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, 0, excludeScopes);
+        results = await this.vectorOnlyRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, 0, excludeScopes, exactToken);
       } else {
         results = await this.hybridRetrieval(query, safeLimit, scopeFilter, category, includeArchived, trace, graph, 0, excludeScopes);
       }
@@ -915,13 +932,8 @@ export class MemoryRetriever {
     // 必须在后续 validity/topicTag filter（以及 BM25 补偿等换数组操作）丢失 ResultSet 属性之前读取。
     let omittedByLimit = (results as RetrievalResultSet).omitted?.count ?? 0;
 
-    // P1.2+: exact-token BM25 补偿——query 含精确 token（大写常量/commit hash/.ts 文件名/camelCase/
-    // 低元音 ID 如 rwmjhb）时，vector 漏掉的精确命中用 BM25 补回（vectorOnly 做语义相似、不做精确
-    // 字符串匹配，是 embedding 本质，跟语言无关）。普通词（mem0/recallnest/GitHub）不触发，日常
-    // 语义召回不受影响。
-    if (hasExactToken(rawQuery)) {
-      results = await this.supplementExactTokenWithBm25(query, results, safeLimit, scopeFilter, category, includeArchived, excludeScopes);
-    }
+    // P1.2+ exact-token BM25 补偿已挪进 vectorOnlyRetrieval（打分链之前并入候选，见
+    // collectExactTokenSupplements）；hybrid 路径的 BM25 本来就参与融合，不再另补。
 
     // LME-2: Multi-hop retrieval — extract entities from first-pass results,
     // run focused follow-up queries, merge to improve cross-session coverage.
@@ -1048,34 +1060,58 @@ export class MemoryRetriever {
   }
 
   /**
-   * P1.2+: exact-token BM25 补偿。vectorOnly 主路径后，若 query 含精确 token，用 BM25 精确匹配把
-   * vector 漏掉的命中补回。hasFtsSupport 在 vectorOnly 触发 store init 后为真；fake store 为假时跳过。
-   * bm25 精确命中提到结果前（exact-token 意图=精确优先），vector 语义结果跟后，去重后 slice limit。
+   * P1.2+: exact-token BM25 补偿（vector 路径）。query 含精确 token 时，用 BM25 精确匹配把 vector 候选池
+   * 漏掉的命中补成候选，**在打分链之前**并入，之后与 vector 候选走同一套打分链、分数下限、噪声与去重。
+   *
+   * 2026-11-01 之前是 finalize 之后 `[...supplements, ...vectorResults]` 无条件插到最前：带文件名的 query
+   * 下，最多 3 条只因字面含文件名、语义无关的 BM25 命中压在向量分最高的答案前面，且不经过分数下限 /
+   * 噪声 / 去重。
+   *
+   * 补偿条目的分数：它自己的向量分（与 store.vectorSearch 同口径：1 / (1 + 余弦距离)）与 BM25 分按
+   * vectorWeight / bm25Weight 加权平均——与 hybrid 融合「两路都命中」同一组权重，但不加 1.05 的双命中
+   * 奖励：它本来就是向量那一路排不进候选池的条目，向量这一路并不「确认」它。加权平均 ≤ 两路中较大者，
+   * 所以向量分明显低的条目靠 BM25 抬不过向量分高的答案；向量分接近、又精确命中的，可以按分数排上来。
+   * 行里没有可用向量（维度不对 / 缺失）时向量分记 0，只剩 BM25 那一份权重。
    */
-  private async supplementExactTokenWithBm25(
+  private async collectExactTokenSupplements(
     query: string,
-    vectorResults: RetrievalResult[],
+    queryVector: number[],
+    vectorPoolIds: Set<string>,
     limit: number,
     scopeFilter?: string[],
     category?: string,
     includeArchived?: boolean,
     excludeScopes?: string[],
   ): Promise<RetrievalResult[]> {
-    if (!this.store.hasFtsSupport) return vectorResults;
+    if (!this.store.hasFtsSupport) return [];
     const ftsQuery = tokenizeFts(expandQuery(query), detectLang(query));
     const bm25 = await this.runBM25Search(ftsQuery, Math.max(limit, 5), scopeFilter, category, includeArchived, excludeScopes);
-    const vecIds = new Set(vectorResults.map(r => r.entry.id));
-    const supplements = bm25
-      .filter(b => !vecIds.has(b.entry.id))
-      .filter(b => isActiveMemory(b.entry.metadata))   // 排掉 superseded/archived/consolidated（补偿绕过了 finalize 的尾部过滤，这里补回 active 校验）
-      .slice(0, 3)
-      .map(b => ({
+    const candidates = bm25
+      .filter(b => !vectorPoolIds.has(b.entry.id))
+      // 默认排掉 superseded/archived/consolidated，免得 3 个名额被 finalize 必然丢掉的条目占掉
+      .filter(b => includeArchived || isActiveMemory(b.entry.metadata))
+      .slice(0, 3);
+
+    const vW = Math.max(0, this.config.vectorWeight);
+    const bW = Math.max(0, this.config.bm25Weight);
+    const totalW = vW + bW;
+    const out: RetrievalResult[] = [];
+    for (const b of candidates) {
+      // 与 hybrid 融合同一条防护：FTS 索引在删行之后、重建之前可能残留幽灵条目
+      try {
+        if (!(await this.store.hasId(b.entry.id))) continue;
+      } catch {
+        // fail-open，与 fuseResults 一致（测试里的鸭子类型 store 可能没有 hasId）
+      }
+      const vectorScore = exactTokenVectorScore(queryVector, b.entry.vector);
+      const score = totalW > 0 ? clamp01((vW * vectorScore + bW * b.score) / totalW, 0) : 0;
+      out.push({
         entry: b.entry,
-        score: b.score,
+        score,
         sources: { bm25: { score: b.score, rank: b.rank } },
-      } as RetrievalResult));
-    if (supplements.length === 0) return vectorResults;
-    return [...supplements, ...vectorResults].slice(0, limit);
+      });
+    }
+    return out;
   }
 
   /**
@@ -1212,6 +1248,7 @@ export class MemoryRetriever {
     trace?: TraceCollector,
     minScoreOverride?: number,
     excludeScopes?: string[],
+    exactTokenSupplement = false,
   ): Promise<RetrievalResult[]> {
     // Temporal reasoning for vector-only mode
     const temporal = parseTemporalQuery(query);
@@ -1257,8 +1294,23 @@ export class MemoryRetriever {
       },
     } as RetrievalResult));
 
+    // P1.2+: exact-token BM25 补偿——作为候选并入，与 vector 候选走同一条打分链与 finalize
+    let candidates = mapped;
+    if (exactTokenSupplement) {
+      trace?.startStage("exact_token_bm25", 0);
+      const supplements = await this.collectExactTokenSupplements(
+        query, queryVector, new Set(results.map(r => r.entry.id)), limit,
+        scopeFilter, category, includeArchived, excludeScopes,
+      );
+      const inWindow = temporal.constraint
+        ? supplements.filter(r => matchesTemporalConstraint(r.entry.timestamp, temporal.constraint!))
+        : supplements;
+      trace?.endStage(inWindow.length, inWindow.map(r => r.score));
+      if (inWindow.length > 0) candidates = [...mapped, ...inWindow];
+    }
+
     // P0.1: Anchor boost for vector-only path
-    const anchorBoosted = applyAnchorBoost(mapped, searchQuery);
+    const anchorBoosted = applyAnchorBoost(candidates, searchQuery);
 
     // T-Mem triggers：联想入口在这里并入候选（相似度那一步之后、打分链之前）
     const withTriggers = await this.applyTriggerRecall(anchorBoosted, queryVector, searchQuery, scopeFilter, category, includeArchived, trace);
