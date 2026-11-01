@@ -8,6 +8,7 @@
  * trigger 条数按侧表实际写入的条数（PersistedMemoryRecord.triggersWritten）写。
  */
 
+import { describeRejectionReason, type RejectionReason } from "./admission-control.js";
 import type { PersistedMemoryRecord } from "./capture-engine.js";
 import type {
   StoredCaseMemoryRecord,
@@ -19,6 +20,11 @@ import type {
 /** 这次写入在主表里落下了新内容：新行、原位修订、提升。deduped / conflict / rejected 都没有。 */
 export function dispositionWroteMemory(disposition: WriteDisposition): boolean {
   return disposition === "stored" || disposition === "updated" || disposition === "promoted";
+}
+
+/** 「text_too_short: below the minimum length …」：枚举值在前（调用方可能按它匹配），说明在后。 */
+function rejectionLabel(reason: RejectionReason | undefined): string {
+  return reason ? `${reason}: ${describeRejectionReason(reason)}` : "unknown reason";
 }
 
 function receiptHeadline(stored: PersistedMemoryRecord): string {
@@ -35,7 +41,7 @@ function receiptHeadline(stored: PersistedMemoryRecord): string {
     case "conflict":
       return `Not stored: canonical key conflict with memory ${stored.id}`;
     case "rejected":
-      return `Not stored: rejected (${stored.rejectionReason ?? "unknown reason"})`;
+      return `Not stored: rejected (${rejectionLabel(stored.rejectionReason)})`;
   }
 }
 
@@ -86,7 +92,7 @@ export function formatBatchStoreReceipt(records: readonly PersistedMemoryRecord[
   const notWritten = records.flatMap((r, i) => {
     if (dispositionWroteMemory(r.disposition)) return [];
     const n = `#${i + 1}`;
-    if (r.disposition === "rejected") return [`- ${n} rejected (${r.rejectionReason ?? "unknown reason"})`];
+    if (r.disposition === "rejected") return [`- ${n} rejected (${rejectionLabel(r.rejectionReason)})`];
     if (r.disposition === "conflict") {
       return [`- ${n} conflict with memory ${r.id}${r.conflictId ? ` (conflict ${r.conflictId.slice(0, 8)})` : ""}`];
     }

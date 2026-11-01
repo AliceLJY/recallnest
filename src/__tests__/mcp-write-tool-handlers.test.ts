@@ -4,7 +4,7 @@ import { registerAdvancedTools } from "../mcp-tools-advanced.js";
 import { registerCoreTools } from "../mcp-tools-core.js";
 import { registerGovernanceTools } from "../mcp-tools-governance.js";
 import { buildSessionCheckpointResult } from "../session-engine.js";
-import { createToolHarness, SAME_VECTOR, type ToolHarness } from "./helpers/mcp-tool-harness.js";
+import { captureTools, createToolHarness, SAME_VECTOR, type ToolHarness } from "./helpers/mcp-tool-harness.js";
 
 /**
  * 写工具 handler 冒烟测试（2026-10-17 体检第 9 条）。
@@ -64,7 +64,7 @@ describe("store_memory handler", () => {
       triggers: ["那个太短的东西是什么", "之前存过的短句"],
     });
     const lines = text.split("\n");
-    expect(lines[0]).toBe("Not stored: rejected (text_too_short)");
+    expect(lines[0]).toBe("Not stored: rejected (text_too_short: below the minimum length of 10 units; CJK characters count as 2, other characters as 1)");
     expect(lines).toContain("Disposition: rejected");
     expect(lines).toContain("Triggers: 0 of 2 written (nothing was stored)");
     expect(await h.rowCount(SCOPE)).toBe(0);
@@ -140,7 +140,7 @@ describe("batch_store handler", () => {
     expect(lines[0]).toBe(
       "Stored 1 of 3 memories (1 new, 0 updated, 0 promoted, 1 deduped, 0 conflict, 1 rejected)",
     );
-    expect(lines).toContain("- #2 rejected (text_too_short)");
+    expect(lines).toContain("- #2 rejected (text_too_short: below the minimum length of 10 units; CJK characters count as 2, other characters as 1)");
     expect(lines).toContain(`- #3 deduped: duplicate of existing memory ${row.id}`);
 
     // 回执说写了几条，表里就有几条
@@ -336,5 +336,44 @@ describe("list_conflicts / audit_conflicts handlers (read-only)", () => {
     const audit = await h.text("audit_conflicts", {});
     expect(audit).toContain("Open conflicts : 1/1");
     expect(audit).toContain(short);
+  }, 30_000);
+});
+
+describe("short CJK facts through the write tools (task Z)", () => {
+  const SCOPE = "project:tool-cjk-short";
+
+  it("store_memory stores 「我是左撇子」: 5 CJK characters = 10 units, exactly the floor", async () => {
+    const h = harness();
+    const text = await h.text("store_memory", { text: "我是左撇子", category: "profile", scope: SCOPE });
+    const row = await onlyRow(h, SCOPE);
+    expect(text.split("\n")[0]).toBe(`Stored memory ${row.id.slice(0, 8)}`);
+    expect(row.text).toBe("我是左撇子");
+  }, 30_000);
+
+  it("batch_store keeps 「我对花生过敏」 and still rejects 「hi」 with a below-minimum-length reason", async () => {
+    const h = harness();
+    const text = await h.text("batch_store", {
+      scope: SCOPE,
+      memories: [{ text: "我对花生过敏", category: "profile" }, { text: "hi" }],
+    });
+    const lines = text.split("\n");
+    expect(lines[0]).toBe("Stored 1 of 2 memories (1 new, 0 updated, 0 promoted, 0 deduped, 0 conflict, 1 rejected)");
+    expect(lines[1]).toStartWith("- #2 rejected (text_too_short: below the minimum length of 10 units");
+    expect((await onlyRow(h, SCOPE)).text).toBe("我对花生过敏");
+  }, 30_000);
+
+  it("store_memory and batch_store descriptions state the minimum length and the CJK rule; schemas keep min(1)", async () => {
+    const descriptions = new Map<string, string>();
+    const handlers = captureTools(ALL_TOOLS, { descriptions });
+    for (const name of ["store_memory", "batch_store"]) {
+      const d = descriptions.get(name) ?? "";
+      expect(d).toContain("shorter than 10 units is rejected");
+      expect(d).toContain("CJK character counts as 2");
+    }
+    expect(handlers.has("store_memory")).toBe(true);
+    // schema 仍是 min(1)：一个字符的文本能过 schema，走到准入才被拒——出的是回执，不是参数错误
+    const h = harness();
+    const text = await h.text("store_memory", { text: "x", scope: SCOPE });
+    expect(text.split("\n")[0]).toStartWith("Not stored: rejected (text_too_short: below the minimum length");
   }, 30_000);
 });
