@@ -160,6 +160,7 @@ export function buildRetrievalContext(
     trace: base.trace,
     graph: base.graph,
     topicTag: base.topicTag,
+    timeRange: base.timeRange,
     reconstruct: base.reconstruct,
     validAt: base.validAt,
     includeExpired: base.includeExpired,
