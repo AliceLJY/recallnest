@@ -86,7 +86,11 @@ export interface PersistMemoryDeps {
   kgExtractor?: KGExtractor | null;
   /** F-1: Optional audit logger for recording store operations */
   auditLogger?: AuditLogger | null;
-  /** LME-8: Optional rate limiter for admission control */
+  /**
+   * LME-8: Optional rate limiter for admission control. Not passed by any production
+   * caller, so per-scope rate limiting is off by default (guarded by a source test in
+   * admission-control.test.ts).
+   */
   rateLimiter?: ScopeRateLimiter | null;
   /** LME-8: Optional admission config overrides */
   admissionConfig?: Partial<AdmissionConfig>;

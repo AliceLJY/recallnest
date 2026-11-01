@@ -848,7 +848,7 @@ registerTool(
 
 registerTool(
   "batch_store",
-  "Store multiple memories in a single call with deduplication. Side effect: persists up to 20 entries. Use when you have several facts to store at once, more efficient than repeated store_memory calls.",
+  "Store multiple memories in a single call with deduplication. Side effect: persists up to 20 entries. Use when you have several facts to store at once, more efficient than repeated store_memory calls. Each text shorter than 10 units is rejected (each CJK character counts as 2, other characters as 1).",
   {
     memories: z.array(z.object({
       text: z.string().min(1),
@@ -948,7 +948,7 @@ registerTool(
           type: z.enum(["text", "tool_use", "tool_result"]),
           name: z.string().optional(),
           id: z.string().optional(),
-          input: z.record(z.unknown()).optional(),
+          input: z.record(z.string(), z.unknown()).optional(),
           content: z.string().optional(),
           text: z.string().optional(),
           tool_use_id: z.string().optional(),
@@ -980,7 +980,11 @@ registerTool(
     }
     if (result.persisted) {
       const p = result.persisted;
-      lines.push(`Persisted: ${p.memories_stored} stored, ${p.memories_deduped} deduped, ${p.memories_conflicted} conflicted`);
+      lines.push(`Persisted: ${p.memories_stored} stored, ${p.memories_deduped} deduped, ${p.memories_conflicted} conflicted${p.memories_failed > 0 ? `, ${p.memories_failed} failed` : ""}`);
+      for (const e of p.errors) lines.push(`Failed: ${e.dimension} — ${e.error}`);
+      if (p.scope_lock_timed_out) {
+        lines.push(`Note: another distill of this scope held its lock past the wait budget; this summary was persisted without it (possible near-duplicates).`);
+      }
     }
 
     return {

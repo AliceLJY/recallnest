@@ -8,8 +8,9 @@ import type { StoredMemoryRecord, DurableMemoryCategory } from "./memory-schema.
 import { persistMemory } from "./capture-engine.js";
 import { detectLang, getSessionPromptHook } from "./language-hook.js";
 import { redactSecrets } from "./pii-detector.js";
-import { withWriteLock } from "./distill-lock.js";
+import { LockTimeoutError, withWriteLock } from "./distill-lock.js";
 import { STORE_WRITE_NESTED_WAIT_MS } from "./store-write-budget.js";
+import { logWarn } from "./stderr-log.js";
 
 // ============================================================================
 // Types
@@ -71,11 +72,39 @@ export interface SummaryResult {
   dimensions: Record<string, string>;
 }
 
+export interface PersistError {
+  /** Summary dimension whose memory was not written (e.g. "errors_and_fixes"). */
+  dimension: string;
+  error: string;
+}
+
 export interface PersistResult {
   memories_stored: number;
   memories_deduped: number;
   memories_conflicted: number;
+  /** Dimensions whose write threw (embedding, LLM dedup, store write); details in `errors`. */
+  memories_failed: number;
+  errors: PersistError[];
+  /**
+   * The per-scope distill lock was still held by another distill when the wait budget ran out, so
+   * this persist ran without it rather than dropping the summary. Each write is still serialized by
+   * store-write and goes through persistMemory's dedup; two distills of the same session racing here
+   * may leave near-duplicates for consolidation to merge.
+   */
+  scope_lock_timed_out: boolean;
   ids: string[];
+}
+
+function emptyPersistResult(): PersistResult {
+  return {
+    memories_stored: 0,
+    memories_deduped: 0,
+    memories_conflicted: 0,
+    memories_failed: 0,
+    errors: [],
+    scope_lock_timed_out: false,
+    ids: [],
+  };
 }
 
 export interface DistillResult {
@@ -146,6 +175,20 @@ const DIMENSION_TO_MEMORY: Record<string, DimensionMapping> = {
   unfinished_tasks: { category: "cases", importance: 0.75 },
   next_steps: { category: "patterns", importance: 0.65 },
 };
+
+/**
+ * The per-scope distill lock covers the whole persist phase: one persistMemory per mapped dimension,
+ * each of which may wait for store-write and then embed, run LLM dedup and write — budgeted at
+ * STORE_WRITE_NESTED_WAIT_MS apiece. That is how long a healthy holder may keep the lock
+ * (`maxHoldMs`, past which it logs as stuck), and a waiter waits at least that long: with a shorter
+ * budget (10 s by default, 60 s since 10-18) a second distill of the same scope timed out while the
+ * first was still healthily writing, and its already-computed summary was thrown away.
+ */
+const DISTILL_PERSIST_MAX_HOLD_MS = Object.keys(DIMENSION_TO_MEMORY).length * STORE_WRITE_NESTED_WAIT_MS;
+export const DISTILL_PERSIST_LOCK_OPTS = {
+  maxHoldMs: DISTILL_PERSIST_MAX_HOLD_MS,
+  waitTimeoutMs: DISTILL_PERSIST_MAX_HOLD_MS,
+} as const;
 
 // ============================================================================
 // Layer 1: Microcompact
@@ -264,12 +307,7 @@ export async function extractAndPersist(
   deps: PersistDeps,
   scope: string,
 ): Promise<PersistResult> {
-  const result: PersistResult = {
-    memories_stored: 0,
-    memories_deduped: 0,
-    memories_conflicted: 0,
-    ids: [],
-  };
+  const result = emptyPersistResult();
 
   for (const [dimKey, mapping] of Object.entries(DIMENSION_TO_MEMORY)) {
     const dimText = summary.dimensions[dimKey];
@@ -286,8 +324,12 @@ export async function extractAndPersist(
       });
 
       trackDisposition(result, stored);
-    } catch {
-      // Non-fatal: continue with other dimensions
+    } catch (err) {
+      // Non-fatal: continue with other dimensions, but say which one was lost and why.
+      const error = redactSecrets(err instanceof Error ? err.message : String(err)).text;
+      result.memories_failed++;
+      result.errors.push({ dimension: dimKey, error });
+      logWarn(`[session-distiller] dimension '${dimKey}' not persisted (scope ${scope}): ${error}`);
     }
   }
 
@@ -322,6 +364,8 @@ export async function distillSession(
     preserveRecent?: number;
     keepRecentTools?: number;
     persist?: boolean;
+    /** Override the per-scope lock wait budget (default DISTILL_PERSIST_LOCK_OPTS.waitTimeoutMs). */
+    lockWaitTimeoutMs?: number;
   } = {},
 ): Promise<DistillResult> {
   const scope = opts.scope || "default";
@@ -347,25 +391,32 @@ export async function distillSession(
     : { text: "", dimensions: {} };
 
   // Layer 3: Persist (optional)
-  let persistResult: PersistResult = {
-    memories_stored: 0,
-    memories_deduped: 0,
-    memories_conflicted: 0,
-    ids: [],
-  };
+  let persistResult = emptyPersistResult();
 
   if (shouldPersist && Object.keys(summaryResult.dimensions).length > 0) {
     // P0-1: serialize the persist phase per scope across processes. Wait (not skip) —
     // skipping would drop this session's distilled knowledge when two sessions distill
     // the same scope at once; microcompact/summary above run unlocked. The persist phase
-    // takes store-write for each dimension, so the holder may itself be waiting on it: a
-    // timeout here throws out of distillSession and the summary computed above is never
-    // stored, hence at least the nested store-write budget.
-    persistResult = await withWriteLock(
-      `distill-${scope}`,
-      () => extractAndPersist(summaryResult, deps, scope),
-      { waitTimeoutMs: STORE_WRITE_NESTED_WAIT_MS },
-    );
+    // takes store-write for each dimension, so the holder may itself be waiting on it; the
+    // wait budget covers the holder's whole max hold (DISTILL_PERSIST_LOCK_OPTS).
+    // If the holder is still there after that (stuck, or a far slower store than budgeted),
+    // persist without the scope lock instead of throwing: the summary above cost an LLM call
+    // and exists nowhere else, and a near-duplicate is recoverable where a lost summary is not.
+    try {
+      persistResult = await withWriteLock(
+        `distill-${scope}`,
+        () => extractAndPersist(summaryResult, deps, scope),
+        {
+          maxHoldMs: DISTILL_PERSIST_LOCK_OPTS.maxHoldMs,
+          waitTimeoutMs: opts.lockWaitTimeoutMs ?? DISTILL_PERSIST_LOCK_OPTS.waitTimeoutMs,
+        },
+      );
+    } catch (err) {
+      if (!(err instanceof LockTimeoutError)) throw err;
+      logWarn(`[session-distiller] ${err.message}; persisting this summary without the scope lock so it is not lost`);
+      persistResult = await extractAndPersist(summaryResult, deps, scope);
+      persistResult.scope_lock_timed_out = true;
+    }
   }
 
   return {

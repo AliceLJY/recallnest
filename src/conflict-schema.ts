@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import { MemoryCategorySchema, MemoryImportanceSchema, MemoryScopeSchema, MemoryTextSchema, StoreMemorySourceSchema, DurableMemoryCategorySchema, CanonicalKeySchema } from "./memory-schema.js";
 import { MEMORY_AUTHORITIES, MEMORY_CONFLICT_POLICIES, MEMORY_LAYERS } from "./memory-boundaries.js";
-import { identifierSchema, optionalBoundedStringSchema } from "./schema-utils.js";
+import { identifierSchema, isoDateTimeSchema, optionalBoundedStringSchema } from "./schema-utils.js";
 
 const BoundaryMetadataSchema = z.object({
   layer: z.enum(MEMORY_LAYERS),
@@ -55,8 +55,8 @@ export const ConflictCandidateInputSchema = z.object({
   reason: ConflictReasonSchema,
   existing: ConflictExistingMemorySchema,
   incoming: ConflictIncomingMemorySchema,
-  createdAt: z.string().datetime().default(() => new Date().toISOString()),
-  updatedAt: z.string().datetime().default(() => new Date().toISOString()),
+  createdAt: isoDateTimeSchema().default(() => new Date().toISOString()),
+  updatedAt: isoDateTimeSchema().default(() => new Date().toISOString()),
 });
 
 export const ConflictCandidateRecordSchema = ConflictCandidateInputSchema.extend({
@@ -64,10 +64,10 @@ export const ConflictCandidateRecordSchema = ConflictCandidateInputSchema.extend
   status: ConflictStatusSchema.default("open"),
   reopenCount: z.number().int().min(0).default(0),
   escalationCount: z.number().int().min(0).default(0),
-  lastReopenedAt: z.string().datetime().optional(),
-  lastEscalatedAt: z.string().datetime().optional(),
+  lastReopenedAt: isoDateTimeSchema().optional(),
+  lastEscalatedAt: isoDateTimeSchema().optional(),
   lastEscalationAttention: z.enum(["stale", "escalated"]).optional(),
-  resolvedAt: z.string().datetime().optional(),
+  resolvedAt: isoDateTimeSchema().optional(),
   resolutionNotes: optionalBoundedStringSchema(320),
 });
 
@@ -81,8 +81,8 @@ export const ResolveConflictInputSchema = z.object({
 export const ConflictResolutionResultSchema = z.object({
   conflictId: identifierSchema("conflictId", 128),
   status: ConflictStatusSchema,
-  updatedAt: z.string().datetime(),
-  resolvedAt: z.string().datetime(),
+  updatedAt: isoDateTimeSchema(),
+  resolvedAt: isoDateTimeSchema(),
   updatedMemoryId: identifierSchema("updatedMemoryId", 128).optional(),
 });
 
