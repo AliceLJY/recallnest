@@ -195,35 +195,49 @@ export function buildDefaultCanonicalKey(params: {
   const fullBase = normalizeCanonicalKeyUntruncated(base);
 
   // 归一化后为空（西里尔、韩文、纯假名……）或发生了截断时，单靠归一化结果会让不同正文共用一个 key，
-  // latest-wins 下后写的把先写的原位改掉。这两种情形附上全文短哈希；其余情形与改前逐字相同，
-  // 现有生产行的 key 不变。哈希输入与 capture-engine 的全文判等同一口径（先小写）：
-  // 为空时用小写、去直引号的原文（保留非拉丁字符），截断时用归一化后的全文。
-  if (!fullBase) {
-    return appendKeyHash(`${params.category}:memory`, base.toLowerCase().replace(/['"`]/g, ""));
-  }
-  // 正文本身恰好以「-h + 16 位 hex」结尾时也附哈希，带这种结尾的 key 只可能出自哈希分支，
-  // 否则普通正文「memory-h<hex>」会和为空分支产出的 key 同形。
-  if (fullBase.length > CANONICAL_KEY_MAX_LENGTH || KEY_HASH_TAIL.test(fullBase)) {
-    return appendKeyHash(`${params.category}:${fullBase}`, fullBase);
+  // latest-wins 下后写的把先写的原位改掉。只在这两种情形附全文短哈希；其余情形与改前逐字相同，
+  // 现有生产行的 key 一个都不变。
+  // 哈希段用 `:h<16 hex>` 接在 key 后面：正文归一化后只剩 [a-z0-9 汉字 -]，产不出冒号，所以带这个
+  // 尾巴的 key 只可能出自哈希分支——普通正文「memory-h<hex>」「note-h0123456789abcdef」照旧原样，
+  // 不需要再按形状识别、也不会被反过来加哈希（R3 Codex / Kimi / Grok 都指出按 `-h` 形状识别会改写
+  // 这类既有行的 key）。哈希输入是 keyHashInput：与归一化同一套折叠（小写、去直引号、标点空白折成 -），
+  // 但保留所有文字而不只 a-z0-9 与汉字，长正文里只差西里尔 / 假名的两段才不会再算成同一个哈希。
+  if (!fullBase || fullBase.length > CANONICAL_KEY_MAX_LENGTH) {
+    const head = fullBase ? `${params.category}:${fullBase}` : `${params.category}:memory`;
+    return appendKeyHash(head, keyHashInput(base));
   }
   return `${params.category}:${fullBase}`;
 }
 
-/** 哈希后缀的形状：`-h` + 16 位 hex（sha256 前 64 bit）。 */
-const KEY_HASH_TAIL = /-h[0-9a-f]{16}$/u;
+/** 哈希后缀的形状：`:h` + 16 位 hex（sha256 前 64 bit）。 */
+const KEY_HASH_SUFFIX_LENGTH = ":h".length + 16;
 
 function keyHash(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
 
 /**
- * 截到整条 key（含类别前缀）加上哈希后缀不超过 120 字，再附 `-h<16 hex>`：冲突记录的 canonicalKey
+ * 全文哈希的输入：normalizeCanonicalKeyUntruncated 同一套折叠，但保留任何文字系统的字母与数字
+ * （\p{L}\p{N}），不只 a-z0-9 与汉字。大小写、直引号、标点与空白的差异不进哈希；
+ * 西里尔、假名、谚文的差异进哈希。
+ */
+function keyHashInput(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/['"`]/g, "")
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/**
+ * 截到整条 key（含类别前缀）加上哈希后缀不超过 120 字，再附 `:h<16 hex>`：冲突记录的 canonicalKey
  * 上限是 120（conflict-schema.ts），冲突指纹与聚类键也先按 120 截，哈希放在 120 之外会被截掉。
  * 按码点截，不留半个代理对；截完去掉结尾的 `-` / `:`。
  */
 function appendKeyHash(head: string, hashInput: string): string {
-  const suffix = `-h${keyHash(hashInput)}`;
-  const budget = CANONICAL_KEY_MAX_LENGTH - suffix.length;
+  const suffix = `:h${keyHash(hashInput)}`;
+  const budget = CANONICAL_KEY_MAX_LENGTH - KEY_HASH_SUFFIX_LENGTH;
   let kept = "";
   for (const char of head) {
     if (kept.length + char.length > budget) break;
@@ -234,12 +248,11 @@ function appendKeyHash(head: string, hashInput: string): string {
 
 function truncateCanonicalKey(segments: string[]): string {
   const joined = segments.filter(Boolean).join(":");
-  const stripped = joined.replace(/[:\-]+$/u, "");
-  // 槽位 key 超长（或恰好以哈希后缀的形状结尾）时同样附哈希；未超长的槽位 key 与改前一字不变。
-  if (joined.length > CANONICAL_KEY_MAX_LENGTH || KEY_HASH_TAIL.test(stripped)) {
+  // 槽位 key 超长时同样附哈希（哈希整条结构化 key）；未超长的槽位 key 与改前一字不变。
+  if (joined.length > CANONICAL_KEY_MAX_LENGTH) {
     return appendKeyHash(joined, joined);
   }
-  return stripped;
+  return joined.replace(/[:\-]+$/u, "");
 }
 
 export function resolveIngestBoundary(params: {
