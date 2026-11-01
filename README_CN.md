@@ -141,6 +141,12 @@ Hits    : 5
 >
 > Retriever 一格：`retrieval.mode` 默认是 `"vector"`（纯向量检索）；在 `config.json` 里改成 `"hybrid"`
 > 后，会加上 BM25 全文检索，并与向量结果做加权分数融合（默认 `vectorWeight` 0.7 / `bm25Weight` 0.3）。
+>
+> 分数下限：每条结果要过所在类别的下限。六个类别各自的下限在 `retrieval.categoryMinScores`（默认 profile /
+> preferences 0.25、entities 0.30、events 0.35、cases 0.40、patterns 0.45）。`retrieval.hardMinScore` 只管这张表里
+> 没有的类别——默认表下只剩旧版类别——所以改它动不了这六类的下限。要改某一类，设 `categoryMinScores`；它整张替换
+> 默认表、不逐键合并，没列出的类别会落到 `hardMinScore`，所以要保留的类别都得写上。`writing` / `debug` /
+> `fact-check` 三个检索档会用各自按比例缩放的整张表盖掉它。
 
 ### 内部设计
 

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { isoDateTimeSchema } from "./schema-utils.js";
 import { persistMemory } from "./capture-engine.js";
 import { formatStoreMemoryReceipt } from "./store-receipts.js";
 import { composeLightResumeContext, composeResumeContext } from "./context-composer.js";
@@ -13,7 +14,8 @@ import { createScopeSuggester } from "./scope-suggester.js";
 import { buildSessionCheckpointResult } from "./session-engine.js";
 import { mirrorCheckpointWithDeadline } from "./checkpoint-mirror.js";
 import { formatCheckpointSaved, formatCheckpointSummary, formatResumeContext } from "./session-output.js";
-import { matchesTemporalConstraint, type TemporalConstraint } from "./temporal-parser.js";
+import { matchesTemporalConstraint } from "./temporal-parser.js";
+import { explicitTimeRange } from "./candidate-filter.js";
 import { buildManagedCheckpointObservation, buildManagedResumeObservation } from "./workflow-observation-managed.js";
 import { PROCESS_READER_ID, recentRecallHits } from "./recall-ledger.js";
 import { buildWorkflowObservationRecord } from "./workflow-observation-engine.js";
@@ -51,16 +53,10 @@ export function registerCoreTools(deps: ToolRegistryDeps): void {
     params: { after?: string; before?: string; limit: number },
   ): RetrievalResult[] {
     const { after, before, limit } = params;
-    if (!after && !before) return results;
-
-    const constraint: TemporalConstraint = {
-      type: (after && before) ? "range" : (after ? "after" : "before"),
-      startMs: after ? new Date(after).getTime() || undefined : undefined,
-      endMs: before ? new Date(before).getTime() || undefined : undefined,
-      anchor: `${after || ""}..${before || ""}`,
-    };
-
-    if (!constraint.startMs && !constraint.endMs) return results;
+    const constraint = explicitTimeRange(after, before);
+    if (!constraint) return results;
+    // The retriever already applied this window to its candidate pool (RetrievalContext.timeRange);
+    // this pass is a guard and keeps the result list at `limit`.
     return results
       .filter(r => matchesTemporalConstraint(r.entry.timestamp, constraint))
       .slice(0, limit);
@@ -191,7 +187,7 @@ registerTool(
     entities: z.array(z.string().min(1).max(120)).max(8).default([]).describe("Relevant projects, tools, or people"),
     files: z.array(z.string().min(1).max(220)).max(12).default([]).describe("Relevant files or paths"),
     idempotencyKey: z.string().min(1).max(160).optional().describe("Optional stable request key; repeated saves with the same key replace the prior checkpoint"),
-    updatedAt: z.string().datetime().optional().describe("Optional override; defaults to now"),
+    updatedAt: isoDateTimeSchema().optional().describe("Optional override; defaults to now"),
   },
   async ({ sessionId, scope, summary, task, decisions, openLoops, nextActions, entities, files, idempotencyKey, updatedAt }) => {
     const result = buildSessionCheckpointResult({
@@ -412,7 +408,7 @@ registerTool(
     if (reconstruct && llm) retriever.setLLMClient(llm);
     let results = await retriever.retrieve(buildRetrievalContext({
       query,
-      limit: (after || before || topicTag) ? limit * 3 : limit,
+      limit,
       category,
       scope,
       sessionId,
@@ -420,6 +416,7 @@ registerTool(
       graph,
       includeArchived,
       topicTag,
+      timeRange: explicitTimeRange(after, before),
       reconstruct,
       // F3: Temporal validity filtering
       validAt: validAt ? new Date(validAt).getTime() : undefined,
@@ -437,7 +434,7 @@ registerTool(
       scopeFallbackUsed = true;
       results = await retriever.retrieve(buildRetrievalContext({
         query,
-        limit: (after || before || topicTag) ? limit * 3 : limit,
+        limit,
         category,
         scope: undefined,
         sessionId: undefined,
@@ -445,6 +442,7 @@ registerTool(
         graph,
         includeArchived,
         topicTag,
+        timeRange: explicitTimeRange(after, before),
         reconstruct,
         validAt: validAt ? new Date(validAt).getTime() : undefined,
         includeExpired: includeExpired ?? undefined,
@@ -528,12 +526,13 @@ registerTool(
       for (const relatedScope of relatedScopesFor(selection.resolvedScope)) {
         let relatedResults = await retriever.retrieve(buildRetrievalContext({
           query,
-          limit: (after || before || topicTag) ? sidecarLimit * 3 : sidecarLimit,
+          limit: sidecarLimit,
           category,
           scope: relatedScope,
           graph,
           includeArchived,
           topicTag,
+          timeRange: explicitTimeRange(after, before),
           source: "auto-recall",
           // 旁路标 auto-recall 只为不做强化写入；查询本身是人发起的，不过琐碎查询闸
           trivialQueryGate: false,
@@ -586,9 +585,10 @@ registerTool(
     }
 
     // P-omitted: 因 limit 上限未返回的达标结果，明确告知调用方可提高 limit 看到更多。
-    // 仅在普通检索下报告；after/before/topicTag 模式内部用 limit*3 拉取，omitted 语义不一致，跳过避免误导。
+    // after/before/topicTag 现在在检索器的候选池里就过滤、按 limit 本身取数（此前 limit*3 再事后筛，
+    // omitted 语义对不上才跳过），所以与普通检索同一口径照常报告。
     // "up to" 措辞：omitted 是上界估计，可能含将被 validity filter 过滤的 expired 项（P3-2）。
-    if (!after && !before && !topicTag && omittedInfo && omittedInfo.count > 0) {
+    if (omittedInfo && omittedInfo.count > 0) {
       sections.push(
         `ℹ️ Up to ${omittedInfo.count} more matching result(s) were capped by limit=${limit}. ` +
         `Raise \`limit\` (max 20) or refine the query to surface them.`
@@ -632,14 +632,26 @@ registerTool(
     const tierOrder: Record<string, number> = { core: 0, advanced: 1, governance: 2 };
     const maxOrder = requestedTier === "full" ? 2 : tierOrder[requestedTier] ?? 1;
 
+    // 只列本进程真正 registerTool 过的工具（TOOL_DESCRIPTIONS 由注册包装器在通过 tier 闸之后才写入）。
+    // 早先按 TOOL_TIERS 全表列：RECALLNEST_MCP_TIER=core 时会把调不了的 advanced 工具列成 Available、
+    // 描述是「(no description)」。没注册的只报个数，不列名字，免得调用方去调一个不存在的工具。
     const lines: string[] = [`Available tools (tier: ${requestedTier}):`];
+    let notEnabled = 0;
     for (const [toolName, toolTier] of Object.entries(TOOL_TIERS)) {
       if ((tierOrder[toolTier] ?? 999) > maxOrder) continue;
       const desc = TOOL_DESCRIPTIONS.get(toolName);
-      const oneLiner = desc
-        ? desc.split(/[.!]\s/)[0]?.slice(0, 100) ?? desc.slice(0, 100)
-        : "(no description)";
+      if (desc === undefined) {
+        notEnabled++;
+        continue;
+      }
+      const oneLiner = desc.split(/[.!]\s/)[0]?.slice(0, 100) ?? desc.slice(0, 100);
       lines.push(`- ${toolName}: ${oneLiner}`);
+    }
+    if (notEnabled > 0) {
+      lines.push(
+        `(${notEnabled} more tool(s) at this tier are not enabled in this server process; ` +
+        `they are gated by RECALLNEST_MCP_TIER and need a server restart with a higher tier to use.)`,
+      );
     }
 
     return {
