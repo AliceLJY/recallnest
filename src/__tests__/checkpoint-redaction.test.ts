@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -64,6 +64,27 @@ function expectScrubbed(text: string): void {
   for (const secret of RAW_SECRETS) expect(text).not.toContain(secret);
   for (const type of ["api_key", "github_token", "aws_access_key", "password", "bearer_token", "uri_credentials"]) {
     expect(text).toContain(`[REDACTED:${type}]`);
+  }
+}
+
+/** No `[REDACTED…` fragment that lost its closing bracket, and no lone surrogate. */
+function expectWholePlaceholders(text: string): void {
+  const rest = text.replace(/\[REDACTED(?::[a-z_]+)?\]/g, "");
+  expect(rest).not.toMatch(/\[R(?:E(?:D(?:A(?:C(?:T(?:E(?:D)?)?)?)?)?)?)?(?::[a-z_]*)?$/);
+  expect(rest).not.toContain("[REDACT");
+  expect(text).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/);
+}
+
+/** Run fn while capturing what logInfo (console.error) prints. */
+async function withLogs<T>(fn: () => Promise<T>): Promise<{ value: T; logs: string[] }> {
+  const logs: string[] = [];
+  const spy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+    logs.push(args.map(String).join(" "));
+  });
+  try {
+    return { value: await fn(), logs };
+  } finally {
+    spy.mockRestore();
   }
 }
 
@@ -135,10 +156,12 @@ describe("checkpoint JSON is redacted before it is written", () => {
     expect(summary.length).toBe(CHECKPOINT_REDACTED_FIELD_CAPS.summary);
     const { record } = buildSessionCheckpointResult({ ...body, summary });
 
-    const stored = await store.save(record);
+    const stored = await withLogs(() => store.save(record));
 
-    expect(Array.from(stored.summary).length).toBeLessThanOrEqual(CHECKPOINT_REDACTED_FIELD_CAPS.summary);
+    expect(stored.value.summary.length).toBeLessThanOrEqual(CHECKPOINT_REDACTED_FIELD_CAPS.summary);
+    expectWholePlaceholders(stored.value.summary);
     expect(onlyFile(dir)).not.toContain("12345678");
+    expect(stored.logs.some((line) => line.includes("summary") && line.includes("dropped"))).toBe(true);
   });
 
   it("list items that redact to the same text are deduped like any other duplicate", async () => {
@@ -164,6 +187,116 @@ describe("checkpoint JSON is redacted before it is written", () => {
       const make = (value: string) => ({ ...record, [field]: isList ? [value] : value });
       expect(SessionCheckpointRecordSchema.safeParse(make(at)).success).toBe(true);
       expect(SessionCheckpointRecordSchema.safeParse(make(over)).success).toBe(false);
+    }
+  });
+});
+
+describe("cutting back to the cap (Codex P2-1, P2-2)", () => {
+  it("measures in UTF-16 units like the schema: an emoji-heavy 600-unit summary saves", async () => {
+    const { dir, store } = tempStore();
+    const summary = "😀".repeat(294) + "pwd=" + "12345678";
+    expect(summary.length).toBe(600);
+    expect(Array.from(summary).length).toBe(306);
+    const { record } = buildSessionCheckpointResult({ ...body, summary });
+
+    const stored = await withLogs(() => store.save(record));
+
+    expect(stored.value.summary.length).toBeLessThanOrEqual(600);
+    expectWholePlaceholders(stored.value.summary);
+    expect(onlyFile(dir)).not.toContain("12345678");
+  });
+
+  it("never cuts a surrogate pair in half", async () => {
+    const { store } = tempStore();
+    // After redaction the cap falls between the two halves of an emoji.
+    const summary = "pwd=" + "12345678" + " " + "😀".repeat(293) + "y";
+    expect(summary.length).toBe(600);
+    const { record } = buildSessionCheckpointResult({ ...body, summary });
+
+    const { value } = await withLogs(() => store.save(record));
+
+    expect(value.summary.length).toBeLessThanOrEqual(600);
+    expectWholePlaceholders(value.summary);
+    expect(value.summary.startsWith("pwd=[REDACTED]")).toBe(true);
+    expect(value.summary.endsWith("😀")).toBe(true);
+  });
+
+  it("a 200-char decision keeps its placeholder whole, shortens it before cutting, and logs the loss", async () => {
+    const { dir, store } = tempStore();
+    const decision = "pwd=" + "12345678" + "; " + "x".repeat(181) + " 禁止上线";
+    expect(decision.length).toBe(200);
+    const { record } = buildSessionCheckpointResult({ ...body, decisions: [decision] });
+
+    const { value, logs } = await withLogs(() => store.save(record));
+
+    const saved = value.decisions[0]!;
+    expect(saved.length).toBeLessThanOrEqual(200);
+    expectWholePlaceholders(saved);
+    // The short placeholder costs 2 extra chars instead of 11, so only 2 chars of the tail go.
+    expect(saved.startsWith("pwd=[REDACTED]; ")).toBe(true);
+    expect(saved.endsWith(" 禁止")).toBe(true);
+    expect(onlyFile(dir)).not.toContain("12345678");
+    expect(logs.some((line) => line.includes("decisions") && line.includes("dropped 2"))).toBe(true);
+  });
+
+  it("a cut that would land inside a placeholder drops it whole with its key= lead", async () => {
+    const { store } = tempStore();
+    const summary = "x".repeat(587) + " pwd=" + "12345678";
+    expect(summary.length).toBe(600);
+    const { record } = buildSessionCheckpointResult({ ...body, summary });
+
+    const { value, logs } = await withLogs(() => store.save(record));
+
+    expect(value.summary).toBe("x".repeat(587));
+    expectWholePlaceholders(value.summary);
+    expect(value.summary).not.toContain("pwd=");
+    expect(logs.some((line) => line.includes("summary") && line.includes("dropped"))).toBe(true);
+  });
+
+  it("a field that still fits keeps its typed placeholder and logs nothing", async () => {
+    const { store } = tempStore();
+    const { record } = buildSessionCheckpointResult({ ...body, summary: "short pwd=" + "12345678" });
+    const { value, logs } = await withLogs(() => store.save(record));
+    expect(value.summary).toBe("short pwd=[REDACTED:password]");
+    expect(logs.filter((line) => line.includes("[checkpoint-redact]"))).toEqual([]);
+  });
+});
+
+describe("names a checkpoint needs are not mistaken for secrets (Codex P2-3)", () => {
+  const UUID = "3f2b8c1e-9a4d-4e7b-8c2f-1d5e6a7b8c9d";
+  const keep = (text: string) => {
+    const { record } = buildSessionCheckpointResult({ ...body, summary: text });
+    return SessionCheckpointRecordSchema.parse(redactCheckpointRecord(record)).summary;
+  };
+
+  it.each([
+    ["dotted test file path", "packages/checkpoint.sessionstore.integration.test.ts"],
+    ["dotted workflow name", "workflow.database.recovery"],
+    ["sessionId with a plain UUID", `resume with sessionId=${UUID}`],
+    ["sk- kebab-case file name", "docs/sk-checkpoint-redaction-design.md"],
+    ["commit SHA", "commit 0cf7836a1b2c3d4e5f60718293a4b5c6d7e8f901"],
+    ["plain source path", "src/session-store.ts"],
+    ["hyphenated slug ending in -sk", "task-assignment"],
+    ["URL with an ordinary query", "https://example.com/search?q=checkpoint&page=2"],
+  ])("keeps a %s as it is", (_label, text) => {
+    expect(keep(text)).toBe(text);
+  });
+
+  it("still redacts the real secret shapes, including next to the kept names", () => {
+    const secrets: Array<[string, string]> = [
+      [OPENAI_KEY, "[REDACTED:api_key]"],
+      [["sk", "abcdefghijklmnopqrstuvwx"].join("-"), "[REDACTED:api_key]"],
+      [GITHUB_TOKEN, "[REDACTED:github_token]"],
+      [AWS_KEY, "[REDACTED:aws_access_key]"],
+      [`password=${PASSWORD_VALUE}`, "password=[REDACTED:password]"],
+      [`Bearer ${BEARER_VALUE}`, "[REDACTED:bearer_token]"],
+      [`postgres://admin:${URI_PASSWORD}@db`, "postgres://[REDACTED:uri_credentials]@db"],
+      [`session_token=${UUID}`, "session_token=[REDACTED:sensitive_assignment]"],
+    ];
+    for (const [secret, placeholder] of secrets) {
+      expect(keep(secret)).toBe(placeholder);
+      expect(keep(`docs/sk-checkpoint-redaction-design.md ${secret} sessionId=${UUID}`))
+        .toBe(`docs/sk-checkpoint-redaction-design.md ${placeholder} sessionId=${UUID}`);
     }
   });
 });
