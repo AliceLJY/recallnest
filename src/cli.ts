@@ -74,7 +74,7 @@ import {
 import { classifyLegacyScope, loadLanceDB, MemoryStore, type MemoryEntry } from "./store.js";
 import { backfillCheckpointMirror, openReadOnlyMirrorReader, purgeCheckpointMirror, type CheckpointMirrorDeps } from "./checkpoint-mirror.js";
 import { autoRegisterBabelMemory } from "./language-hook.js";
-import { ConflictStatusSchema } from "./conflict-schema.js";
+import { ConflictStatusSchema, type ConflictStatus } from "./conflict-schema.js";
 import { resolveConflictCandidate } from "./conflict-engine.js";
 import { escalateConflicts } from "./conflict-escalation.js";
 import { ConflictCandidateStore } from "./conflict-store.js";
@@ -354,7 +354,7 @@ function defaultConflictAuditExportPath(format: "md" | "json", canonicalKey?: st
   return join(getExportsDir(), `${timestamp}-${stem}.${format}`);
 }
 
-function parseConflictStatusOption(value?: string): "open" | "accepted-incoming" | "kept-existing" | undefined {
+function parseConflictStatusOption(value?: string): ConflictStatus | undefined {
   if (!value) return undefined;
   const parsed = ConflictStatusSchema.safeParse(value);
   if (!parsed.success) {

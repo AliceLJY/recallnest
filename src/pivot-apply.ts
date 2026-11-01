@@ -339,12 +339,12 @@ function normalizeForCompare(text: string): string {
 
 /** Read the row back and assert it is this candidate's write, not merely a well-formed row. */
 async function verifyPivotRow(
-  get: (id: string) => Promise<{ text: string; scope: string; metadata: string } | null>,
+  get: (id: string) => Promise<{ text: string; scope: string; metadata?: string } | null>,
   id: string,
   expected: { candidateHash: string; text: string },
 ): Promise<string[]> {
   const issues: string[] = [];
-  let row: { text: string; scope: string; metadata: string } | null = null;
+  let row: { text: string; scope: string; metadata?: string } | null = null;
   try {
     row = await get(id);
   } catch (err) {

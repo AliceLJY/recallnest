@@ -134,7 +134,10 @@ export function scoreTaskCandidate(category: TaskCategory, result: RetrievalResu
   let score = result.score;
   if (isDurableMemoryScope(result.entry.scope)) score += 5;
   if (boundary?.layer === "durable") score += 4;
-  if (boundary?.layer === "working") score += 1;
+  // Never true: "working" is not a MemoryLayer (durable / canonical / session / evidence); it is a
+  // decay tier (metadata.tier). Kept as is, widened only so it compiles, until the owner says which
+  // was meant — changing it would change task ranking.
+  if ((boundary?.layer as string | undefined) === "working") score += 1;
   if (boundary?.layer === "evidence") score -= 4;
   if (extractCanonicalKey(result.entry.metadata)) score += 2;
   if (result.entry.category === category) score += 2;

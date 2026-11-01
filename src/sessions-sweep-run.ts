@@ -17,7 +17,7 @@ import type { LLMClient } from "./llm-client.js";
 import { redactSecrets } from "./pii-detector.js";
 import { buildLedger, renderLedgerMarkdown, type GenerateLedgerOptions, type LedgerBody, type LedgerMeta } from "./session-ledger.js";
 import { parseSessionFile, summarizeSession, type SessionDoc, type SessionSource } from "./session-events.js";
-import { applyDecision, decide, DEFAULT_POLICY, discoverTranscripts, ledgerRelPath, SessionStateStore, sid8, type RootSpec, type SweepAction, type SweepPolicy, type TranscriptFile } from "./sessions-sweep.js";
+import { applyDecision, decide, DEFAULT_POLICY, discoverTranscripts, ledgerRelPath, SessionStateStore, sid8, type RootSpec, type SweepAction, type SweepDecision, type SweepPolicy, type TranscriptFile } from "./sessions-sweep.js";
 import { addToIndex, buildSignatureIndex, ledgerDirDigest, ledgerFileSignatures, lookupSignatures, readSignatureIndex, recurrenceLines, recurrenceSignatures, writeSignatureIndex, type SignatureIndex } from "./ledger-signatures.js";
 import type { SessionSummary } from "./session-events.js";
 import { judgeRecallLog } from "./recall-outcome.js";
@@ -239,7 +239,7 @@ export async function runSweep(opts: SweepRunOptions): Promise<SweepRunResult> {
     const key = stateStore.fresh(file).key;
     const state = stateStore.load(key) ?? stateStore.fresh(file);
     const policy = policyFor(file.source, opts);
-    let decision;
+    let decision: SweepDecision;
     try {
       decision = decide(file, state, nowMs, policy);
     } catch (error) {

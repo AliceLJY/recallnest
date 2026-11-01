@@ -14,7 +14,7 @@ import { homedir } from "node:os";
 import { detectLang, tokenizeFts } from "./language-hook.js";
 import { redactSecrets } from "./pii-detector.js";
 import { normalizeDedupText } from "./text-fingerprint.js";
-import type { MemoryStore, MemoryEntry } from "./store.js";
+import type { MemoryStore, MemoryEntry, MemoryCategory } from "./store.js";
 import type { Embedder } from "./embedder.js";
 import { chunkDocument, type ChunkerConfig } from "./chunker.js";
 import type { ConnectorOutputV1, ConnectorRecord } from "./connector-types.js";
@@ -636,7 +636,6 @@ export async function drainPendingQueue(
         });
         await store.store({
           ...entry,
-          category: entry.category as any,
           language,
           fts_text,
         });
@@ -666,6 +665,11 @@ function initialTier(extraction: Pick<SmartExtraction, "category" | "importance"
   return "peripheral";
 }
 
+/** One row as ingest hands it to store.storeBatch (id / timestamp are assigned by the store). */
+export type IngestedEntry = Pick<MemoryEntry, "text" | "vector" | "category" | "scope" | "importance"> & {
+  metadata: string;
+};
+
 export function buildIngestedEntry(params: {
   source: string;
   scope: string;
@@ -681,14 +685,7 @@ export function buildIngestedEntry(params: {
   sessionImages?: number;
   /** 本条记忆所在 session 里 AI 自己产的图片总数（截图 / 读图 / 生图）；无则不传 */
   sessionToolImages?: number;
-}): {
-  text: string;
-  vector: number[];
-  category: string;
-  scope: string;
-  importance: number;
-  metadata: string;
-} {
+}): IngestedEntry {
   const resolution = resolveIngestBoundary({
     source: params.source,
     scope: params.scope,
@@ -1270,7 +1267,7 @@ export async function ingestCodexSessions(
 
         try {
           const vectors = await embedder.embedBatchPassage(batch);
-          const toStore: Array<{text: string; vector: number[]; category: string; scope: string; importance: number; metadata: string}> = [];
+          const toStore: IngestedEntry[] = [];
 
           // Dedup + L0 batch
           const dedupedTexts: string[] = [];
@@ -1568,7 +1565,7 @@ export async function ingestKimiSessions(
 
         try {
           const vectors = await embedder.embedBatchPassage(batch);
-          const toStore: Array<{text: string; vector: number[]; category: string; scope: string; importance: number; metadata: string}> = [];
+          const toStore: IngestedEntry[] = [];
 
           // Dedup + L0 batch
           const dedupedTexts: string[] = [];
@@ -1771,7 +1768,7 @@ export async function ingestGeminiSessions(
 
         try {
           const vectors = await embedder.embedBatchPassage(batch);
-          const toStore: Array<{text: string; vector: number[]; category: string; scope: string; importance: number; metadata: string}> = [];
+          const toStore: IngestedEntry[] = [];
 
           const dedupedTexts: string[] = [];
           const dedupedVectors: number[][] = [];
@@ -2042,7 +2039,7 @@ export async function ingestCCTranscripts(
           const extractions = await smartExtractBatch(dedupedTexts, options.llm);
           const coreSummaries = await generateCoreSummaries(dedupedTexts, options.llm);
 
-          const toStore: Array<{text: string; vector: number[]; category: string; scope: string; importance: number; metadata: string}> = [];
+          const toStore: IngestedEntry[] = [];
           for (let j = 0; j < dedupedTexts.length; j++) {
             const chunk = dedupedChunks[j];
             const ext = extractions[j];
@@ -2155,7 +2152,7 @@ export async function ingestMarkdownFiles(
 
         try {
           const vectors = await embedder.embedBatchPassage(batch);
-          const toStore: Array<{text: string; vector: number[]; category: string; scope: string; importance: number; metadata: string}> = [];
+          const toStore: IngestedEntry[] = [];
 
           const dedupedTexts: string[] = [];
           const dedupedVectors: number[][] = [];
@@ -2310,7 +2307,7 @@ export async function ingestGenericText(
           if (dedupedTexts.length > 0) {
             const extractions = await smartExtractBatch(dedupedTexts, options.llm);
             const coreSummaries = await generateCoreSummaries(dedupedTexts, options.llm);
-            const toStore: Array<{text: string; vector: number[]; category: string; scope: string; importance: number; metadata: string}> = [];
+            const toStore: IngestedEntry[] = [];
 
             for (let j = 0; j < dedupedTexts.length; j++) {
               const ext = extractions[j];
@@ -2429,14 +2426,7 @@ export async function ingestConnectorFile(
       // --- extract + build entries ---
       const extractions = await smartExtractBatch(dedupedTexts, options.llm);
       const coreSummaries = await generateCoreSummaries(dedupedTexts, options.llm);
-      const toStore: Array<{
-        text: string;
-        vector: number[];
-        category: string;
-        scope: string;
-        importance: number;
-        metadata: string;
-      }> = [];
+      const toStore: IngestedEntry[] = [];
 
       for (let j = 0; j < dedupedTexts.length; j++) {
         const record = dedupedRecords[j];
@@ -2460,7 +2450,9 @@ export async function ingestConnectorFile(
 
         // Respect categoryHint / importanceHint from connector
         if (record.categoryHint) {
-          entry.category = record.categoryHint;
+          // Unchecked on purpose (unchanged behaviour): ConnectorRecord.categoryHint is a free
+          // string and has always been written to the column as given.
+          entry.category = record.categoryHint as MemoryCategory;
         }
         if (record.importanceHint !== undefined) {
           entry.importance = record.importanceHint;

@@ -32,14 +32,16 @@ export const MAX_TRIGGERS_PER_MEMORY = 6;
 export const MIN_TRIGGER_LENGTH = 2;
 export const MAX_TRIGGER_LENGTH = 200;
 
-export interface TriggerRow {
+// A type alias, not an interface: LanceDB takes rows as Record<string, unknown>, which only
+// object type aliases satisfy (interfaces have no implicit index signature).
+export type TriggerRow = {
   id: string;
   memory_id: string;
   scope: string;
   text: string;
   vector: number[];
   created_at: number;
-}
+};
 
 export interface TriggerHit {
   memoryId: string;

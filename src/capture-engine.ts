@@ -35,6 +35,7 @@ import {
   type DurableMemoryCategory,
   DURABLE_MEMORY_CATEGORIES,
   type WriteDisposition,
+  type StoreMemorySource,
   parsePrivacyTier,
 } from "./memory-schema.js";
 import { deterministicId, type MemoryEntry, type MemoryStore } from "./store.js";
@@ -129,7 +130,8 @@ export interface DurableWriteInput {
   metadata: string;
   canonicalKey: string;
   promotedFrom?: string;
-  source: "manual" | "agent" | "api";
+  /** Every store entry point accepts all STORE_MEMORY_SOURCES; this used to list only three of them. */
+  source: StoreMemorySource;
   sourceCategory?: string;
   sourceBoundary?: ReturnType<typeof extractBoundaryMetadata>;
   language?: string;
@@ -1229,6 +1231,7 @@ export async function persistMemory(
       scope: admissionScope,
       source: input.source,
       tags: input.tags ?? [],
+      privacyTier: input.privacyTier,
       resolvedScope: admissionScope,
       storedAt: new Date().toISOString(),
       disposition: "rejected" as const,
@@ -1738,6 +1741,9 @@ export async function promoteMemory(
     id: entry.id,
     storedAt: new Date(entry.timestamp).toISOString(),
     disposition,
+    // Promotion metadata never sets a tier, so the row's own metadata is the truth
+    // (an existing row on deduped / conflict keeps whatever tier it had).
+    privacyTier: parsePrivacyTier(entry.metadata),
     sourceMemoryId: sourceEntry.id,
     sourceCategory: sourceEntry.category,
     ...(conflictId ? { conflictId } : {}),
