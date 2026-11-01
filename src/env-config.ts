@@ -304,4 +304,6 @@ export const gatewayFileRootsRaw = (): string | undefined => process.env.RECALLN
 
 export const gatewayRgRaw = (): string | undefined => process.env.RECALLNEST_GATEWAY_RG;
 
+export const gatewayLogRaw = (): string | undefined => process.env.RECALLNEST_GATEWAY_LOG;
+
 export const apiUrlRaw = (): string | undefined => process.env.RECALLNEST_API_URL;
