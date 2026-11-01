@@ -4,6 +4,7 @@ import { basename, join, resolve } from "node:path";
 
 import { metaDir } from "./compat.js";
 import { withWriteLock } from "./distill-lock.js";
+import { redactSecrets } from "./pii-detector.js";
 import type { SessionCheckpointRecord } from "./session-schema.js";
 import { SessionCheckpointRecordSchema } from "./session-schema.js";
 import { isFallbackSummary, normalizeCheckpointScope, type CheckpointQuality } from "./session-engine.js";
@@ -18,6 +19,54 @@ export function classifyCheckpointQuality(record: SessionCheckpointRecord): Chec
 /** File name a checkpoint is saved under (updatedAt with ":" and "." made file-safe, then the id). */
 export function checkpointFileName(record: Pick<SessionCheckpointRecord, "updatedAt" | "checkpointId">): string {
   return `${record.updatedAt.replace(/[:.]/g, "-")}-${record.checkpointId}.json`;
+}
+
+/**
+ * Per-field length caps of SessionCheckpointRecordSchema for the free-text fields.
+ * A placeholder can be longer than the secret it replaces (`pwd=12345678` →
+ * `pwd=[REDACTED:password]`), so a field near its cap is cut back to it after
+ * redaction instead of failing the save. Pinned to the schema by a test.
+ */
+export const CHECKPOINT_REDACTED_FIELD_CAPS = {
+  summary: 600,
+  task: 240,
+  decisions: 200,
+  openLoops: 200,
+  nextActions: 200,
+  entities: 120,
+  files: 220,
+} as const;
+
+function redactField(value: string, cap: number): string {
+  const redacted = redactSecrets(value).text;
+  if (redacted === value) return value;
+  const chars = Array.from(redacted);
+  return chars.length > cap ? chars.slice(0, cap).join("") : redacted;
+}
+
+function redactList(items: string[], cap: number): string[] {
+  return items.map((item) => redactField(item, cap));
+}
+
+/**
+ * Scrub secrets from every free-text field of a checkpoint with the same `redactSecrets`
+ * the memory-table mirror uses, so the JSON file on disk only ever holds placeholders.
+ * Identifier fields (sessionId, scope, idempotencyKey, checkpointId, resolvedScope,
+ * updatedAt) are left alone: they name the file and the record, and rewriting them
+ * would change which checkpoint a save replaces.
+ */
+export function redactCheckpointRecord(record: SessionCheckpointRecord): SessionCheckpointRecord {
+  const caps = CHECKPOINT_REDACTED_FIELD_CAPS;
+  return {
+    ...record,
+    summary: redactField(record.summary, caps.summary),
+    ...(record.task !== undefined ? { task: redactField(record.task, caps.task) } : {}),
+    decisions: redactList(record.decisions, caps.decisions),
+    openLoops: redactList(record.openLoops, caps.openLoops),
+    nextActions: redactList(record.nextActions, caps.nextActions),
+    entities: redactList(record.entities, caps.entities),
+    files: redactList(record.files, caps.files),
+  };
 }
 
 /** Named write lock held while a checkpoint file is published and older same-id files are removed. */
@@ -83,12 +132,18 @@ export class SessionCheckpointStore {
   }
 
   /**
-   * Write the new version to a temp file, rename it into place, and only then remove
-   * older files with the same checkpointId. Any failure throws, so a failed save never
+   * Secrets in the free-text fields are replaced with `[REDACTED:<type>]` first (see
+   * redactCheckpointRecord). Then write the new version to a temp file, rename it into
+   * place, and only then remove older files with the same checkpointId. Any failure throws, so a failed save never
    * deletes the previous version and is never reported as a success.
    */
   async save(record: SessionCheckpointRecord): Promise<SessionCheckpointRecord> {
-    const parsed = SessionCheckpointRecordSchema.parse(record);
+    // Redact before the final parse: the parse re-collapses whitespace and re-dedupes
+    // list items that redaction made identical. The returned record is the redacted one,
+    // so callers (managed observation, mirror, HTTP response) never see the raw text.
+    const parsed = SessionCheckpointRecordSchema.parse(
+      redactCheckpointRecord(SessionCheckpointRecordSchema.parse(record)),
+    );
     const dir = this.dataDir;
     // Publication and the same-id sweep run under one cross-process lock: without it two
     // processes saving the same id could each rename their file in, then each delete the
