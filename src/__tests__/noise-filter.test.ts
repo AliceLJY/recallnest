@@ -234,3 +234,67 @@ describe("isNoise — denial / meta-question patterns only apply to short uttera
     expect(isNoise(padTo(201))).toBe(false);
   });
 });
+
+// 2026-11-01：检索端默认对候选跑 filterNoise，写入端不跑——被误判成噪声的记忆存得进库、却永远搜不到。
+// 下面四条是体检里复现出来的误判（修前都判 true），每条只认「整段短话」型噪声。
+describe("isNoise — only whole short utterances count as noise (retrieval false positives)", () => {
+  const LOG_RETRO =
+    "复盘：ingest 在凌晨失败。日志如下：\n2026-10-05T16:38:03Z ERROR commit conflict\n根因是 delete 不持锁，两个进程同时提交时后一个撞冲突。修法：delete 走写锁。";
+
+  it("keeps a retrospective that contains one ISO-timestamped log line", () => {
+    expect(isNoise(LOG_RETRO)).toBe(false);
+  });
+  it("keeps a single log line that has content after the timestamp", () => {
+    expect(isNoise("2026-10-05T16:38:03Z ERROR commit conflict")).toBe(false);
+  });
+  it("keeps a note in which one line is only a timestamp", () => {
+    expect(isNoise("ingest 失败时间：\n2026-10-05T16:38:03Z\n之后两小时内的写入都没进库，要补跑一次。")).toBe(false);
+  });
+  it("keeps a note that starts with 新会话 but goes on to say something", () => {
+    expect(isNoise("新会话启动时先调 resume_context，再看 open-loops，最后才动代码。")).toBe(false);
+  });
+  it("keeps a rule that mentions 我不确定的 as part of its body", () => {
+    expect(isNoise("规则：遇到我不确定的 API 行为，先查官方文档再写代码。")).toBe(false);
+  });
+  it("keeps a note about a project whose name starts with Hello-", () => {
+    expect(isNoise("Hello-Agent 项目已于 9 月归档，仓库只读，后续需求转到 hippo。")).toBe(false);
+  });
+  it("keeps a YAML-ish metadata block followed by real content", () => {
+    expect(isNoise('---\n{"channel": "telegram"}\n---\n今天把 ingest 默认关掉了，原文改由 Deja 索引。')).toBe(false);
+  });
+  it("keeps a long greeting-led message past the utterance limit", () => {
+    const body = "这是复盘正文，记录了当时的判断、证据和后续动作。".repeat(10);
+    expect(isNoise(`Hi team, ${body}`)).toBe(false);
+  });
+
+  // 真正的噪声仍要判 true
+  it("still filters a bare ISO timestamp line", () => {
+    expect(isNoise("2026-10-05T16:38:03Z")).toBe(true);
+    expect(isNoise("2026-10-05T16:38:03.123+08:00")).toBe(true);
+    expect(isNoise("[2026-10-05T16:38:03 GMT+8]")).toBe(true);
+    expect(isNoise("  [2026-10-05T16:38:03Z]  \n")).toBe(true);
+  });
+  it("still filters a pure YAML-ish metadata block", () => {
+    expect(isNoise('---\n{"channel": "telegram", "sender": "alice"}\n---')).toBe(true);
+    expect(isNoise('---\n{\n  "a": 1\n}\n---\n')).toBe(true);
+  });
+  it("still filters bare greetings", () => {
+    expect(isNoise("hi")).toBe(true);
+    expect(isNoise("hello")).toBe(true);
+    expect(isNoise("good evening")).toBe(true);
+  });
+  it("still filters 新会话 / 新对话 on their own", () => {
+    expect(isNoise("新会话")).toBe(true);
+    expect(isNoise("新对话。")).toBe(true);
+    expect(isNoise("新会话开始了")).toBe(true);
+  });
+  it("still filters short 我不确定 denials, including with a short opener", () => {
+    expect(isNoise("我不确定。")).toBe(true);
+    expect(isNoise("我不太确定你说的是哪个方案")).toBe(true);
+    expect(isNoise("抱歉，我不确定这个配置在哪")).toBe(true);
+  });
+  it("still filters greetings followed by punctuation or space", () => {
+    expect(isNoise("hello!")).toBe(true);
+    expect(isNoise("Hey, 在吗")).toBe(true);
+  });
+});
