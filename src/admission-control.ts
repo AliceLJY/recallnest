@@ -17,6 +17,7 @@
 
 import { isNoise } from "./noise-filter.js";
 import { logInfo } from "./stderr-log.js";
+import { MIN_MEMORY_TEXT_UNITS, weightedTextLength } from "./text-length.js";
 
 // ============================================================================
 // Configuration
@@ -39,7 +40,7 @@ export interface AdmissionConfig {
 }
 
 const DEFAULT_CONFIG: AdmissionConfig = {
-  minTextLength: 10,
+  minTextLength: MIN_MEMORY_TEXT_UNITS,
   noiseFilterEnabled: true,
   minImportance: 0.2,
   maxWritesPerScope: 50,
@@ -75,23 +76,10 @@ const ACCEPTED: AdmissionResult = { verdict: "accepted" };
 // ============================================================================
 
 /**
- * 汉字（含扩展区）、平假名、片假名、谚文按 2 个单位计。标点、全角符号不在这几个 script 里，
- * 照常按 1 计。用 Unicode script 属性而不是码位区间，扩展区与兼容区的汉字不会漏。
+ * 准入最短长度用的长度：汉字 / 假名 / 谚文每个 2，其余每个 code point 1（先做 NFC）。
+ * 实现在 text-length.ts，下游几处短文本门槛共用同一口径。
  */
-const DOUBLE_WIDTH_SCRIPT = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
-
-/**
- * 准入最短长度用的长度：汉字 / 假名 / 谚文每个 2，其余每个 code point 1。
- * 一个中文字承载的信息约等于两三个英文字母，按 UTF-16 计会把「我对花生过敏」这类短事实挡掉。
- * 按 code point 而不是 UTF-16 下标计：扩展区汉字（代理对）算一个字、2 个单位，emoji 算 1。
- */
-export function admissionLength(text: string): number {
-  let units = 0;
-  for (const ch of text) {
-    units += DOUBLE_WIDTH_SCRIPT.test(ch) ? 2 : 1;
-  }
-  return units;
-}
+export const admissionLength = weightedTextLength;
 
 /**
  * 回执里给人看的拒绝原因说明。`reason` 枚举值照旧原样给出，这里只附一句话。
