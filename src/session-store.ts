@@ -55,10 +55,21 @@ const PLACEHOLDER_LEAD = /(?:["']?[A-Za-z][A-Za-z0-9_-]*["']?\s*[=:]\s*["']?|[a-
  * - `sk-` followed by two or more short all-lowercase words (`sk-checkpoint-redaction-design`):
  *   a kebab-case name, while a real key's random tail mixes digits and case.
  */
-const CHECKPOINT_PROTECTED_NAMES: readonly RegExp[] = [
-  /\bsession[_-]?id["']?\s*[=:]\s*["']?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi,
-  /(?<![A-Za-z0-9])sk(?:-[a-z]{2,20}){2,}(?![A-Za-z0-9_-])/g,
+const CHECKPOINT_PROTECTED_NAMES: readonly CheckpointProtectedName[] = [
+  { pattern: /\bsession[_-]?id["']?\s*[=:]\s*["']?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi },
+  {
+    pattern: /(?<![A-Za-z0-9])sk(?:-[a-z]{2,20}){2,}(?![A-Za-z0-9_-])/g,
+    // A kebab-case `sk-…` sitting right after `key=`, `key: "`, `Bearer ` or a URI's
+    // `user:` is a value, not a name (`password=sk-correct-horse-battery`): leave it to
+    // the generic rules. Second-round audit #1 (2026-11-01).
+    unlessLedBy: /(?:[=:]\s*["'`]?|\bbearer\s+)$/i,
+  },
 ];
+interface CheckpointProtectedName {
+  pattern: RegExp;
+  /** When the text just before the match ends like this, the match is not protected. */
+  unlessLedBy?: RegExp;
+}
 const MASK_OPEN = "";
 const MASK_CLOSE = "";
 
@@ -75,9 +86,13 @@ function redactCheckpointText(value: string): string {
   }
   const kept: string[] = [];
   let masked = value;
-  for (const pattern of CHECKPOINT_PROTECTED_NAMES) {
+  for (const { pattern, unlessLedBy } of CHECKPOINT_PROTECTED_NAMES) {
     pattern.lastIndex = 0;
-    masked = masked.replace(pattern, (match) => {
+    masked = masked.replace(pattern, (match: string, ...rest: unknown[]) => {
+      const offset = rest.find((arg): arg is number => typeof arg === "number") ?? 0;
+      if (unlessLedBy && unlessLedBy.test(masked.slice(Math.max(0, offset - 32), offset))) {
+        return match;
+      }
       kept.push(match);
       return `${MASK_OPEN}${kept.length - 1}${MASK_CLOSE}`;
     });
