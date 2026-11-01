@@ -632,14 +632,26 @@ registerTool(
     const tierOrder: Record<string, number> = { core: 0, advanced: 1, governance: 2 };
     const maxOrder = requestedTier === "full" ? 2 : tierOrder[requestedTier] ?? 1;
 
+    // 只列本进程真正 registerTool 过的工具（TOOL_DESCRIPTIONS 由注册包装器在通过 tier 闸之后才写入）。
+    // 早先按 TOOL_TIERS 全表列：RECALLNEST_MCP_TIER=core 时会把调不了的 advanced 工具列成 Available、
+    // 描述是「(no description)」。没注册的只报个数，不列名字，免得调用方去调一个不存在的工具。
     const lines: string[] = [`Available tools (tier: ${requestedTier}):`];
+    let notEnabled = 0;
     for (const [toolName, toolTier] of Object.entries(TOOL_TIERS)) {
       if ((tierOrder[toolTier] ?? 999) > maxOrder) continue;
       const desc = TOOL_DESCRIPTIONS.get(toolName);
-      const oneLiner = desc
-        ? desc.split(/[.!]\s/)[0]?.slice(0, 100) ?? desc.slice(0, 100)
-        : "(no description)";
+      if (desc === undefined) {
+        notEnabled++;
+        continue;
+      }
+      const oneLiner = desc.split(/[.!]\s/)[0]?.slice(0, 100) ?? desc.slice(0, 100);
       lines.push(`- ${toolName}: ${oneLiner}`);
+    }
+    if (notEnabled > 0) {
+      lines.push(
+        `(${notEnabled} more tool(s) at this tier are not enabled in this server process; ` +
+        `they are gated by RECALLNEST_MCP_TIER and need a server restart with a higher tier to use.)`,
+      );
     }
 
     return {
