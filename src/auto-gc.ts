@@ -10,6 +10,7 @@
  */
 
 import type { MemoryStorePort } from "./memory-store-port.js";
+import type { MemoryEntry } from "./store.js";
 import {
   parseEvolution,
   computeDecayScore,
@@ -157,6 +158,9 @@ export async function maybeRunGc(
   }
 }
 
+/** Why the scan picked a row: decay below threshold, or the scope's retention policy. */
+type ArchiveReason = "decay" | "policy";
+
 /**
  * The full-corpus archive scan — the body of a triggered GC run. Extracted from
  * maybeRunGc so the P0-1 lock/throttle wiring stays readable; the scan logic itself
@@ -210,23 +214,54 @@ async function runGcScan(
   // activeCounts 仍在"选中"时即刻预递减，保持旧路径"逐行归档、后续行的 retention 判断
   // 看到已减的 activeCount"语义（互审 C6）。selected 与 archivedCount 分开：前者控
   // maxArchivePerRun 上限（选中即占额度），后者按批量写的实际写入数累计。
+  const decayBelowThreshold = (entry: MemoryEntry, importance: number): boolean => {
+    const evo = parseEvolution(entry.metadata, entry.timestamp);
+    let decayScore = useUsageAdjustedDecay
+      ? computeUsageAdjustedDecayScore(evo, importance, now, entry.metadata)
+      : computeDecayScore(evo, importance, now, entry.metadata);
+    // F3: Expired memories (validUntil < now) get 2x decay acceleration
+    if (evo.validUntil != null && evo.validUntil < now) {
+      decayScore *= 0.5; // Halve the score → archives faster
+    }
+    return decayScore < config.decayScoreThreshold;
+  };
+
+  // 2026-11-01 锁内复判：扫描与写入之间隔着整页扫描（秒级），这期间行可能被 pin
+  // （importance ≥ 0.95）、被 supersede / consolidate、被访问（decay 回升）。patchFn 在
+  // store-write 锁内拿到最新行，这里按它重判：不再 active、已 pinned、或当初因 decay 选中
+  // 而现在 decay 已回到阈值之上的，返回 null 不写——superseded / consolidated 的 status
+  // 不被 archived 覆盖。因 retention policy 选中的只重判 status 与 pin：policy 看的是
+  // 存入天数与 scope 的 active 计数，pin / supersede 不改前者，后者本轮扫描已按选中预递减。
+  const stillArchivable = (current: MemoryEntry, reason: ArchiveReason): boolean => {
+    if (!isActiveMemory(current.metadata)) return false;
+    const importance = current.importance ?? 0.5;
+    if (importance >= 0.95) return false;
+    return reason === "policy" || decayBelowThreshold(current, importance);
+  };
+
   let selected = 0;
-  let pendingArchive: Array<{ id: string; ageDays: number }> = [];
+  let pendingArchive: Array<{ id: string; ageDays: number; reason: ArchiveReason }> = [];
   const flushArchiveBatch = async (): Promise<void> => {
     if (pendingArchive.length === 0) return;
     const batch = pendingArchive;
     pendingArchive = [];
+    const applied = new Set<string>();
     const written = await store.patchMetadataBatch(
-      batch.map(({ id }) => ({
+      batch.map(({ id, reason }) => ({
         id,
-        patchFn: (meta: Record<string, unknown>) => patchEvolutionOnMeta(meta, { status: "archived" }),
+        patchFn: (meta: Record<string, unknown>, current: MemoryEntry) => {
+          if (!stillArchivable(current, reason)) return null;
+          applied.add(id);
+          return patchEvolutionOnMeta(meta, { status: "archived" });
+        },
       })),
     );
     archivedCount += written;
-    // F-1: Audit log — record archive operations (silent on failure)。按提交批记录：
-    // 批内个别行被并发删除时 audit 会多记一条，best-effort 语义可接受（旧路径里
-    // update 失败是直接炸掉整个 GC，连 audit 都到不了）。
+    // F-1: Audit log — record archive operations (silent on failure)。只记锁内复判通过、
+    // 真交给写入的行（复判不过、行已被删的不记）；mergeInsert 前一瞬被不拿锁的 delete()
+    // 删掉的个别行仍会多记一条，best-effort 语义可接受。
     for (const { id, ageDays } of batch) {
+      if (!applied.has(id)) continue;
       try {
         auditLogger?.log({
           operation: "archive",
@@ -257,34 +292,24 @@ async function runGcScan(
     const ageDays = (now - entry.timestamp) / 86_400_000;
 
     // Decay-based archival (existing logic)
-    let shouldArchive = false;
-    if (ageDays >= config.minAgeDays) {
-      const evo = parseEvolution(entry.metadata, entry.timestamp);
-      let decayScore = useUsageAdjustedDecay
-        ? computeUsageAdjustedDecayScore(evo, importance, now, entry.metadata)
-        : computeDecayScore(evo, importance, now, entry.metadata);
-      // F3: Expired memories (validUntil < now) get 2x decay acceleration
-      if (evo.validUntil != null && evo.validUntil < now) {
-        decayScore *= 0.5; // Halve the score → archives faster
-      }
-      if (decayScore < config.decayScoreThreshold) {
-        shouldArchive = true;
-      }
+    let reason: ArchiveReason | null = null;
+    if (ageDays >= config.minAgeDays && decayBelowThreshold(entry, importance)) {
+      reason = "decay";
     }
 
     // Retention-policy-based archival (F-2): OR with decay-based
-    if (!shouldArchive) {
+    if (reason === null) {
       const scope = entry.scope ?? "";
       const policy = policyCache.get(scope) ?? loadRetentionPolicy(scope, retentionConfigDir);
       const activeCount = activeCounts.get(scope) ?? 0;
       const policyCheck = shouldArchiveByPolicy(policy, ageDays, activeCount);
       if (policyCheck.archive) {
-        shouldArchive = true;
+        reason = "policy";
       }
     }
 
-    if (shouldArchive) {
-      pendingArchive.push({ id: entry.id, ageDays });
+    if (reason !== null) {
+      pendingArchive.push({ id: entry.id, ageDays, reason });
       selected++;
       // Decrement active count for the scope（预递减：选中即视为不再 active，
       // 同页后续行的 retention 判断与旧逐行路径看到同样的计数）
