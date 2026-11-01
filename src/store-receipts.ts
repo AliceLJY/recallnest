@@ -106,7 +106,10 @@ export interface HttpWriteResponse {
   body: Record<string, unknown>;
 }
 
-/** HTTP /v1/store 的状态码与响应体。只有真写进主表才回 201 与 `stored: true`。 */
+/**
+ * HTTP /v1/store 的状态码与响应体。只有真写进主表才回 201 与 `stored: true`。
+ * `triggersWritten` 是侧表 memory_triggers 实际写入的条数（与 store_memory 回执的 Triggers 行同源）。
+ */
 export function buildStoreHttpResponse(stored: PersistedMemoryRecord): HttpWriteResponse {
   const wrote = dispositionWroteMemory(stored.disposition);
   return {
@@ -120,6 +123,7 @@ export function buildStoreHttpResponse(stored: PersistedMemoryRecord): HttpWrite
       scope: stored.resolvedScope,
       canonicalKey: stored.canonicalKey,
       conflictId: stored.conflictId,
+      triggersWritten: stored.triggersWritten,
       ...(stored.rejectionReason ? { rejectionReason: stored.rejectionReason } : {}),
     },
   };
