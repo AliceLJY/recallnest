@@ -17,6 +17,7 @@ import { formatCheckpointSaved, formatCheckpointSummary, formatResumeContext } f
 import { matchesTemporalConstraint } from "./temporal-parser.js";
 import { explicitTimeRange } from "./candidate-filter.js";
 import { buildManagedCheckpointObservation, buildManagedResumeObservation } from "./workflow-observation-managed.js";
+import { applyPivotWriteGuard } from "./pivot-write-guard.js";
 import { PROCESS_READER_ID, recentRecallHits } from "./recall-ledger.js";
 import { buildWorkflowObservationRecord } from "./workflow-observation-engine.js";
 import type { ToolRegistryDeps } from "./mcp-tool-deps.js";
@@ -106,6 +107,11 @@ registerTool(
     dependsOn: DependsOnSchema.optional().describe("Optional freshness dependencies (borrowed). Declare what this memory depends on so recall shows a cheap validity verdict (exact/compatible/uncertain/invalid). Items: {kind:'file'|'git-rev', ref, expected?}. file → ref=path, expected=mtime-ms string; git-rev → ref=repo path, expected=commit hash (short ok). expected may be an array: first=exact, rest=compatible set. Omit expected for existence-only checks."),
   },
   async ({ text, category, importance, scope, source, tags, canonicalKey, topicTag, privacyTier, triggers, validUntil, eventTime, confidence, dependsOn }) => {
+    const pivotGuard = applyPivotWriteGuard({ scope, tags, canonicalKey });
+    if (!pivotGuard.ok) {
+      return { content: [{ type: "text" as const, text: pivotGuard.error }], isError: true };
+    }
+    tags = pivotGuard.tags;
     const { store, embedder, triggerStore } = getComponents();
     const kgExtractor = getKGExtractor();
     const stored = await persistMemory({
@@ -139,7 +145,7 @@ registerTool(
     return {
       content: [{
         type: "text" as const,
-        text: formatStoreMemoryReceipt(stored, { requestedTriggers: triggers?.length ?? 0, scope }),
+        text: [formatStoreMemoryReceipt(stored, { requestedTriggers: triggers?.length ?? 0, scope }), ...pivotGuard.notes].join("\n"),
       }],
     };
   }

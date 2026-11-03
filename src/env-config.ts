@@ -188,6 +188,9 @@ export const transcriptIngest = (): boolean => process.env.RECALLNEST_TRANSCRIPT
  */
 export const checkpointMirror = (): boolean => process.env.RECALLNEST_CHECKPOINT_MIRROR !== "off";
 
+/** memory:pivot 写入必带字段守卫（`src/pivot-write-guard.ts`，2026-11-03）。默认开，只认 `off` 关闭。 */
+export const pivotGuard = (): boolean => process.env.RECALLNEST_PIVOT_GUARD !== "off";
+
 // --- String settings with `||` default (empty string falls through) ---
 
 export const dataDir = (): string => process.env.RECALLNEST_DATA_DIR || "data";

@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { isPivotScope } from "./pivot-write-guard.js";
+import { pivotGuard as pivotGuardEnabled } from "./env-config.js";
 import { indexAsset, pinMemory } from "./asset-sync.js";
 import { createAuditLogger } from "./audit-log.js";
 import { persistCaseMemory, persistMemoryBatch, persistWorkflowPattern, promoteMemory } from "./capture-engine.js";
@@ -860,6 +862,13 @@ registerTool(
     source: z.enum(["manual", "agent", "api"]).default("agent"),
   },
   async ({ memories, scope, source }) => {
+    if (isPivotScope(scope) && pivotGuardEnabled()) {
+      // batch_store 没有 canonicalKey 字段，pivot 每条必带 key（§5.3），只能逐条走 store_memory
+      return {
+        content: [{ type: "text" as const, text: "Not stored: memory:pivot 不接受 batch_store（没有 canonicalKey 字段，§5.3 要求每条必带）。请逐条用 store_memory 并带 canonicalKey。2026-11-03 错误转脚本检查第 1 条。" }],
+        isError: true,
+      };
+    }
     const { store, embedder } = getComponents();
     const kgExtractor = getKGExtractor();
     const stored = await persistMemoryBatch({
