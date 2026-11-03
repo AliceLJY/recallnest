@@ -18,7 +18,7 @@ import { DurableMemoryCategorySchema, StoreMemorySourceSchema, DebugFramingSchem
 import { buildRetrievalContext, resolveScopeSelection } from "./scope-policy.js";
 import { persistSkill, retrieveSkills } from "./skill-engine.js";
 import { SkillImplementationTypeSchema } from "./skill-schema.js";
-import { dispositionWroteMemory, formatBatchStoreReceipt } from "./store-receipts.js";
+import { formatBatchStoreReceipt } from "./store-receipts.js";
 import type { ToolRegistryDeps } from "./mcp-tool-deps.js";
 
 /** The data/pins directory, as forget_memory uses it when nothing else is injected. */
@@ -101,6 +101,7 @@ registerTool(
     const { store, embedder } = getComponents();
     const kgExtractor = getKGExtractor();
     const stored = await persistWorkflowPattern({
+      onMemoryWritten: recordSessionWrite,
       store,
       embedder,
       conflictStore,
@@ -169,6 +170,7 @@ registerTool(
     const { store, embedder } = getComponents();
     const kgExtractor = getKGExtractor();
     const stored = await persistMemoryBatch({
+      onMemoryWritten: recordSessionWrite,
       store,
       embedder,
       conflictStore,
@@ -225,6 +227,7 @@ registerTool(
     const { store, embedder } = getComponents();
     const kgExtractor = getKGExtractor();
     const stored = await persistCaseMemory({
+      onMemoryWritten: recordSessionWrite,
       store,
       embedder,
       conflictStore,
@@ -280,6 +283,7 @@ registerTool(
     const { store, embedder } = getComponents();
     const kgExtractor = getKGExtractor();
     const stored = await promoteMemory({
+      onMemoryWritten: recordSessionWrite,
       store,
       embedder,
       conflictStore,
@@ -793,6 +797,7 @@ registerTool(
       tags,
     });
 
+    recordSessionWrite(stored.id);
     return {
       content: [{
         type: "text" as const,
@@ -879,6 +884,7 @@ registerTool(
     const { store, embedder } = getComponents();
     const kgExtractor = getKGExtractor();
     const stored = await persistMemoryBatch({
+      onMemoryWritten: recordSessionWrite,
       store,
       embedder,
       conflictStore,
@@ -896,7 +902,6 @@ registerTool(
       })),
     });
 
-    for (const r of stored) if (dispositionWroteMemory(r.disposition)) recordSessionWrite(r.id);
     return {
       content: [{
         type: "text" as const,
@@ -933,7 +938,7 @@ registerTool(
     }
 
     const result = await ingestNormalizedMessages(
-      { store, embedder, llm, conflictStore, kgExtractor, auditLogger },
+      { store, embedder, llm, conflictStore, kgExtractor, auditLogger, onMemoryWritten: recordSessionWrite },
       messages,
       scope,
     );

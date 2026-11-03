@@ -26,7 +26,8 @@ export type PivotGuardResult =
   | { ok: false; error: string };
 
 export function isPivotScope(scope: string): boolean {
-  return scope === PIVOT_GUARD_SCOPE || scope.startsWith(`${PIVOT_GUARD_SCOPE}:`);
+  const normalized = scope.trim();
+  return normalized === PIVOT_GUARD_SCOPE || normalized.startsWith(`${PIVOT_GUARD_SCOPE}:`);
 }
 
 /** 当前会话 id：Claude Code 给子进程的环境变量，或手动指定的 RECALLNEST_SESSION_ID。 */
@@ -71,12 +72,17 @@ export function applyPivotWriteGuard(
     }
   }
   if (tags.length > MAX_TAGS) {
-    // 自动补的两个标签优先保留，挤掉调用方给的最后几个
-    const keep = new Set(tags.filter((t) => t === "pinned" || t.startsWith("src:")));
-    const rest = tags.filter((t) => !keep.has(t)).slice(0, MAX_TAGS - keep.size);
-    const dropped = tags.filter((t) => !keep.has(t) && !rest.includes(t));
+    // Only the first pinned/src occurrences are protected; extra src tags use ordinary slots.
+    const protectedIndexes = new Set([tags.indexOf("pinned"), tags.findIndex((t) => t.startsWith("src:"))].filter((i) => i >= 0));
+    const kept = tags.filter((_, i) => protectedIndexes.has(i));
+    const dropped: string[] = [];
+    for (const [i, tag] of tags.entries()) {
+      if (protectedIndexes.has(i)) continue;
+      if (kept.length < MAX_TAGS) kept.push(tag);
+      else dropped.push(tag);
+    }
     notes.push(`标签超过 ${MAX_TAGS} 个，丢掉了：${dropped.join(", ")}`);
-    return { ok: true, tags: [...tags.filter((t) => keep.has(t)), ...rest], notes };
+    return { ok: true, tags: kept, notes };
   }
   return { ok: true, tags, notes };
 }

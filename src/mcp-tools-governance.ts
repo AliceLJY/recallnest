@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { recordSessionWrite } from "./revision-guard.js";
 import { ALIAS_RULES, expandQueryWithAliases, explainAliasExpansion } from "./aliases.js";
 import { buildConflictAuditSummary, clusterConflicts } from "./conflict-advisor.js";
 import { resolveConflictCandidate } from "./conflict-engine.js";
@@ -498,7 +499,7 @@ registerTool(
   async ({ scope, dryRun, minOccurrences, minImportance }) => {
     const { store, embedder } = getComponents();
     const kgExtractor = getKGExtractor();
-    const deps = buildPromoteScanDeps({ store, embedder, conflictStore, kgExtractor });
+    const deps = buildPromoteScanDeps({ store, embedder, conflictStore, kgExtractor, onMemoryWritten: recordSessionWrite });
     const result = await scanMemoryPromotions(deps, scope, { dryRun, minOccurrences, minImportance });
 
     return {
@@ -522,7 +523,7 @@ registerTool(
   async ({ scope, dryRun, minDistinctEvidence, minImportance }) => {
     const { store, embedder } = getComponents();
     const kgExtractor = getKGExtractor();
-    const deps = buildPromoteScanDeps({ store, embedder, conflictStore, kgExtractor });
+    const deps = buildPromoteScanDeps({ store, embedder, conflictStore, kgExtractor, onMemoryWritten: recordSessionWrite });
     const result = await scanSynthesisPromotions(deps, scope, { dryRun, minDistinctEvidence, minImportance });
 
     return {

@@ -78,6 +78,25 @@ describe("applyPivotWriteGuard（纯函数）", () => {
     expect(isPivotScope("memory:pivotal")).toBe(false);
   });
 
+  it("trims pivot scopes before checking the guard", () => {
+    for (const scope of [" memory:pivot ", "\tmemory:pivot:child\n"]) {
+      expect(isPivotScope(scope)).toBe(true);
+      expect(applyPivotWriteGuard({ scope, tags: [] }, { env: {} }).ok).toBe(false);
+    }
+    expect(isPivotScope(" memory:pivotal ")).toBe(false);
+  });
+
+  it("caps protected tags at pinned and the first src and reports every dropped src", () => {
+    const sources = Array.from({ length: 8 }, (_, i) => `src:synthetic${i}`);
+    const r = applyPivotWriteGuard({ scope: "memory:pivot", tags: sources, canonicalKey: "test:tag-cap" }, { env: {} });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.tags).toHaveLength(8);
+    expect(r.tags.slice(0, 2)).toEqual(["pinned", sources[0]]);
+    expect(r.tags).not.toContain(sources[7]);
+    expect(r.notes.join("\n")).toContain(`丢掉了：${sources[7]}`);
+  });
+
   it("RECALLNEST_SESSION_ID 优先于 CLAUDE_CODE_SESSION_ID", () => {
     expect(currentSessionId({ RECALLNEST_SESSION_ID: "aaa", CLAUDE_CODE_SESSION_ID: "bbb" })).toBe("aaa");
     expect(currentSessionId({})).toBeUndefined();
@@ -120,6 +139,57 @@ describe("经真实 handler", () => {
     expect(rows).toHaveLength(1);
     expect(JSON.stringify(rows[0])).toContain("pinned");
   }, 30_000);
+
+  it("store_memory: eight src tags still persist at most eight tags including pinned", async () => {
+    const h = harness();
+    const sources = Array.from({ length: 8 }, (_, i) => `src:synthetic${i}`);
+    const receipt = await h.text("store_memory", {
+      text: "Synthetic tag overflow record for a fictional project", scope: " memory:pivot ",
+      canonicalKey: "test:tag-overflow", tags: sources,
+    });
+    expect(receipt).toContain("Disposition: stored");
+    expect(receipt).toContain(`丢掉了：${sources[7]}`);
+    const [row] = await h.store.list(["memory:pivot"], undefined, 10, 0, "exact");
+    const metadata: { tags: string[] } = JSON.parse(row.metadata ?? "{}");
+    expect(metadata.tags).toHaveLength(8);
+    expect(metadata.tags).toContain("pinned");
+    expect(metadata.tags).toContain(sources[0]);
+    expect(metadata.tags).not.toContain(sources[7]);
+  }, 30_000);
+
+  for (const tool of ["store_memory", "batch_store"]) {
+    it(`${tool}: padded pivot scopes cannot bypass rejection`, async () => {
+      const h = harness();
+      const text = "Synthetic padded scope guard regression record";
+      const result = await h.call(tool, {
+        scope: " \tmemory:pivot:child ",
+        ...(tool === "store_memory" ? { text } : { memories: [{ text }] }),
+      });
+      expect(result.isError).toBe(true);
+      expect(await h.rowCount("memory:pivot:child")).toBe(0);
+    }, 30_000);
+  }
+
+  for (const disposition of ["deduped", "rejected", "conflict"] as const) {
+    it(`store_memory: ${disposition} never claims pivot tags were added`, async () => {
+      const h = harness();
+      const scope = "memory:pivot";
+      const text = "Synthetic guard receipt test record for a fictional project";
+      if (disposition !== "rejected") {
+        await h.text("store_memory", { text, scope, canonicalKey: "test:receipt", tags: ["src:fixture"] });
+      }
+      const result = await h.text("store_memory", {
+        text: disposition === "rejected" ? "hi" : disposition === "conflict" ? "Synthetic conflicting category record for a fictional project" : text,
+        category: disposition === "conflict" ? "entities" : "events",
+        scope,
+        canonicalKey: "test:receipt",
+        tags: ["src:fixture"],
+      });
+      expect(result).toContain(`Disposition: ${disposition}`);
+      expect(result).not.toContain("已自动补");
+      expect(result).toContain("这次没写入，标签没有补上");
+    }, 30_000);
+  }
 
   it("batch_store：pivot scope 整批拒绝", async () => {
     const h = harness();
