@@ -118,29 +118,36 @@ export async function planCascadeForget(
  *
  * @param store - Memory store
  * @param forgottenEntry - The entry that was just deleted/archived (need its vector + scope)
- * @param config - Cascade config
+ * @param config - Cascade config (used only when no plan is supplied)
+ * @param plan - Optional authoritative preflight plan; an empty plan performs no writes
  */
 export async function cascadeForget(
   store: MemoryStore,
   forgottenEntry: Pick<MemoryEntry, "id" | "vector" | "scope">,
   config: CascadeForgetConfig = DEFAULT_CASCADE_FORGET_CONFIG,
+  plan?: readonly PlannedDemotion[],
 ): Promise<CascadeForgetResult> {
-  const planned = await planCascadeForget(store, forgottenEntry, config);
+  // An explicit (even empty) plan is authoritative: never search again after preflight.
+  const planned = plan ?? await planCascadeForget(store, forgottenEntry, config);
   const demotedIds: string[] = [];
 
   for (const { entry, similarity, to: newImportance } of planned) {
-    let meta: Record<string, any> = {};
-    try { meta = JSON.parse(entry.metadata || "{}"); } catch { /* skip */ }
+    let meta: Record<string, unknown> = {};
+    try {
+      const parsed: unknown = JSON.parse(entry.metadata || "{}");
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) meta = parsed as Record<string, unknown>;
+    } catch { /* skip */ }
 
     // Audit trail
-    if (!Array.isArray(meta.cascade_forget)) meta.cascade_forget = [];
-    meta.cascade_forget.push({
+    const history: unknown[] = Array.isArray(meta.cascade_forget) ? meta.cascade_forget : [];
+    history.push({
       forgottenId: forgottenEntry.id.slice(0, 8),
       from: entry.importance,
       to: newImportance,
       similarity,
       date: new Date().toISOString().slice(0, 10),
     });
+    meta.cascade_forget = history;
 
     // Demote tier if importance drops below working threshold
     if (meta.tier === "working" && newImportance < 0.5) {

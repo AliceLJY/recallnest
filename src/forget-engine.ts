@@ -350,6 +350,9 @@ export async function forgetMemory(
       );
     } catch (err) {
       console.error("[recallnest] Cascade preflight failed during forget:", errorMessage(err));
+      if (cascadeMode === "auto" && revisionGuard()) {
+        return failed(entry.id, `Not forgotten: cascade preflight failed: ${errorMessage(err)}. Nothing was changed. Retry or use cascadeMode=skip (delete without demotion) / cascadeMode=force (bypass the revision guard).`, { evidence });
+      }
     }
     if (cascadeMode === "auto" && revisionGuard()) {
       const protectedRows = findProtectedDemotions(entry, plannedDemotions, (deps.sessionWrittenIds ?? defaultSessionWrittenIds)());
@@ -444,6 +447,7 @@ export async function forgetMemory(
       store,
       { id: entry.id, vector: entry.vector, scope: entry.scope },
       cascadeConfig ?? DEFAULT_CASCADE_FORGET_CONFIG,
+      plannedDemotions,
     );
   } catch (err) {
     console.error("[recallnest] Cascade demote failed during forget:", errorMessage(err));
@@ -452,7 +456,7 @@ export async function forgetMemory(
   // 8. Evolution breadcrumb
   try {
     const patchedMetadata = patchEvolution(entry.metadata, {
-      status: "archived" as any,
+      status: "archived",
       evolutionNote: `forgotten: ${reason || "user request"}`,
     });
     progress.breadcrumbWritten = (await store.update(entry.id, { metadata: patchedMetadata }, scopeFilter)) !== null;

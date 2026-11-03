@@ -1,3 +1,4 @@
+import { dispositionWroteMemory } from "./store-receipts.js";
 import type { Embedder } from "./embedder.js";
 import { detectLang, tokenizeFts } from "./language-hook.js";
 import { generateAnchor } from "./anchor-generator.js";
@@ -77,6 +78,8 @@ type StoreDeps = Pick<MemoryStore, "store"> & Partial<Pick<MemoryStore, "list" |
 type ConflictStoreDeps = Pick<ConflictCandidateStore, "save" | "replace" | "getOpenByFingerprint" | "getLatestByFingerprint">;
 
 export interface PersistMemoryDeps {
+  /** Called only after a content write succeeds; MCP uses it for session revision protection. */
+  onMemoryWritten?: (id: string) => void;
   store: StoreDeps;
   embedder: Pick<Embedder, "embedPassage">;
   conflictStore?: ConflictStoreDeps;
@@ -708,6 +711,17 @@ async function replaceBeliefInPlace(
 }
 
 export async function writeDurableEntry(
+  deps: PersistMemoryDeps,
+  params: DurableWriteInput,
+): ReturnType<typeof writeDurableEntryInner> {
+  const result = await writeDurableEntryInner(deps, params);
+  if (dispositionWroteMemory(result.disposition)) {
+    deps.onMemoryWritten?.(result.entry.id);
+  }
+  return result;
+}
+
+async function writeDurableEntryInner(
   deps: PersistMemoryDeps,
   params: DurableWriteInput,
 ): Promise<{
@@ -1366,6 +1380,7 @@ export async function persistMemory(
           timestamp: Date.now(),
           metadata: "{}",
         };
+        if (matchResult.action === "merge" && applied.entry) deps.onMemoryWritten?.(applied.entry.id);
         return {
           ...toStoredRecord(
             input,

@@ -92,6 +92,8 @@ export function captureTools(
     auditLogger: options.auditLogger ?? memoryAuditLogger(),
     toolDescriptions: new Map<string, string>(),
     toolTiers: {},
+    saveBrief: () => "synthetic-brief-path",
+    savePin: () => "synthetic-pin-path",
     getKGExtractor: () => null,
     getKGStore: () => null,
   } satisfies ToolRegistryDeps;

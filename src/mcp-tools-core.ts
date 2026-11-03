@@ -117,6 +117,7 @@ registerTool(
     const { store, embedder, triggerStore } = getComponents();
     const kgExtractor = getKGExtractor();
     const stored = await persistMemory({
+      onMemoryWritten: recordSessionWrite,
       store,
       embedder,
       conflictStore,
@@ -146,7 +147,10 @@ registerTool(
 
     // revision-guard（2026-11-03）：登记本会话写入，供 forget 预演保护；同 key 已在别的 scope 时警告
     const revisionNotes: string[] = [];
-    if (dispositionWroteMemory(stored.disposition)) recordSessionWrite(stored.id);
+    const wrote = dispositionWroteMemory(stored.disposition);
+    const pivotNotes = wrote || pivotGuard.notes.length === 0
+      ? pivotGuard.notes
+      : ["这次没写入，标签没有补上（pivot 守卫的标签调整未保存）。"];
     if (canonicalKey && revisionGuardEnabled()) {
       try {
         const warning = otherScopeWarning(await findSameKeyInOtherScopes(store, canonicalKey, stored.resolvedScope || scope));
@@ -159,7 +163,7 @@ registerTool(
     return {
       content: [{
         type: "text" as const,
-        text: [formatStoreMemoryReceipt(stored, { requestedTriggers: triggers?.length ?? 0, scope }), ...pivotGuard.notes, ...revisionNotes].join("\n"),
+        text: [formatStoreMemoryReceipt(stored, { requestedTriggers: triggers?.length ?? 0, scope }), ...pivotNotes, ...revisionNotes].join("\n"),
       }],
     };
   }
@@ -177,6 +181,7 @@ registerTool(
   async ({ trigger, action, scope, expiresInDays }) => {
     const { store, embedder } = getComponents();
     const entry = await setReminder(store, embedder, { trigger, action, scope, expiresInDays });
+    recordSessionWrite(entry.id);
 
     return {
       content: [{

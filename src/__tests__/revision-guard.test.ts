@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -106,6 +106,97 @@ describe("回放 14 个历史 store→forget 序列", () => {
 });
 
 describe("forget 预演", () => {
+  it("auto preflight failure leaves every layer untouched and offers skip/force", async () => {
+    const store = freshStore();
+    const old = await put(store, "project:preflight-failure", OLD_VEC, 0.8);
+    const before = await store.getById(old.id);
+    const calls: string[] = [];
+    const search = spyOn(store, "vectorSearch").mockRejectedValue(new Error("synthetic search failure"));
+    const update = spyOn(store, "update");
+    const remove = spyOn(store, "delete");
+    const prev = process.env.RECALLNEST_REVISION_GUARD;
+    delete process.env.RECALLNEST_REVISION_GUARD;
+    try {
+      const result = await forgetMemory({
+        store,
+        triggerStore: {
+          deleteForMemory: async () => { calls.push("triggers"); return 1; },
+          countForMemory: async () => 0,
+        },
+        pins: {
+          archiveForMemory: () => { calls.push("pins"); return 1; },
+          countForMemory: () => 0,
+        },
+      }, { memoryId: old.id, confirm: true });
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("synthetic search failure");
+      expect(result.error).toContain("cascadeMode=skip");
+      expect(result.error).toContain("cascadeMode=force");
+      expect(calls).toEqual([]);
+      expect(update).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalled();
+      expect(await store.getById(old.id)).toEqual(before);
+    } finally {
+      search.mockRestore();
+      update.mockRestore();
+      remove.mockRestore();
+      if (prev === undefined) delete process.env.RECALLNEST_REVISION_GUARD;
+      else process.env.RECALLNEST_REVISION_GUARD = prev;
+    }
+  }, 30_000);
+
+  for (const cascadeMode of ["auto", "force"] as const) {
+    it(`${cascadeMode}: rows inserted after preflight are never demoted`, async () => {
+      const store = freshStore();
+      const old = await put(store, "project:plan-race", OLD_VEC, 0.8);
+      const planned = await put(store, old.scope, NEAR_VEC, 0.7);
+      let lateId = "";
+      const search = spyOn(store, "vectorSearch");
+      try {
+        const result = await forgetMemory({
+          store,
+          triggerStore: {
+            deleteForMemory: async () => {
+              const late = await put(store, old.scope, OLD_VEC, 0.92);
+              lateId = late.id;
+              recordSessionWrite(late.id);
+              return 0;
+            },
+            countForMemory: async () => 0,
+          },
+        }, { memoryId: old.id, confirm: true, cascadeMode });
+        expect(result.success).toBe(true);
+        expect(result.plannedDemotions?.map((p) => p.entry.id)).toEqual([planned.id]);
+        expect(result.cascadeResult.demotedIds).toEqual([planned.id]);
+        expect((await store.getById(planned.id))!.importance).toBeCloseTo(result.plannedDemotions![0].to, 5);
+        expect((await store.getById(lateId))!.importance).toBeCloseTo(0.92, 5);
+        expect(search).toHaveBeenCalledTimes(1);
+      } finally {
+        search.mockRestore();
+      }
+    }, 30_000);
+  }
+
+  it("an empty preflight plan remains empty after a late insert", async () => {
+    const store = freshStore();
+    const old = await put(store, "project:empty-plan", OLD_VEC, 0.8);
+    let lateId = "";
+    const result = await forgetMemory({
+      store,
+      triggerStore: {
+        deleteForMemory: async () => {
+          lateId = (await put(store, old.scope, NEAR_VEC, 0.9)).id;
+          return 0;
+        },
+        countForMemory: async () => 0,
+      },
+    }, { memoryId: old.id, confirm: true });
+    expect(result.success).toBe(true);
+    expect(result.plannedDemotions).toEqual([]);
+    expect(result.cascadeResult.demotedIds).toEqual([]);
+    expect((await store.getById(lateId))!.importance).toBeCloseTo(0.9, 5);
+  }, 30_000);
+
   it("同 canonicalKey 的兄弟条会被降权时拒绝（不是本会话写的也拒）", async () => {
     const store = freshStore();
     const old = await put(store, "project:x", OLD_VEC, 0.8, "decision:x");
