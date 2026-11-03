@@ -19,6 +19,10 @@
  * 10. Read-back (fetch the id again; count what is left in triggers, pins, pin index rows and KG)
  * 11. Audit log (record the operation and what the read-back found)
  *
+ * Between steps 3 and 4 the cascade is previewed (revision-guard.ts, 2026-11-03): with the default
+ * cascadeMode "auto", a preview that would demote a row written in this session or a row sharing the
+ * forgotten row's canonicalKey refuses the whole forget before anything is changed.
+ *
  * Steps 4 and 5 fail closed and run before the primary delete: once the row is
  * gone, forget() can no longer find the id, so whatever they left behind would
  * have no tool to remove it.
@@ -59,7 +63,9 @@ import type { KGStore } from "./kg-store.js";
 import type { AuditLogger } from "./audit-log.js";
 import { parsePrivacyTier, type PrivacyTier } from "./memory-schema.js";
 import { parseEvolution, patchEvolution } from "./memory-evolution.js";
-import { cascadeForget, type CascadeForgetConfig, DEFAULT_CASCADE_FORGET_CONFIG } from "./cascade-forget.js";
+import { cascadeForget, planCascadeForget, type CascadeForgetConfig, type PlannedDemotion, DEFAULT_CASCADE_FORGET_CONFIG } from "./cascade-forget.js";
+import { findProtectedDemotions, refusalMessage, sessionWrittenIds as defaultSessionWrittenIds, type CascadeMode } from "./revision-guard.js";
+import { revisionGuard } from "./env-config.js";
 import { textFingerprint } from "./text-fingerprint.js";
 
 // ---------------------------------------------------------------------------
@@ -75,6 +81,11 @@ export interface ForgetRequest {
   reason?: string;
   /** Scope filter for permission check */
   scopeFilter?: string[];
+  /**
+   * 级联降权怎么处理（2026-11-03 revision-guard）：auto（默认）= 先预演，名单里有本会话刚写的或同 key 的就拒绝；
+   * skip = 删但不降权；force = 照旧降权。
+   */
+  cascadeMode?: CascadeMode;
 }
 
 export interface ForgetEvidence {
@@ -139,6 +150,10 @@ export interface ForgetResult {
   pinIndexRowsRemoved: number | null;
   /** Cascade demote results */
   cascadeResult: { demotedCount: number; demotedIds: string[] };
+  /** 预演出的降权名单（cascadeMode=skip 时为空）；拒绝时也带上，供回执回显 */
+  plannedDemotions?: PlannedDemotion[];
+  /** 本次是否跳过了降权（cascadeMode=skip） */
+  cascadeSkipped?: boolean;
   /** Read-back after the primary delete (absent when the forget stopped before deleting) */
   verification?: ForgetVerification;
   /** Error message if failed */
@@ -177,6 +192,8 @@ export interface ForgetByIdDeps {
   triggerStore?: ForgetTriggerStore | null;
   /** Omit to skip the file half of step 5 (the indexed copies live in `store` and are always handled). */
   pins?: ForgetPinArchive | null;
+  /** 本会话写过的 id（revision-guard 预演用）；不给就用本进程的登记表。 */
+  sessionWrittenIds?: () => ReadonlySet<string>;
 }
 
 /** What a forget has already changed at the moment it stops or finishes. */
@@ -298,6 +315,7 @@ export async function forgetMemory(
 ): Promise<ForgetResult> {
   const { store, kgStore, auditLogger, cascadeConfig, triggerStore, pins } = deps;
   const { memoryId, confirm, reason, scopeFilter } = request;
+  const cascadeMode: CascadeMode = request.cascadeMode ?? "auto";
 
   // 1. Fetch target
   const entry = await store.get(memoryId, scopeFilter);
@@ -320,6 +338,26 @@ export async function forgetMemory(
     forgottenAt: new Date().toISOString(),
     reason,
   };
+
+  // (between 3 and 4) Cascade preflight — revision-guard, 2026-11-03; runs before anything is changed
+  let plannedDemotions: PlannedDemotion[] = [];
+  if (cascadeMode !== "skip") {
+    try {
+      plannedDemotions = await planCascadeForget(
+        store,
+        { id: entry.id, vector: entry.vector, scope: entry.scope },
+        cascadeConfig ?? DEFAULT_CASCADE_FORGET_CONFIG,
+      );
+    } catch (err) {
+      console.error("[recallnest] Cascade preflight failed during forget:", errorMessage(err));
+    }
+    if (cascadeMode === "auto" && revisionGuard()) {
+      const protectedRows = findProtectedDemotions(entry, plannedDemotions, (deps.sessionWrittenIds ?? defaultSessionWrittenIds)());
+      if (protectedRows.length > 0) {
+        return failed(entry.id, refusalMessage(entry, plannedDemotions, protectedRows), { evidence, plannedDemotions });
+      }
+    }
+  }
 
   const progress: ForgetProgress = {
     triggerRowsRemoved: null,
@@ -401,7 +439,7 @@ export async function forgetMemory(
   }
 
   // 7. Cascade demote
-  try {
+  if (cascadeMode !== "skip") try {
     progress.cascadeResult = await cascadeForget(
       store,
       { id: entry.id, vector: entry.vector, scope: entry.scope },
@@ -475,6 +513,8 @@ export async function forgetMemory(
     evidence,
     ...resultFields(progress),
     verification,
+    plannedDemotions,
+    cascadeSkipped: cascadeMode === "skip",
   };
 }
 
@@ -519,6 +559,8 @@ export async function forgetByScope(
       confirm: true,
       reason: reason || `scope-level forget: ${scope}`,
       scopeFilter: [scope],
+      // 整个 scope 都在删，兄弟条互相被预演打中是预期内的，不走 revision-guard 的拒绝
+      cascadeMode: "force",
     });
 
     if (result.success) {

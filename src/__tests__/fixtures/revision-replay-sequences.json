@@ -1,0 +1,155 @@
+[
+ {
+  "session": "a1c6052a",
+  "date": "2026-10-16",
+  "stepGap": 7,
+  "storeScope": "memory:pivot",
+  "forgetScope": "memory:pivot",
+  "storedWithKey": true,
+  "forgotTheNewRow": false,
+  "expect": "refuse",
+  "note": "forget 调用没传 scope；被删条的 reason 写明「以新条目取代」，回执 Cascade demoted: 1，按同 scope 回放"
+ },
+ {
+  "session": "a1c6052a",
+  "date": "2026-10-16",
+  "stepGap": 6,
+  "storeScope": "memory:pivot",
+  "forgetScope": "memory:pivot",
+  "storedWithKey": true,
+  "forgotTheNewRow": false,
+  "expect": "refuse",
+  "note": "forget 调用没传 scope；被删条的 reason 写明「以新条目取代」，回执 Cascade demoted: 1，按同 scope 回放"
+ },
+ {
+  "session": "b68db9c0",
+  "date": "2026-07-10",
+  "stepGap": 28,
+  "storeScope": "project:cc-harness",
+  "forgetScope": "project:cc-harness",
+  "storedWithKey": true,
+  "forgotTheNewRow": true,
+  "expect": "proceed"
+ },
+ {
+  "session": "b68db9c0",
+  "date": "2026-07-10",
+  "stepGap": 6,
+  "storeScope": "project:cc-harness",
+  "forgetScope": "project:cc-harness",
+  "storedWithKey": true,
+  "forgotTheNewRow": false,
+  "expect": "refuse"
+ },
+ {
+  "session": "664468b4",
+  "date": "2026-07-25",
+  "stepGap": 16,
+  "storeScope": "project:recallnest",
+  "forgetScope": "project:recallnest",
+  "storedWithKey": false,
+  "forgotTheNewRow": true,
+  "expect": "proceed"
+ },
+ {
+  "session": "664468b4",
+  "date": "2026-07-25",
+  "stepGap": 3,
+  "storeScope": "project:recallnest",
+  "forgetScope": "project:recallnest",
+  "storedWithKey": true,
+  "forgotTheNewRow": false,
+  "expect": "refuse"
+ },
+ {
+  "session": "664468b4",
+  "date": "2026-07-25",
+  "stepGap": 2,
+  "storeScope": "project:recallnest",
+  "forgetScope": "project:recallnest",
+  "storedWithKey": true,
+  "forgotTheNewRow": false,
+  "expect": "refuse"
+ },
+ {
+  "session": "b5a819ba",
+  "date": "2026-07-30",
+  "stepGap": 18,
+  "storeScope": "project:telegram-ai-bridge",
+  "forgetScope": "project:telegram-ai-bridge",
+  "storedWithKey": false,
+  "forgotTheNewRow": true,
+  "expect": "proceed"
+ },
+ {
+  "session": "b5a819ba",
+  "date": "2026-07-30",
+  "stepGap": 17,
+  "storeScope": "project:telegram-ai-bridge",
+  "forgetScope": "project:telegram-ai-bridge",
+  "storedWithKey": false,
+  "forgotTheNewRow": false,
+  "expect": "refuse"
+ },
+ {
+  "session": "b5a819ba",
+  "date": "2026-07-30",
+  "stepGap": 4,
+  "storeScope": "project:telegram-ai-bridge",
+  "forgetScope": "project:telegram-ai-bridge",
+  "storedWithKey": false,
+  "forgotTheNewRow": false,
+  "expect": "refuse"
+ },
+ {
+  "session": "b5714e42",
+  "date": "2026-08-07",
+  "stepGap": 22,
+  "storeScope": "memory:pivot",
+  "forgetScope": "project:hippo-wiki",
+  "storedWithKey": true,
+  "forgotTheNewRow": false,
+  "expect": "proceed"
+ },
+ {
+  "session": "b5714e42",
+  "date": "2026-08-07",
+  "stepGap": 17,
+  "storeScope": "memory:pivot",
+  "forgetScope": "project:hippo-wiki",
+  "storedWithKey": true,
+  "forgotTheNewRow": false,
+  "expect": "proceed"
+ },
+ {
+  "session": "98dd2ec6",
+  "date": "2026-07-10",
+  "stepGap": 8,
+  "storeScope": "project:hippo-wiki",
+  "forgetScope": "project:hippo-wiki",
+  "storedWithKey": false,
+  "forgotTheNewRow": true,
+  "expect": "proceed"
+ },
+ {
+  "session": "98dd2ec6",
+  "date": "2026-07-10",
+  "stepGap": 6,
+  "storeScope": "project:harness",
+  "forgetScope": "project:hippo-wiki",
+  "storedWithKey": false,
+  "forgotTheNewRow": false,
+  "expect": "proceed"
+ },
+ {
+  "session": "739f925a",
+  "date": "2026-10-28",
+  "stepGap": 3,
+  "storeScope": "project:grok-build",
+  "forgetScope": "project:grok-build",
+  "storedWithKey": true,
+  "forgotTheNewRow": true,
+  "crossScopeDuplicate": true,
+  "expect": "warn-on-store"
+ }
+]

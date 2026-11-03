@@ -59,14 +59,23 @@ export interface CascadeForgetResult {
  * @param forgottenEntry - The entry that was just deleted/archived (need its vector + scope)
  * @param config - Cascade config
  */
-export async function cascadeForget(
+export interface PlannedDemotion {
+  entry: MemoryEntry;
+  similarity: number;
+  from: number;
+  to: number;
+}
+
+/**
+ * 只算不写：cascadeForget 会打中哪些条目、各降到多少（2026-11-03 加，供 forget 前预演）。
+ * 与 cascadeForget 用同一套候选与公式；cascadeForget 自己也走这里，两边不会算出不同名单。
+ */
+export async function planCascadeForget(
   store: MemoryStore,
   forgottenEntry: Pick<MemoryEntry, "id" | "vector" | "scope">,
   config: CascadeForgetConfig = DEFAULT_CASCADE_FORGET_CONFIG,
-): Promise<CascadeForgetResult> {
-  if (!forgottenEntry.vector?.length) {
-    return { demotedCount: 0, demotedIds: [] };
-  }
+): Promise<PlannedDemotion[]> {
+  if (!forgottenEntry.vector?.length) return [];
 
   // Find related entries in the same scope. "exact": the default "family" match turns a
   // colon-less scope into a prefix (`memory` → `memory%`), which would also demote
@@ -79,20 +88,14 @@ export async function cascadeForget(
     "exact",
   );
 
-  const demotedIds: string[] = [];
-
+  const planned: PlannedDemotion[] = [];
   for (const candidate of candidates) {
-    if (demotedIds.length >= config.maxDemotePerForget) break;
-
+    if (planned.length >= config.maxDemotePerForget) break;
     const entry = candidate.entry;
-
     // Skip the forgotten entry itself (may still be in index)
     if (entry.id === forgottenEntry.id) continue;
-
     // Skip already-archived/superseded entries (unified via evolution.status)
     if (!isActiveMemory(entry.metadata)) continue;
-    let meta: Record<string, any> = {};
-    try { meta = JSON.parse(entry.metadata || "{}"); } catch { /* skip */ }
 
     // Proportional demotion: higher similarity → bigger cut
     // At sim=1.0 → full maxDemotion, at threshold → near-zero
@@ -101,14 +104,33 @@ export async function cascadeForget(
       ? (candidate.score - config.similarityThreshold) / simRange
       : 1.0;
     const demotion = config.maxDemotion * simNormalized;
-
-    const newImportance = Math.max(
-      entry.importance - demotion,
-      config.importanceFloor,
-    );
+    const newImportance = Math.max(entry.importance - demotion, config.importanceFloor);
 
     // Skip if no meaningful change
     if (Math.abs(newImportance - entry.importance) < 0.01) continue;
+    planned.push({ entry, similarity: candidate.score, from: entry.importance, to: newImportance });
+  }
+  return planned;
+}
+
+/**
+ * After deleting/archiving a memory, cascade-demote related entries.
+ *
+ * @param store - Memory store
+ * @param forgottenEntry - The entry that was just deleted/archived (need its vector + scope)
+ * @param config - Cascade config
+ */
+export async function cascadeForget(
+  store: MemoryStore,
+  forgottenEntry: Pick<MemoryEntry, "id" | "vector" | "scope">,
+  config: CascadeForgetConfig = DEFAULT_CASCADE_FORGET_CONFIG,
+): Promise<CascadeForgetResult> {
+  const planned = await planCascadeForget(store, forgottenEntry, config);
+  const demotedIds: string[] = [];
+
+  for (const { entry, similarity, to: newImportance } of planned) {
+    let meta: Record<string, any> = {};
+    try { meta = JSON.parse(entry.metadata || "{}"); } catch { /* skip */ }
 
     // Audit trail
     if (!Array.isArray(meta.cascade_forget)) meta.cascade_forget = [];
@@ -116,7 +138,7 @@ export async function cascadeForget(
       forgottenId: forgottenEntry.id.slice(0, 8),
       from: entry.importance,
       to: newImportance,
-      similarity: candidate.score,
+      similarity,
       date: new Date().toISOString().slice(0, 10),
     });
 

@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { isoDateTimeSchema } from "./schema-utils.js";
 import { persistMemory } from "./capture-engine.js";
-import { formatStoreMemoryReceipt } from "./store-receipts.js";
+import { dispositionWroteMemory, formatStoreMemoryReceipt } from "./store-receipts.js";
 import { composeLightResumeContext, composeResumeContext } from "./context-composer.js";
 import { renderMemories } from "./context-renderer.js";
 import { formatSearchResults, formatBriefResults, formatFullResults, formatCollapsedResults } from "./memory-output.js";
@@ -18,6 +18,8 @@ import { matchesTemporalConstraint } from "./temporal-parser.js";
 import { explicitTimeRange } from "./candidate-filter.js";
 import { buildManagedCheckpointObservation, buildManagedResumeObservation } from "./workflow-observation-managed.js";
 import { applyPivotWriteGuard } from "./pivot-write-guard.js";
+import { findSameKeyInOtherScopes, otherScopeWarning, recordSessionWrite } from "./revision-guard.js";
+import { revisionGuard as revisionGuardEnabled } from "./env-config.js";
 import { PROCESS_READER_ID, recentRecallHits } from "./recall-ledger.js";
 import { buildWorkflowObservationRecord } from "./workflow-observation-engine.js";
 import type { ToolRegistryDeps } from "./mcp-tool-deps.js";
@@ -142,10 +144,22 @@ registerTool(
       dependsOn,
     });
 
+    // revision-guard（2026-11-03）：登记本会话写入，供 forget 预演保护；同 key 已在别的 scope 时警告
+    const revisionNotes: string[] = [];
+    if (dispositionWroteMemory(stored.disposition)) recordSessionWrite(stored.id);
+    if (canonicalKey && revisionGuardEnabled()) {
+      try {
+        const warning = otherScopeWarning(await findSameKeyInOtherScopes(store, canonicalKey, stored.resolvedScope || scope));
+        if (warning) revisionNotes.push(warning);
+      } catch (err) {
+        console.error("[recallnest] same-key scope check failed:", err);
+      }
+    }
+
     return {
       content: [{
         type: "text" as const,
-        text: [formatStoreMemoryReceipt(stored, { requestedTriggers: triggers?.length ?? 0, scope }), ...pivotGuard.notes].join("\n"),
+        text: [formatStoreMemoryReceipt(stored, { requestedTriggers: triggers?.length ?? 0, scope }), ...pivotGuard.notes, ...revisionNotes].join("\n"),
       }],
     };
   }
