@@ -1292,6 +1292,16 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 160
+        },
+        "cascadeMode": {
+          "default": "auto",
+          "description": "How to demote related memories. auto (default): preview first and refuse if a row written in this session or a row with the same canonicalKey would be demoted (revision-guard, 2026-11-03). skip: forget without demoting anything. force: demote as before.",
+          "type": "string",
+          "enum": [
+            "auto",
+            "skip",
+            "force"
+          ]
         }
       },
       "required": [

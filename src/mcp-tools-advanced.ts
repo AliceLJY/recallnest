@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { isPivotScope } from "./pivot-write-guard.js";
+import { formatPlannedDemotions, recordSessionWrite } from "./revision-guard.js";
 import { pivotGuard as pivotGuardEnabled } from "./env-config.js";
 import { indexAsset, pinMemory } from "./asset-sync.js";
 import { createAuditLogger } from "./audit-log.js";
@@ -17,7 +18,7 @@ import { DurableMemoryCategorySchema, StoreMemorySourceSchema, DebugFramingSchem
 import { buildRetrievalContext, resolveScopeSelection } from "./scope-policy.js";
 import { persistSkill, retrieveSkills } from "./skill-engine.js";
 import { SkillImplementationTypeSchema } from "./skill-schema.js";
-import { formatBatchStoreReceipt } from "./store-receipts.js";
+import { dispositionWroteMemory, formatBatchStoreReceipt } from "./store-receipts.js";
 import type { ToolRegistryDeps } from "./mcp-tool-deps.js";
 
 /** The data/pins directory, as forget_memory uses it when nothing else is injected. */
@@ -57,7 +58,9 @@ function formatForgetResult(result: ForgetResult): string {
     `KG triples removed: ${result.kgTriplesRemoved ? "yes" : "no/N/A"}`,
     `Trigger rows removed: ${count(result.triggerRowsRemoved)}`,
     `Pins archived: ${count(result.pinsArchived)} (index rows removed: ${count(result.pinIndexRowsRemoved)})`,
-    `Cascade demoted: ${result.cascadeResult.demotedCount} related memories`,
+    result.cascadeSkipped
+      ? "Cascade demoted: skipped (cascadeMode=skip)"
+      : `Cascade demoted: ${result.cascadeResult.demotedCount} related memories`,
     `Read-back: ${v?.primary ?? "unverified"} (left: trigger rows ${count(v?.triggerRowsLeft)}, pin files ${count(v?.pinsLeft)}, pin index rows ${count(v?.pinIndexRowsLeft)}, KG triples ${count(v?.kgTriplesLeft)})`,
   ];
   if (v && v.unverified.length > 0 && state !== "unverified") {
@@ -66,6 +69,9 @@ function formatForgetResult(result: ForgetResult): string {
   if (result.pinsArchived) {
     // 归档是挪走不是删：文件里还有那段正文，调用方得知道它在哪
     lines.push("Archived pin files were moved, not erased: they are in data/archive/forgotten-pins and still hold the snippet. Delete them there if the content itself has to go.");
+  }
+  if (result.plannedDemotions && result.plannedDemotions.length > 0 && !result.cascadeSkipped) {
+    lines.push("Demoted (preview list):", ...formatPlannedDemotions(result.plannedDemotions));
   }
   if (result.evidence?.reason) {
     lines.push(`Reason: ${result.evidence.reason}`);
@@ -521,8 +527,9 @@ registerTool(
     confirm: z.boolean().default(false).describe("Required confirmation — must be true for durable-tier memories"),
     reason: z.string().min(1).max(200).optional().describe("Reason for forgetting (recorded in audit trail)"),
     scope: z.string().min(1).max(160).optional().describe("Optional scope filter for permission check"),
+    cascadeMode: z.enum(["auto", "skip", "force"]).default("auto").describe("How to demote related memories. auto (default): preview first and refuse if a row written in this session or a row with the same canonicalKey would be demoted (revision-guard, 2026-11-03). skip: forget without demoting anything. force: demote as before."),
   },
-  async ({ memoryId, confirm, reason, scope }) => {
+  async ({ memoryId, confirm, reason, scope, cascadeMode }) => {
     const { store, triggerStore } = getComponents();
     const kgStoreInstance = getKGStore();
     const auditLogger = createAuditLogger();
@@ -536,7 +543,7 @@ registerTool(
         triggerStore,
         pins: forgetPins ?? defaultForgetPins,
       },
-      { memoryId, confirm, reason, scopeFilter },
+      { memoryId, confirm, reason, scopeFilter, cascadeMode },
     );
 
     if (!result.success) {
@@ -889,6 +896,7 @@ registerTool(
       })),
     });
 
+    for (const r of stored) if (dispositionWroteMemory(r.disposition)) recordSessionWrite(r.id);
     return {
       content: [{
         type: "text" as const,

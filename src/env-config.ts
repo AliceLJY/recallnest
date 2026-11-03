@@ -191,6 +191,9 @@ export const checkpointMirror = (): boolean => process.env.RECALLNEST_CHECKPOINT
 /** memory:pivot 写入必带字段守卫（`src/pivot-write-guard.ts`，2026-11-03）。默认开，只认 `off` 关闭。 */
 export const pivotGuard = (): boolean => process.env.RECALLNEST_PIVOT_GUARD !== "off";
 
+/** 修订级联闸（`src/revision-guard.ts`，2026-11-03）：forget 前预演 cascade、store 时查别的 scope 同 key。默认开，只认 `off`。 */
+export const revisionGuard = (): boolean => process.env.RECALLNEST_REVISION_GUARD !== "off";
+
 // --- String settings with `||` default (empty string falls through) ---
 
 export const dataDir = (): string => process.env.RECALLNEST_DATA_DIR || "data";
