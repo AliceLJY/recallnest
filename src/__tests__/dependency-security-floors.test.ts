@@ -21,7 +21,8 @@ interface Floor {
 const FLOORS: Floor[] = [
   { name: "body-parser", min: "2.4.0", advisory: "GHSA-27r3-jxmh-p828" },
   { name: "qs", min: "6.16.1", advisory: "GHSA-6pq8-jhm2-2vcw" },
-  { name: "@hono/node-server", min: "2.1.3", advisory: "GHSA-rmxm-3fg6-px4f" },
+  { name: "@hono/node-server", min: "2.1.6", advisory: "GHSA-jpvv-r467-5p4w, GHSA-qv5m-9pm6-hqp3" },
+  { name: "hono", min: "4.13.16", advisory: "GHSA-4m76-xfj5-7975, GHSA-h7mg-cq63-vhpq, GHSA-46wx-v44x-9hh2" },
   { name: "zod", min: "4.6.6", advisory: "GHSA-mrhx-c7xc-m3w5" },
 ];
 
