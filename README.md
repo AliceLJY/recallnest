@@ -613,7 +613,7 @@ Maintainers: see [Publishing RecallNest](https://github.com/AliceLJY/recallnest/
 
 ## Relationship to memory-lancedb-pro
 
-RecallNest started as a fork of [memory-lancedb-pro](https://github.com/CortexReach/memory-lancedb-pro) and shares its core ideas around hybrid retrieval, decay modeling, and memory-as-engineering-system. The key difference:
+RecallNest grew out of [memory-lancedb-pro](https://github.com/CortexReach/memory-lancedb-pro). The earliest version adapted its code from an OpenClaw plugin into a standalone local service, keeping its core ideas: hybrid retrieval, decay modeling, and memory as an engineering system. Since then it has been developed independently and does not track upstream. The key difference:
 
 - **memory-lancedb-pro** is an OpenClaw plugin — it adds long-term memory to a single OpenClaw agent.
 - **RecallNest** is a standalone memory layer — it serves CLI agents, GUI chat apps and plain HTTP callers simultaneously through MCP + HTTP API, with session continuity, structured assets, and conflict management built in.
@@ -622,7 +622,7 @@ RecallNest started as a fork of [memory-lancedb-pro](https://github.com/CortexRe
 
 | Source | Contribution |
 |--------|-------------|
-| [memory-lancedb-pro](https://github.com/CortexReach/memory-lancedb-pro) by [@win4r](https://github.com/win4r) | Fork base — hybrid retrieval, decay modeling, and memory architecture |
+| [memory-lancedb-pro](https://github.com/CortexReach/memory-lancedb-pro) by [@win4r](https://github.com/win4r) | Starting point — early code adapted from it; hybrid retrieval, decay modeling, and memory architecture |
 | Claude Code | Foundation and early project scaffolding |
 | OpenAI Codex | Productization and MCP expansion |
 
