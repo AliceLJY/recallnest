@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, setSystemTime } from "bun:test";
 
 import { resolveSearchReinforcement } from "../api-server.js";
 import { createRetriever } from "../retriever.js";
@@ -10,6 +10,12 @@ import { buildRetrievalContext } from "../scope-policy.js";
  */
 
 const SCOPE = "test:probe";
+
+// Scores carry a recency term, so two searches a few milliseconds apart differ around the tenth decimal.
+// Freeze the clock: "same ranking and scores" is then an exact comparison, not a matter of timing.
+const FROZEN_NOW = new Date("2026-11-25T04:00:00.000Z");
+beforeAll(() => { setSystemTime(FROZEN_NOW); });
+afterAll(() => { setSystemTime(); });
 
 function harness() {
   const now = Date.now();
@@ -85,6 +91,7 @@ describe("/v1/search reinforce flag", () => {
 
   it("reinforce:false returns the same ranking and scores and writes nothing", async () => {
     const normal = await search({ query: "what did we decide about the desktop client" });
+    await Bun.sleep(25);      // real time passes between the two calls; the frozen clock must make that irrelevant
     const probe = await search({ query: "what did we decide about the desktop client", reinforce: false });
     expect(probe.ids).toEqual(normal.ids);
     expect(probe.scores).toEqual(normal.scores);
