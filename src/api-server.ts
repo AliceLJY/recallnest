@@ -594,6 +594,16 @@ async function handleResume(request: Request): Promise<Response> {
   }
 }
 
+/**
+ * `reinforce: false` in a /v1/search body marks a read-only probe (a hook checking whether anything is
+ * worth injecting). It skips the three reinforcement writes — frequency ledger, evolution access count,
+ * AccessTracker — which are gated on `source !== "auto-recall"` in the retriever. `trivialQueryGate: false`
+ * keeps the trivial-query gate off, so the ranking of this call is the same as a normal search.
+ */
+export function resolveSearchReinforcement(body: Record<string, unknown>): { source?: "auto-recall"; trivialQueryGate?: false } {
+  return body.reinforce === false ? { source: "auto-recall", trivialQueryGate: false } : {};
+}
+
 /** POST /v1/search — advanced search with full detail */
 async function handleSearch(request: Request): Promise<Response> {
   const body = await readJson(request);
@@ -615,6 +625,7 @@ async function handleSearch(request: Request): Promise<Response> {
     scope: typeof body.scope === "string" ? body.scope : undefined,
     sessionId: typeof body.sessionId === "string" ? body.sessionId : undefined,
     allScopes: body.allScopes === true,
+    ...resolveSearchReinforcement(body),
   }, {
     operation: "api:/v1/search",
   }));

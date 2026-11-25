@@ -1164,6 +1164,7 @@ Advanced search with full metadata, retrieval path details, and scope filtering.
 | `profile` | string | no | `"default"` | Retrieval profile: `default`, `writing`, `debug`, `fact-check` |
 | `scope` | string | no | — | Filter by source scope (e.g. `cc`, `codex`, `api:my-agent`) |
 | `minScore` | number | no | 0 | Minimum relevance score (0-1) |
+| `reinforce` | boolean | no | `true` | Pass `false` for read-only probes (hooks, health checks): results and ranking are unchanged, but the hits are not counted as usage, so repeated probing does not raise their future scores |
 
 **Response:**
 
