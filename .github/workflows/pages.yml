@@ -16,11 +16,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
+  # Build and deploy are separate jobs on purpose: when deploy-pages ran in the
+  # same job right after the upload, the artifact listing sometimes had not
+  # caught up and it failed with "No artifacts named github-pages"
+  # (2026-11-24 here, three times on 2026-11-25 in drug-mystery-desk).
+  build:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v6
 
@@ -36,5 +37,13 @@ jobs:
       - uses: actions/upload-pages-artifact@v4
         with:
           path: _site
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - id: deployment
         uses: actions/deploy-pages@v4
