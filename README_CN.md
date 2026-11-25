@@ -239,6 +239,8 @@ recallnest doctor
 
 ### 方式 C：手动安装
 
+需要先装 [Bun](https://bun.sh)（下面的 `bun install` 没有 Bun 会直接失败）。
+
 ```bash
 git clone https://github.com/AliceLJY/recallnest.git
 cd recallnest
@@ -248,11 +250,20 @@ cp .env.example .env
 # 编辑 .env → 填入 JINA_API_KEY
 ```
 
+每次写入和搜索都要先算 embedding，所以在 `.env` 里填好能用的 Jina key（且本机能连上 `api.jina.ai`）之前，`store`、`recall`、`ingest`、`seed:continuity` 都会报 `Failed to generate embedding`。本节没有免 key 的跑法。没有 key 时服务照样能启动，`/v1/health` 和 `/v1/stats` 也能用。建议先跑 `bun run src/cli.ts doctor`，它会在你跑需要 key 的命令之前就指出 key 缺失或还是占位值。
+
 ### 启动服务
 
 ```bash
 bun run api
 # → RecallNest API running at http://localhost:4318
+```
+
+在另一个终端确认服务起来了（不需要 API key）：
+
+```bash
+curl http://localhost:4318/v1/health
+# → {"status":"ok","version":"…","totalMemories":0,…}
 ```
 
 ### 试一下
@@ -261,16 +272,18 @@ bun run api
 # 存入一条记忆
 curl -X POST http://localhost:4318/v1/store \
   -H "Content-Type: application/json" \
-  -d '{"text": "用户偏好暗色模式", "category": "preferences"}'
+  -d '{"text": "用户偏好暗色模式", "category": "preferences", "scope": "project:demo"}'
 
 # 搜索记忆
 curl -X POST http://localhost:4318/v1/recall \
   -H "Content-Type: application/json" \
-  -d '{"query": "用户偏好"}'
+  -d '{"query": "用户偏好", "scope": "project:demo"}'
 
 # 查看统计
 curl http://localhost:4318/v1/stats
 ```
+
+`store` 和 `recall` 必须带 `scope`：不带时接口会报 `scope is required`（store）或 `requires a scope`（recall）。示例用的是 `project:demo`，读回时用写入时的同一个 scope。完整字段见 [`docs/api-reference.md`](docs/api-reference.md)。
 
 ### 接入终端
 
@@ -285,10 +298,12 @@ bash integrations/codex/setup.sh
 ### 索引已有对话
 
 ```bash
+bun run src/cli.ts doctor          # 先体检：key、配置、数据目录
 bun run src/cli.ts ingest --source all
 bun run seed:continuity
-bun run src/cli.ts doctor
 ```
+
+`ingest` 和 `seed:continuity` 都要用到 embedding key（见方式 C）。`doctor` 和部分报错里提到的 `lm`，是仓库根目录的 `./lm`，等同于 `bun run src/cli.ts`（`./lm doctor` 就是 `bun run src/cli.ts doctor`）。
 
 2026-10-06 起，`ingest` 默认只做两件事：对账记忆文件（`sources.memory`），以及把 Minis 投递目录里的文件挪进
 `data/minis-archive`。六个对话来源（cc / codex / kimi / gemini / desktop / minis）不切片、不嵌入、不写库。

@@ -246,6 +246,8 @@ Requires [Bun](https://bun.sh): RecallNest does not run on Node.js. The npm laun
 
 ### Option C: Manual setup
 
+Requires [Bun](https://bun.sh) (`bun install` below fails without it).
+
 ```bash
 git clone https://github.com/AliceLJY/recallnest.git
 cd recallnest
@@ -255,11 +257,20 @@ cp .env.example .env
 # Edit .env → add your JINA_API_KEY
 ```
 
+Every write and every search needs an embedding, so `store`, `recall`, `ingest` and `seed:continuity` fail with `Failed to generate embedding` until `.env` holds a working Jina key (and the machine can reach `api.jina.ai`). There is no key-free mode in this Quick Start. Without a key you can still start the server and call `/v1/health` and `/v1/stats`. Run `bun run src/cli.ts doctor` first: it flags a missing or placeholder key before you run anything that needs one.
+
 ### Start the server
 
 ```bash
 bun run api
 # → RecallNest API running at http://localhost:4318
+```
+
+Check it from a second terminal (works without an API key):
+
+```bash
+curl http://localhost:4318/v1/health
+# → {"status":"ok","version":"…","totalMemories":0,…}
 ```
 
 ### Try it
@@ -268,16 +279,18 @@ bun run api
 # Store a memory
 curl -X POST http://localhost:4318/v1/store \
   -H "Content-Type: application/json" \
-  -d '{"text": "User prefers dark mode", "category": "preferences"}'
+  -d '{"text": "User prefers dark mode", "category": "preferences", "scope": "project:demo"}'
 
 # Recall memories
 curl -X POST http://localhost:4318/v1/recall \
   -H "Content-Type: application/json" \
-  -d '{"query": "user preferences"}'
+  -d '{"query": "user preferences", "scope": "project:demo"}'
 
 # Check stats
 curl http://localhost:4318/v1/stats
 ```
+
+`scope` is required on `store` and `recall`: without it the API answers `scope is required` (store) or `requires a scope` (recall). The examples use `project:demo`; read back with the same scope you wrote to. Full request fields: [`docs/api-reference.md`](docs/api-reference.md).
 
 ### Connect your terminals
 
@@ -292,10 +305,12 @@ Each script installs MCP access and managed continuity rules, so `resume_context
 ### Index existing conversations
 
 ```bash
+bun run src/cli.ts doctor          # check first: key, config, data directory
 bun run src/cli.ts ingest --source all
 bun run seed:continuity
-bun run src/cli.ts doctor
 ```
+
+`ingest` and `seed:continuity` both need the embedding key (see Option C). `doctor` and some error messages refer to `lm`: that is `./lm` in the repo root, a shortcut for `bun run src/cli.ts` (`./lm doctor` = `bun run src/cli.ts doctor`).
 
 Since 2026-10-06, `ingest` does two things by default: it reconciles memory files
 (`sources.memory`) and moves files from the Minis drop folder into `data/minis-archive`. The six
