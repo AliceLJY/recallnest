@@ -16,6 +16,17 @@
 
 ## Unreleased
 
+## v4.1.0 — Revisions that land where you meant them (2026-11-27)
+
+Most of this release is about a write or a delete hitting the row it was aimed at: default
+canonical keys stop colliding for non-Latin and long bodies, same-key writes stay inside their
+own scope, `forget_memory` previews its cascade before demoting anything, and `memory:pivot`
+writes get their required fields from the server. Two behaviour changes are visible to callers:
+a memory whose normalised body was empty or truncated now gets a new key (a rewrite lands as a
+new row next to the old one), and a cross-scope same-key write that used to be refused as a
+conflict now lands as a second row. Four dependency advisories are closed, including a zod
+major bump (3 → 4) and @hono/node-server 1 → 2.
+
 - **`POST /v1/search` accepts `reinforce: false` for read-only probes (2026-11-25).** A hook that asks "is anything here worth injecting?" on the first message of every session went through `/v1/search`, which had no way to say "this is not a human search". Every probe therefore counted its top hits as usage (frequency ledger, evolution access count, AccessTracker), and under the default bounded popularity step each counted access raises that row's future score. With the flag, the three writes are skipped; ranking and scores of the call itself are unchanged. Omitting the flag keeps the old behaviour.
   - *Before:* one rejected-proposal row went from 0.813 to 0.890 within a single evening of repeated probing with near-identical queries (2026-11-24), which is what about four extra counted accesses produce through `×(1+0.2·h)`. The threshold for injecting it was 0.88, so the row was dropped on the first probe and carried on later ones for no reason other than having been probed. *After:* not re-measured on production; the tests assert zero reinforcement writes and identical ranking and scores for the same query with and without the flag.
   - *Measured how:* probe volume from the hook's own log, 2026-11-16 to 11-25: 196 first-message probes over those 10 days, about 20 a day, limit 3 each. The 0.813 → 0.890 pair is one row on one evening, read from that log and a replay the same night.
